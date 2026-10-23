@@ -1,0 +1,75 @@
+{
+  "configVersion": 2,
+  "controller": {
+    "transport": "auto",
+    "url": "http://127.0.0.1:9090",
+    "pipePath": "",
+    "pipePattern": "^verge-mihomo-(production|sidecar-release)-",
+    "secretEnv": "MIHOMO_CONTROLLER_SECRET",
+    "requestTimeoutMs": 5000
+  },
+  "groups": {
+    "target": "CHANGE_ME_TARGET_SELECTOR",
+    "candidates": "CHANGE_ME_CANDIDATE_GROUP"
+  },
+  "probes": {
+    "urls": [
+      "https://chatgpt.com/",
+      "https://api.openai.com/v1/models"
+    ],
+    "controlUrls": [
+      "https://cp.cloudflare.com/generate_204"
+    ],
+    "timeoutMs": 5000,
+    "currentRounds": 2,
+    "currentMinSuccessRate": 1,
+    "currentMaxAverageMs": 800,
+    "currentMaxSingleMs": 1500,
+    "scanRounds": 1,
+    "scanUrlCount": 1,
+    "validationRounds": 2,
+    "topCandidates": 6,
+    "parallelism": 4,
+    "candidateMinSuccessRate": 1,
+    "candidateMaxAverageMs": 600,
+    "candidateMaxSingleMs": 1200,
+    "includeRegex": "",
+    "excludeRegex": ""
+  },
+  "policy": {
+    "intervalSeconds": 30,
+    "partialFailureCycles": 2,
+    "latencyFailureCycles": 3,
+    "hardFailureConfirmSeconds": 5,
+    "minimumDwellSeconds": 120,
+    "minimumImprovementMs": 200,
+    "minimumImprovementRatio": 0.2,
+    "failedNodeQuarantineSeconds": 900,
+    "maxSwitchAttempts": 3,
+    "postSwitchDelaySeconds": 2,
+    "postSwitchRounds": 2,
+    "rollbackOnFailure": true,
+    "emergencySuccessRate": 0.5,
+    "emergencyMaxAverageMs": 3000,
+    "candidateScanBackoffSeconds": 120,
+    "switchBudgetCount": 3,
+    "switchBudgetWindowSeconds": 600,
+    "upstreamFailureMinCandidates": 3
+  },
+  "logging": {
+    "maxBytes": 5242880,
+    "retainedFiles": 14
+  },
+  "telemetry": {
+    "enabled": true,
+    "proxyUrl": "http://127.0.0.1:7897",
+    "httpsUrl": "https://chatgpt.com/",
+    "websocketUrl": "wss://chatgpt.com/backend-api/codex/responses",
+    "timeoutMs": 5000
+  },
+  "files": {
+    "state": "./var/state.json",
+    "log": "./var/watchdog.ndjson",
+    "lock": "./var/watchdog.lock"
+  }
+}

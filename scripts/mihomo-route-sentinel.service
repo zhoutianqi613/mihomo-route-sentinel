@@ -1,0 +1,21 @@
+[Unit]
+Description=Mihomo Node Stability Watchdog
+After=network-online.target mihomo.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@SERVICE_USER@
+WorkingDirectory="@PROJECT_DIR@"
+EnvironmentFile=-/etc/mihomo-route-sentinel.env
+ExecStart="@NODE_PATH@" "@PROJECT_DIR@/src/cli.mjs" --config "@CONFIG_PATH@" --run --apply --quiet
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths="@RUNTIME_DIR@"
+
+[Install]
+WantedBy=multi-user.target

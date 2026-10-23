@@ -1,0 +1,19 @@
+{
+  "name": "mihomo-route-sentinel",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "AI service route quality monitoring and automatic failover for Mihomo",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zhoutianqi613/mihomo-route-sentinel.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "check": "node --check src/cli.mjs && node --check src/config.mjs && node --check src/controller.mjs && node --check src/link-probe.mjs && node --check src/observability.mjs && node --check src/watchdog.mjs",
+    "test": "node --test"
+  }
+}

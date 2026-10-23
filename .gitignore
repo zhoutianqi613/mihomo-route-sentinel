@@ -1,0 +1,12 @@
+/config.json
+/var/
+/MEMORY.md
+/node_modules/
+/.env
+/.env.*
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+/.idea/
+/.vscode/

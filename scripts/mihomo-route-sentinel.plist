@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.github.mihomo-route-sentinel</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@NODE_PATH@</string>
+    <string>@PROJECT_DIR@/src/cli.mjs</string>
+    <string>--config</string>
+    <string>@CONFIG_PATH@</string>
+    <string>--run</string>
+    <string>--apply</string>
+    <string>--quiet</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>@PROJECT_DIR@</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>@RUNTIME_DIR@/launchd.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>@RUNTIME_DIR@/launchd.stderr.log</string>
+</dict>
+</plist>
