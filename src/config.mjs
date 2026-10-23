@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 
-export const CURRENT_CONFIG_VERSION = 2;
+export const CURRENT_CONFIG_VERSION = 3;
 
 export const defaults = Object.freeze({
   configVersion: CURRENT_CONFIG_VERSION,
@@ -51,6 +51,7 @@ export const defaults = Object.freeze({
     rollbackOnFailure: true,
     emergencySuccessRate: 0.5,
     emergencyMaxAverageMs: 3000,
+    immediateMaxSingleMs: 2500,
     candidateScanBackoffSeconds: 120,
     switchBudgetCount: 3,
     switchBudgetWindowSeconds: 600,
@@ -67,10 +68,20 @@ export const defaults = Object.freeze({
     websocketUrl: 'wss://chatgpt.com/backend-api/codex/responses',
     timeoutMs: 5000,
   },
+  guardrails: {
+    enabled: true,
+    autoRepair: true,
+    expectedRuntimeMode: 'rule',
+    runtimeModeCheckIntervalSeconds: 5,
+    disableClashVergeDnsOverride: true,
+    clashVergeAppDir: '',
+    restartClashVergeOnDnsRepair: true,
+  },
   files: {
     state: './var/state.json',
     log: './var/watchdog.ndjson',
     lock: './var/watchdog.lock',
+    guardrailState: './var/guardrails.json',
   },
 });
 
@@ -162,14 +173,18 @@ function migrate(parsed) {
   }
   if (version < 1) throw new Error(`不支持配置版本 ${version}`);
 
-  // v1 没有 configVersion 以及对照探测、切换预算、日志轮转和遥测字段。
-  // 这些字段由 v2 默认值补齐，不会回写或覆盖原文件。
-  return { ...parsed, configVersion: CURRENT_CONFIG_VERSION };
+  // 旧版本升级时不应在未明确选择的情况下开始修改第三方客户端配置。
+  // 新安装使用示例中的显式 guardrails.enabled=true；迁移不会回写原文件。
+  const migrated = { ...parsed, configVersion: CURRENT_CONFIG_VERSION };
+  if (version < 3 && parsed.guardrails === undefined) {
+    migrated.guardrails = { enabled: false };
+  }
+  return migrated;
 }
 
 function validate(config) {
   requireKnownKeys(config, defaults, '配置根节点');
-  for (const section of ['controller', 'groups', 'probes', 'policy', 'logging', 'telemetry', 'files']) {
+  for (const section of ['controller', 'groups', 'probes', 'policy', 'logging', 'telemetry', 'guardrails', 'files']) {
     requireObject(config[section], section);
     requireKnownKeys(config[section], defaults[section], section);
   }
@@ -250,6 +265,7 @@ function validate(config) {
     postSwitchDelaySeconds: 0,
     postSwitchRounds: 1,
     emergencyMaxAverageMs: 1,
+    immediateMaxSingleMs: 1,
     candidateScanBackoffSeconds: 0,
     switchBudgetCount: 1,
     switchBudgetWindowSeconds: 1,
@@ -263,6 +279,9 @@ function validate(config) {
   }
   if (config.policy.emergencyMaxAverageMs <= config.probes.currentMaxAverageMs) {
     throw new Error('policy.emergencyMaxAverageMs 必须高于 probes.currentMaxAverageMs');
+  }
+  if (config.policy.immediateMaxSingleMs <= config.probes.currentMaxSingleMs) {
+    throw new Error('policy.immediateMaxSingleMs 必须高于 probes.currentMaxSingleMs');
   }
   if (config.probes.topCandidates < config.policy.maxSwitchAttempts) {
     throw new Error('probes.topCandidates 不能小于 policy.maxSwitchAttempts');
@@ -280,7 +299,32 @@ function validate(config) {
   }
   requireInteger(config.telemetry.timeoutMs, 'telemetry.timeoutMs', 100);
 
-  for (const name of ['state', 'log', 'lock']) {
+  requireBoolean(config.guardrails.enabled, 'guardrails.enabled');
+  requireBoolean(config.guardrails.autoRepair, 'guardrails.autoRepair');
+  if (!['rule', 'global'].includes(config.guardrails.expectedRuntimeMode)) {
+    throw new Error('guardrails.expectedRuntimeMode 必须是 rule 或 global；不允许 direct');
+  }
+  requireInteger(
+    config.guardrails.runtimeModeCheckIntervalSeconds,
+    'guardrails.runtimeModeCheckIntervalSeconds',
+    2,
+  );
+  requireBoolean(
+    config.guardrails.disableClashVergeDnsOverride,
+    'guardrails.disableClashVergeDnsOverride',
+  );
+  if (typeof config.guardrails.clashVergeAppDir !== 'string') {
+    throw new Error('guardrails.clashVergeAppDir 必须是字符串');
+  }
+  if (config.guardrails.clashVergeAppDir && !path.isAbsolute(config.guardrails.clashVergeAppDir)) {
+    throw new Error('guardrails.clashVergeAppDir 必须是绝对路径或空字符串');
+  }
+  requireBoolean(
+    config.guardrails.restartClashVergeOnDnsRepair,
+    'guardrails.restartClashVergeOnDnsRepair',
+  );
+
+  for (const name of ['state', 'log', 'lock', 'guardrailState']) {
     if (typeof config.files[name] !== 'string' || !config.files[name].trim()) {
       throw new Error(`files.${name} 不能为空`);
     }
@@ -293,11 +337,11 @@ export async function loadConfig(configPath) {
   const parsed = JSON.parse(await readFile(absolutePath, 'utf8'));
   const config = validate(merge(defaults, migrate(parsed)));
   const baseDir = path.dirname(absolutePath);
-  for (const key of ['state', 'log', 'lock']) {
+  for (const key of ['state', 'log', 'lock', 'guardrailState']) {
     config.files[key] = path.resolve(baseDir, config.files[key]);
   }
-  if (new Set([config.files.state, config.files.log, config.files.lock]).size !== 3) {
-    throw new Error('files.state、files.log 和 files.lock 必须指向不同文件');
+  if (new Set(Object.values(config.files)).size !== Object.keys(config.files).length) {
+    throw new Error('files.state、files.log、files.lock 和 files.guardrailState 必须指向不同文件');
   }
   config.configPath = absolutePath;
   return config;

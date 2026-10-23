@@ -165,6 +165,22 @@ function latestByEvent(records, event) {
   return records.findLast((record) => record?.event === event) ?? null;
 }
 
+const GUARDRAIL_ISSUE_TEXT = Object.freeze({
+  'controller-unreachable': 'Mihomo Controller 不可达',
+  'runtime-mode': '运行模式不符合预期',
+  'clash-verge-config-unavailable': 'Clash Verge 配置目录不可用',
+  'clash-verge-config-invalid': 'Clash Verge 配置格式无效或发生并发修改',
+  'guardrail-state-invalid': '配置守卫状态文件无效',
+  'dns-override': '当前订阅启用了 DNS 覆写',
+  'dns-repair-unsupported': '当前平台不支持安全自动修复 DNS 覆写',
+  'dns-reload-pending': 'DNS 修复正在等待客户端重载确认',
+  'clash-verge-reload-failed': 'Clash Verge 重载或运行态复核失败',
+});
+
+function explainGuardrailIssue(issue) {
+  return GUARDRAIL_ISSUE_TEXT[issue] ? `${GUARDRAIL_ISSUE_TEXT[issue]}(${issue})` : issue;
+}
+
 function telemetryForEvaluation(records, evaluation) {
   if (!evaluation) return latestByEvent(records, 'link-telemetry');
   const evaluationTimestamp = Date.parse(evaluation.timestamp);
@@ -264,6 +280,8 @@ export async function buildStatusSnapshot({ stateFile, logFile, controller, targ
   ]);
   const evaluation = latestByEvent(records, 'current-node-evaluated');
   const telemetry = telemetryForEvaluation(records, evaluation);
+  const guardrail = latestByEvent(records, 'guardrail-evaluated');
+  const runtimeModeGuard = latestByEvent(records, 'runtime-mode-guard-evaluated');
   const current = live && !live.error
     ? live
     : {
@@ -275,6 +293,16 @@ export async function buildStatusSnapshot({ stateFile, logFile, controller, targ
   if (live?.error) warnings.push(live.error);
   const policyState = normalizePolicyState(state, policy);
   const quarantinedNodes = activeQuarantines(state.quarantinedNodes);
+  const externalSelectionAdmission = state.externalSelectionPendingAdmission
+    ? {
+        status: 'pending-or-rejected',
+        from: state.externalSelectionPendingAdmission.from ?? null,
+        fromLeaf: state.externalSelectionPendingAdmission.fromLeaf ?? null,
+        to: state.externalSelectionPendingAdmission.to ?? null,
+        leaf: state.externalSelectionPendingAdmission.leaf ?? null,
+        detectedAt: state.externalSelectionPendingAdmission.detectedAt ?? null,
+      }
+    : null;
   if (live && !live.error) {
     const selectionMismatch = state.currentSelection != null
       && state.currentSelection !== live.selected;
@@ -286,6 +314,21 @@ export async function buildStatusSnapshot({ stateFile, logFile, controller, targ
   }
   if (current?.leaf && quarantinedNodes.some((entry) => entry.node === current.leaf)) {
     warnings.push('当前叶子节点仍在隔离列表中；后续周期应重新核验并修正状态');
+  }
+  if (externalSelectionAdmission) {
+    warnings.push('外部节点待准入/已拒绝，正在寻找合格候选');
+  }
+  if (guardrail?.ready === false) {
+    const issueText = Array.isArray(guardrail.issues) && guardrail.issues.length
+      ? guardrail.issues.map(explainGuardrailIssue).join(', ')
+      : 'unknown';
+    warnings.push(`配置守卫未就绪，链路探测与节点切换已暂停：${issueText}`);
+  }
+  if (runtimeModeGuard?.ready === false) {
+    const issueText = Array.isArray(runtimeModeGuard.issues) && runtimeModeGuard.issues.length
+      ? runtimeModeGuard.issues.map(explainGuardrailIssue).join(', ')
+      : 'unknown';
+    warnings.push(`运行模式守卫未就绪，任何节点切换均被禁止：${issueText}`);
   }
   return {
     generatedAt: new Date().toISOString(),
@@ -302,6 +345,21 @@ export async function buildStatusSnapshot({ stateFile, logFile, controller, targ
     telemetry: telemetry ? {
       at: telemetry.timestamp ?? null,
       ...telemetry.metrics,
+    } : null,
+    guardrails: guardrail ? {
+      at: guardrail.timestamp ?? null,
+      status: guardrail.status ?? null,
+      ready: guardrail.ready ?? null,
+      issues: guardrail.issues ?? [],
+      repairs: guardrail.repairs ?? [],
+    } : null,
+    externalSelectionAdmission,
+    runtimeModeGuard: runtimeModeGuard ? {
+      at: runtimeModeGuard.timestamp ?? null,
+      status: runtimeModeGuard.status ?? null,
+      ready: runtimeModeGuard.ready ?? null,
+      issues: runtimeModeGuard.issues ?? [],
+      repairs: runtimeModeGuard.repairs ?? [],
     } : null,
     consecutiveFailures: {
       overall: state.consecutiveFailures ?? 0,
@@ -335,8 +393,17 @@ export function formatStatus(snapshot) {
     : '未配置或无记录';
   const httpsTelemetry = snapshot.telemetry?.https;
   const websocketTelemetry = snapshot.telemetry?.websocket;
+  const guardrailText = snapshot.guardrails
+    ? `${display(snapshot.guardrails.status)}，问题 ${snapshot.guardrails.issues.length}，修复 ${snapshot.guardrails.repairs.length}`
+    : '尚无数据';
+  const externalAdmissionText = snapshot.externalSelectionAdmission
+    ? `外部节点待准入/已拒绝，正在寻找合格候选：${display(snapshot.externalSelectionAdmission.to)}（叶子 ${display(snapshot.externalSelectionAdmission.leaf)}）`
+    : '无';
+  const runtimeGuardText = snapshot.runtimeModeGuard
+    ? `${display(snapshot.runtimeModeGuard.status)}，问题 ${snapshot.runtimeModeGuard.issues.length}，修复 ${snapshot.runtimeModeGuard.repairs.length}`
+    : '尚无检查记录（需确认服务已加载最新版）';
   const lines = [
-    'Watchdog 运行状态',
+    'Mihomo Route Sentinel 运行状态',
     `当前选择       : ${display(snapshot.current?.selected)}`,
     `当前叶子节点   : ${display(snapshot.current?.leaf)}（来源：${display(snapshot.current?.source)}）`,
     `最近探测       : ${display(snapshot.probe?.at)}`,
@@ -349,6 +416,9 @@ export function formatStatus(snapshot) {
     `切换预算       : ${budget}`,
     `HTTPS 真实链路 : ${httpsTelemetry ? `网络 ${httpsTelemetry.networkOk ? '成功' : '失败'}，HTTP ${display(httpsTelemetry.statusCode)}，代理 TCP ${display(httpsTelemetry.connectMs, ' ms')}，CONNECT ${display(httpsTelemetry.tunnelMs, ' ms')}，TLS ${display(httpsTelemetry.tlsMs, ' ms')}，TTFB ${display(httpsTelemetry.ttfbMs, ' ms')}` : '尚无数据'}`,
     `WebSocket 链路 : ${websocketTelemetry ? `网络 ${websocketTelemetry.networkOk ? '成功' : '失败'}，升级 ${websocketTelemetry.websocketOk ? '成功' : '未成功'}，HTTP ${display(websocketTelemetry.statusCode)}，代理 TCP ${display(websocketTelemetry.connectMs, ' ms')}，CONNECT ${display(websocketTelemetry.tunnelMs, ' ms')}，TLS ${display(websocketTelemetry.tlsMs, ' ms')}，TTFB ${display(websocketTelemetry.ttfbMs, ' ms')}` : '尚无数据'}`,
+    `配置守卫       : ${guardrailText}`,
+    `外部节点准入   : ${externalAdmissionText}`,
+    `运行模式守卫   : ${runtimeGuardText}`,
     `日志路径       : ${snapshot.files.log}`,
   ];
   if (snapshot.warnings.length) lines.push(`警告           : ${snapshot.warnings.join('；')}`);

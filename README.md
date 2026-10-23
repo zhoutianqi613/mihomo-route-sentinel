@@ -55,7 +55,7 @@ node .\src\cli.mjs --config .\config.json --status-json
 
 ## 配置重点
 
-- `configVersion`：当前为 `2`。无此字段的旧配置按 v1 在内存中迁移，原文件不会被改写。
+- `configVersion`：当前为 `3`。v1/v2 配置会在内存中迁移，原文件不会被改写。
 - `groups.target`：需要被切换的 Selector。必须把示例的 `CHANGE_ME_TARGET_SELECTOR` 改为实际组名。
 - `groups.candidates`：包含实际节点的候选组。必须把 `CHANGE_ME_CANDIDATE_GROUP` 改为实际组名。
 - `probes.urls`：真实业务目标，应至少配置两个。
@@ -66,13 +66,34 @@ node .\src\cli.mjs --config .\config.json --status-json
 - `includeRegex` / `excludeRegex`：限制允许参与切换的节点名称。
 - `minimumDwellSeconds`：只约束纯延迟优化的最短驻留时间；不阻止故障恢复。
 - `minimumImprovementMs` / `minimumImprovementRatio`：延迟型切换所需的最小收益。
+- `policy.immediateMaxSingleMs`：不可接受尖峰的立即确认线，默认 2500 ms；必须高于当前节点单次健康上限。
 - `failedNodeQuarantineSeconds`：故障节点隔离时间。
 - `candidateScanBackoffSeconds`：没有合格候选时的再扫描退避，默认 120 秒。
 - `switchBudgetCount` / `switchBudgetWindowSeconds`：滚动时间窗内的最大切换数，默认 10 分钟内 3 次。
 - `logging.maxBytes` / `logging.retainedFiles`：单个日志的轮转阈值和保留份数。
 - `telemetry.*`：通过本地代理检查 HTTPS TLS/TTFB 和 WebSocket；对不同客户端需要调整 `proxyUrl`。
+- `guardrails.expectedRuntimeMode`：允许 `rule` 或 `global`，默认强制为 `rule`；禁止把 `direct` 设为目标模式。
+- `guardrails.runtimeModeCheckIntervalSeconds`：独立运行模式守卫的检查间隔，默认 5 秒；候选扫描再慢也不会让手动 `direct` 长时间生效。
+- `guardrails.disableClashVergeDnsOverride`：使用 Clash Verge Named Pipe 时，检查当前订阅的 DNS 覆写并自动关闭。
+- `guardrails.clashVergeAppDir`：Windows Named Pipe 模式可留空并自动发现；HTTP Controller、Linux 和 macOS 必须填写绝对路径后才会检测 DNS 覆写。
+- `guardrails.restartClashVergeOnDnsRepair`：Windows 修复 DNS 覆写后自动隐藏重启 Clash Verge，使修复进入运行态。
+- `files.guardrailState`：保存“DNS 已修改但尚未确认重载”的持久债务；只有运行态复核成功才会清除。
 
 配置在启动时严格校验：轮数、并发数、周期和预算必须是整数，成功率必须在 0–1 内，正则必须可编译，业务探测 URL 只允许 HTTP/HTTPS，遥测 URL 必须匹配各自协议。无效配置会在连接 Controller 或切换节点前终止。
+
+## 配置守卫与自动纠正
+
+每个监控周期都会先执行配置守卫，再进行链路探测和节点切换：
+
+1. 每个主周期读取 Mihomo `/configs`；独立守卫还会每 5 秒检查一次。运行模式被人为切成 `direct` 时立即改回配置的 `rule` 或 `global` 并复核。
+2. 运行模式只通过 Mihomo 官方 API 修复，不读取或重写可能包含节点与凭据的 `config.yaml`；Clash Verge 重启后最多 5 秒会再次纠正。
+3. 检查当前订阅的 DNS 覆写状态；Windows 仅定位需要关闭的布尔字段，在停止同一会话的 Clash Verge 后原位修改，不生成包含其他配置的临时副本。
+4. 隐藏重启 Clash Verge 后，同时复核持久化开关、生成配置已刷新、Controller 恢复和运行模式；本周期暂停节点切换。
+5. DNS 重载债务写入独立状态文件，跨周期和服务重启保留。任何修复或复核失败都会持续进入 `blocked`，停止探测和切换。
+
+默认单次命令是 Dry Run：只报告 `would-repair`，不会修改 Mihomo 或 Clash Verge。计划任务使用 `--apply`，会自动修复。`--status` 中的“配置守卫”会显示最近状态、问题数和修复数。
+
+Windows 可自动完成上述 DNS 修复闭环。Linux 和 macOS 只有显式配置 `guardrails.clashVergeAppDir` 时才检测，且当前不修改第三方配置；发现 DNS 覆写时保持 `blocked` 并给出问题代码。
 
 ## 自动切换策略
 
@@ -84,9 +105,14 @@ node .\src\cli.mjs --config .\config.json --status-json
 | 瞬时异常 | 尚未达到对应的连续周期阈值 | 记录，不切换 |
 | 部分失败 | 成功率高于 50% 但低于 100%，连续 2 个周期 | 立即扫描和切换，不受最短驻留限制 |
 | 延迟退化 | 100% 成功，但平均或单次延迟超标，连续 3 个周期 | 最短驻留结束后，仅切换到至少改善 200 ms 或 20% 的候选 |
-| 硬故障 | 成功率不超过 50% 或平均延迟超过 3000 ms | 5 秒后确认；仍失败则立即切换，不受最短驻留限制 |
+| 不可接受尖峰 | 任一真实探测超过 `immediateMaxSingleMs`（默认 2500 ms），但尚未达到硬故障 | 5 秒后确认；仍为尖峰则立即扫描，不受普通连续周期与最短驻留限制 |
+| 硬故障 | 成功率不超过 50% 或平均延迟超过 3000 ms | 5 秒后确认；仍失败则立即扫描，不受普通连续周期与最短驻留限制 |
 
 候选必须 100% 成功、平均延迟不超过 600 ms、单次不超过 1200 ms，并连续两轮验证合格。切换后再次验证两轮；失败候选隔离 15 分钟并继续尝试下一个，最多尝试 3 个。只有原节点重新探测合格时才允许回滚。找不到合格候选后退避 120 秒；10 分钟最多切换 3 次。业务目标整体失败但对照 URL 正常时，按上游故障处理并抑制切换风暴。
+
+如果用户或其他程序在 Sentinel 之外改变目标 Selector，或嵌套代理组解析出的实际叶子节点发生变化，实际选择会与最近已准入状态比对并记录 `external-selection-detected`。新节点必须使用业务 URL 按候选门槛立即完成严格多轮准入；未通过时立即扫描其他候选，并把待准入状态保留到成功准入或 Sentinel 完成切换。Mihomo UI 中的 `5000 ms` history/占位显示不参与准入判断。
+
+升级到包含节点准入版本的版本后，缺少 `selectionAdmissionVersion` 的旧状态会对当前 Selector 和叶子节点执行一次严格基线复核，并记录 `baseline-revalidation`；这不是本轮检测到外部切换。通过后写入版本，未通过则保留待准入状态并寻找合格候选。Sentinel 自身完成验证切换时也会写入同一版本，避免旧状态或中断切换被静默继承。
 
 延迟质量等级用于日志解释和产品判断，不单独替代成功率与连续周期：
 
@@ -98,7 +124,7 @@ node .\src\cli.mjs --config .\config.json --status-json
 | 不可接受 | 平均超过 1200 ms，或最大超过 2500 ms |
 | 硬故障 | 成功率不超过 50%，或平均超过 3000 ms |
 
-平均值可能掩盖尖峰，因此决策同时使用成功率、平值、最大值、抖动和连续周期。HTTPS 遥测分解 TCP/TLS/TTFB/总时长，WebSocket 遥测检查握手。遥测用于运维观测，当前不替代候选节点的多轮准入门槛。
+平均值可能掩盖尖峰，因此决策同时使用成功率、平均值、最大值、抖动和连续周期。HTTPS 遥测分解 TCP/TLS/TTFB/总时长，WebSocket 遥测检查握手。遥测用于运维观测，当前不替代候选节点的多轮准入门槛。
 
 HTTP Controller 使用 secret 时，只配置环境变量名称：
 

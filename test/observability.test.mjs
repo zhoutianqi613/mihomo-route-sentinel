@@ -164,6 +164,33 @@ test('synchronized current state mismatch produces a precise warning', async () 
   assert.ok(snapshot.warnings.some((message) => message.includes('守护程序同步状态不一致')));
 });
 
+test('pending external admission is explicit in snapshot and formatted status', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'watchdog-status-external-admission-'));
+  const stateFile = path.join(root, 'state.json');
+  const logFile = path.join(root, 'watchdog.ndjson');
+  await writeFile(stateFile, JSON.stringify({
+    currentSelection: 'old-node',
+    currentLeaf: 'old-node',
+    externalSelectionPendingAdmission: {
+      from: 'old-node',
+      fromLeaf: 'old-node',
+      to: 'manual-node',
+      leaf: 'manual-leaf',
+      detectedAt: '2026-10-23T10:00:00.000Z',
+    },
+  }));
+  await writeFile(logFile, '');
+
+  const snapshot = await buildStatusSnapshot({ stateFile, logFile });
+  assert.equal(snapshot.externalSelectionAdmission.to, 'manual-node');
+  assert.equal(snapshot.externalSelectionAdmission.leaf, 'manual-leaf');
+  assert.ok(snapshot.warnings.includes('外部节点待准入/已拒绝，正在寻找合格候选'));
+  assert.match(
+    formatStatus(snapshot),
+    /外部节点准入\s+: 外部节点待准入\/已拒绝，正在寻找合格候选：manual-node/,
+  );
+});
+
 test('status pairs telemetry at or before the latest evaluation across cycle interleaving', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'watchdog-status-interleaved-'));
   const stateFile = path.join(root, 'state.json');
@@ -239,4 +266,65 @@ test('status hides expired scan backoff and keeps a future backoff active', asyn
   assert.equal(active.scanBackoff.until, futureUntil);
   assert.equal(active.scanBackoff.reason, 'upstream-outage');
   assert.match(formatStatus(active), new RegExp(`扫描退避\\s+: 至 ${futureUntil}`));
+});
+
+test('status exposes the latest guardrail result', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'route-sentinel-guard-status-'));
+  const stateFile = path.join(root, 'state.json');
+  const logFile = path.join(root, 'watchdog.ndjson');
+  await writeFile(stateFile, '{}');
+  await writeFile(logFile, `${JSON.stringify({
+    timestamp: '2026-10-23T10:00:00.000Z',
+    event: 'guardrail-evaluated',
+    status: 'repaired',
+    ready: true,
+    issues: ['runtime-mode'],
+    repairs: ['runtime-mode'],
+  })}\n`);
+
+  const snapshot = await buildStatusSnapshot({ stateFile, logFile });
+  assert.equal(snapshot.guardrails.status, 'repaired');
+  assert.deepEqual(snapshot.guardrails.repairs, ['runtime-mode']);
+  assert.match(formatStatus(snapshot), /配置守卫\s+: repaired，问题 1，修复 1/);
+});
+
+test('blocked guardrail produces an explicit fail-closed warning', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'route-sentinel-guard-blocked-'));
+  const stateFile = path.join(root, 'state.json');
+  const logFile = path.join(root, 'watchdog.ndjson');
+  await writeFile(stateFile, '{}');
+  await writeFile(logFile, `${JSON.stringify({
+    timestamp: '2026-10-23T10:00:00.000Z',
+    event: 'guardrail-evaluated',
+    status: 'blocked',
+    ready: false,
+    issues: ['dns-override', 'clash-verge-reload-failed'],
+    repairs: ['dns-override-persisted'],
+  })}\n`);
+
+  const snapshot = await buildStatusSnapshot({ stateFile, logFile });
+  assert.ok(snapshot.warnings.some((message) => (
+    message.includes('配置守卫未就绪') && message.includes('clash-verge-reload-failed')
+  )));
+  assert.match(formatStatus(snapshot), /链路探测与节点切换已暂停/);
+});
+
+test('status exposes runtime mode guard failures and switch blocking', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'route-sentinel-runtime-guard-'));
+  const stateFile = path.join(root, 'state.json');
+  const logFile = path.join(root, 'watchdog.ndjson');
+  await writeFile(stateFile, '{}');
+  await writeFile(logFile, `${JSON.stringify({
+    timestamp: '2026-10-23T10:00:00.000Z',
+    event: 'runtime-mode-guard-evaluated',
+    status: 'blocked',
+    ready: false,
+    issues: ['controller-unreachable'],
+    repairs: [],
+  })}\n`);
+
+  const snapshot = await buildStatusSnapshot({ stateFile, logFile });
+  assert.equal(snapshot.runtimeModeGuard.status, 'blocked');
+  assert.ok(snapshot.warnings.some((message) => message.includes('任何节点切换均被禁止')));
+  assert.match(formatStatus(snapshot), /运行模式守卫\s+: blocked/);
 });

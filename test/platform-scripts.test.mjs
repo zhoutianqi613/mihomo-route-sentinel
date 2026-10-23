@@ -40,3 +40,24 @@ test('Windows 安装器不在参数绑定阶段读取 PSScriptRoot', async () =>
   assert.doesNotMatch(paramBlock, /\$PSScriptRoot/);
   assert.match(source, /IsNullOrWhiteSpace\(\$ConfigPath\)/);
 });
+
+test('Windows BAT 暴露六个服务生命周期动作', async () => {
+  const source = await readFile(new URL('service-windows.bat', root), 'utf8');
+  for (const action of ['start', 'stop', 'restart', 'disable', 'enable', 'status']) {
+    assert.match(source, new RegExp(`\\b${action}\\b`));
+  }
+  assert.match(source, /service-windows\.ps1/);
+});
+
+test('Windows 服务使用隐藏宿主并按 CLI 绝对路径清理进程', async () => {
+  const [service, hiddenHost] = await Promise.all([
+    readFile(new URL('service-windows.ps1', root), 'utf8'),
+    readFile(new URL('run-hidden.vbs', root), 'utf8'),
+  ]);
+  assert.match(service, /ValidateSet\('start', 'stop', 'restart', 'disable', 'enable', 'status'\)/);
+  assert.match(service, /Name = 'node\.exe'/);
+  assert.match(service, /IndexOf\(\$cliPath, \[StringComparison\]::OrdinalIgnoreCase\)/);
+  assert.match(service, /Stop-Process -Id \$process\.ProcessId -Force/);
+  assert.match(service, /wscript\.exe/);
+  assert.match(hiddenHost, /shell\.Run\(command, 0, True\)/);
+});

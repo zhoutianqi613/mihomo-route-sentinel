@@ -36,7 +36,12 @@ export class MihomoController {
     return { kind: 'http', endpoint: this.transport.url.origin };
   }
 
-  async request(method, requestPath, body) {
+  rediscoverPipeTransport() {
+    const pipePath = this.config.pipePath || discoverWindowsPipe(this.config.pipePattern);
+    return pipePath ? { kind: 'pipe', pipePath } : null;
+  }
+
+  async requestOnce(method, requestPath, body) {
     const payload = body === undefined ? null : Buffer.from(JSON.stringify(body));
     const headers = { Accept: 'application/json' };
     if (payload) {
@@ -77,11 +82,42 @@ export class MihomoController {
           }
         });
       });
-      req.setTimeout(this.config.requestTimeoutMs, () => req.destroy(new Error('Mihomo API 请求超时')));
+      req.setTimeout(this.config.requestTimeoutMs, () => {
+        const timeout = new Error('Mihomo API 请求超时');
+        timeout.code = 'ETIMEDOUT';
+        req.destroy(timeout);
+      });
       req.on('error', reject);
       if (payload) req.write(payload);
       req.end();
     });
+  }
+
+  async request(method, requestPath, body) {
+    if (this.config.transport === 'auto' && this.transport.kind === 'http') {
+      const rediscovered = this.rediscoverPipeTransport();
+      if (rediscovered) this.transport = rediscovered;
+    }
+    try {
+      return await this.requestOnce(method, requestPath, body);
+    } catch (error) {
+      const recoverable = new Set(['ENOENT', 'ECONNREFUSED', 'ECONNRESET', 'EPIPE', 'ETIMEDOUT']);
+      if (!recoverable.has(error?.code)) throw error;
+      if (!['auto', 'pipe'].includes(this.config.transport)) throw error;
+      const rediscovered = this.rediscoverPipeTransport();
+      // Pipe 重启窗口内可能暂时消失；auto 的 HTTP fallback 也必须持续尝试回到 Pipe。
+      if (!rediscovered) throw error;
+      this.transport = rediscovered;
+      return this.requestOnce(method, requestPath, body);
+    }
+  }
+
+  async getConfigs() {
+    return (await this.request('GET', '/configs')).data;
+  }
+
+  async patchConfigs(patch) {
+    await this.request('PATCH', '/configs', patch);
   }
 
   async getProxy(name) {

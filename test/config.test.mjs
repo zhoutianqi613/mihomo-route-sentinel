@@ -18,19 +18,31 @@ async function withConfig(value, action) {
 }
 
 const minimal = {
-  configVersion: 2,
+  configVersion: 3,
   groups: { target: 'PROXY', candidates: 'Candidates' },
 };
 
-test('v1 配置可内存迁移到 v2 并补齐新默认值', async () => {
+test('v1 配置可内存迁移到 v3 并补齐新默认值', async () => {
   await withConfig({ groups: minimal.groups }, async (configPath) => {
     const config = await loadConfig(configPath);
     assert.equal(config.configVersion, CURRENT_CONFIG_VERSION);
     assert.equal(config.probes.parallelism, 4);
     assert.deepEqual(config.probes.controlUrls, ['https://cp.cloudflare.com/generate_204']);
     assert.equal(config.policy.switchBudgetCount, 3);
+    assert.equal(config.policy.immediateMaxSingleMs, 2500);
     assert.equal(config.logging.maxBytes, 5242880);
     assert.equal(config.telemetry.enabled, true);
+    assert.equal(config.guardrails.expectedRuntimeMode, 'rule');
+    assert.equal(config.guardrails.disableClashVergeDnsOverride, true);
+  });
+});
+
+test('v2 配置可内存迁移到 v3 且不会静默启用外部配置修改', async () => {
+  await withConfig({ ...minimal, configVersion: 2 }, async (configPath) => {
+    const config = await loadConfig(configPath);
+    assert.equal(config.configVersion, CURRENT_CONFIG_VERSION);
+    assert.equal(config.guardrails.enabled, false);
+    assert.equal(config.guardrails.autoRepair, true);
   });
 });
 
@@ -41,7 +53,7 @@ test('未来配置版本被明确拒绝', async () => {
 });
 
 test('示例占位组名会给出可操作错误', async () => {
-  await withConfig({ configVersion: 2 }, async (configPath) => {
+  await withConfig({ configVersion: 3 }, async (configPath) => {
     await assert.rejects(loadConfig(configPath), /仍是占位值.*实际存在的策略组名/);
   });
 });
@@ -59,9 +71,12 @@ for (const [label, override, expected] of [
   ['WebSocket 遥测目标必须为 WSS', { telemetry: { websocketUrl: 'ws://example.com/' } }, /telemetry\.websocketUrl.*wss:/],
   ['代理遥测只允许 HTTP', { telemetry: { proxyUrl: 'https://example.com/' } }, /telemetry\.proxyUrl.*http:/],
   ['遥测 URL 不得内嵌凭据', { telemetry: { proxyUrl: 'http://user:pass@example.com/' } }, /telemetry URL.*凭据/],
+  ['配置守卫禁止 direct 目标模式', { guardrails: { expectedRuntimeMode: 'direct' } }, /expectedRuntimeMode.*不允许 direct/],
+  ['Clash Verge 配置目录必须是绝对路径', { guardrails: { clashVergeAppDir: './relative' } }, /clashVergeAppDir.*绝对路径/],
   ['扫描 URL 数不得超过 URL 数组', { probes: { scanUrlCount: 3 } }, /scanUrlCount.*urls/],
   ['候选节点门槛不得更宽', { probes: { candidateMaxAverageMs: 900 } }, /候选节点延迟准入线/],
   ['候选短名单必须覆盖尝试数', { probes: { topCandidates: 2 } }, /topCandidates.*maxSwitchAttempts/],
+  ['立即响应尖峰必须高于当前单次健康线', { policy: { immediateMaxSingleMs: 1500 } }, /immediateMaxSingleMs.*currentMaxSingleMs/],
 ]) {
   test(label, async () => {
     await withConfig({ ...minimal, ...override }, async (configPath) => {

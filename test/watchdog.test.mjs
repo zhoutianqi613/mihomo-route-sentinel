@@ -13,6 +13,7 @@ function startMockController({
   flakyCandidate = false,
   candidates: configuredCandidates,
   delayResolver,
+  targetHistoryDelay,
 } = {}) {
   let selected = initialSelected;
   const switches = [];
@@ -25,7 +26,13 @@ function startMockController({
 
     if (request.method === 'GET' && url.pathname === '/proxies/XFLTD') {
       response.setHeader('Content-Type', 'application/json');
-      response.end(JSON.stringify({ name: 'XFLTD', type: 'Selector', now: selected, alive: true }));
+      response.end(JSON.stringify({
+        name: 'XFLTD',
+        type: 'Selector',
+        now: selected,
+        alive: true,
+        history: targetHistoryDelay == null ? [] : [{ delay: targetHistoryDelay }],
+      }));
       return;
     }
     if (request.method === 'GET' && url.pathname === '/proxies/candidates') {
@@ -136,6 +143,7 @@ test('health classification distinguishes hard, partial, and latency failures', 
   const policy = {
     emergencySuccessRate: 0.5,
     emergencyMaxAverageMs: 3000,
+    immediateMaxSingleMs: 2500,
   };
   assert.deepEqual(classifyHealth({ successRate: 0.5, averageMs: 800, maxMs: 900 }, thresholds, policy), {
     stable: false,
@@ -158,6 +166,17 @@ test('health classification distinguishes hard, partial, and latency failures', 
   assert.equal(classifyHealth({ successRate: 1, averageMs: 500, maxMs: 1000 }, thresholds, policy).quality, 'excellent');
   assert.equal(classifyHealth({ successRate: 1, averageMs: 700, maxMs: 1400 }, thresholds, policy).quality, 'acceptable');
   assert.equal(classifyHealth({ successRate: 1, averageMs: 1000, maxMs: 2000 }, thresholds, policy).quality, 'degraded');
+  assert.deepEqual(classifyHealth({ successRate: 1, averageMs: 1400, maxMs: 2600 }, thresholds, policy), {
+    stable: false,
+    emergency: false,
+    status: 'latency-spike',
+    quality: 'unacceptable',
+  });
+  assert.equal(classifyHealth(
+    { successRate: 1, averageMs: 1400, maxMs: 2600 },
+    { ...thresholds, maxAverageMs: 5000, maxSingleMs: 5000 },
+    policy,
+  ).stable, false);
 });
 
 test('watchdog switches an unhealthy node to a validated candidate', async (t) => {
@@ -177,10 +196,34 @@ test('watchdog switches an unhealthy node to a validated candidate', async (t) =
   assert.equal(mock.getSelected(), 'good-node');
   assert.deepEqual(mock.switches, ['good-node']);
   assert.ok(events.some((entry) => entry.event === 'switch-verified'));
+  const next = await watchdog.runOnce({ dryRun: false });
+  assert.equal(next.status, 'healthy');
+  assert.equal(events.some((entry) => entry.event === 'external-selection-detected'), false);
   const state = JSON.parse(await readFile(config.files.state, 'utf8'));
   assert.equal(state.lastSwitch.to, 'good-node');
   assert.equal(state.lastSwitch.verified, true);
   assert.equal(state.switchHistory.length, 1);
+});
+
+test('runtime guard failure blocks every actual node selection', async (t) => {
+  const mock = await startMockController();
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  const controller = new MihomoController(config.controller, {});
+  const watchdog = new Watchdog({
+    controller,
+    config,
+    logger: async () => {},
+    beforeSwitch: async () => {
+      const error = new Error('guard blocked');
+      error.code = 'GUARDRAIL_BLOCKED';
+      throw error;
+    },
+  });
+
+  await assert.rejects(watchdog.runOnce({ dryRun: false }), { code: 'GUARDRAIL_BLOCKED' });
+  assert.equal(mock.getSelected(), 'bad-node');
+  assert.deepEqual(mock.switches, []);
 });
 
 test('dry run recommends a candidate without switching', async (t) => {
@@ -279,6 +322,172 @@ test('stable node synchronizes runtime selection and clears its stale quarantine
   assert.equal(state.quarantinedNodes['other-node'].reason, 'other-failure');
 });
 
+test('external selection is strictly admitted from real probes and ignores UI 5000 placeholder', async (t) => {
+  const mock = await startMockController({
+    initialSelected: 'good-node',
+    targetHistoryDelay: 5000,
+  });
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  await writeFile(config.files.state, JSON.stringify({
+    currentSelection: 'good-node',
+    currentLeaf: 'old-node',
+  }));
+  const events = [];
+  const controller = new MihomoController(config.controller, {});
+  const watchdog = new Watchdog({
+    controller,
+    config,
+    logger: async (level, event, details) => events.push({ level, event, details }),
+  });
+
+  const result = await watchdog.runOnce({ dryRun: false });
+  assert.equal(result.status, 'external-selection-admitted');
+  assert.equal(mock.probeCounts.get('good-node\u0000https://service.example/'), 2);
+  assert.deepEqual(mock.switches, []);
+  assert.equal(events.some((entry) => entry.event === 'external-selection-detected'
+    && entry.details.expected === 'good-node'
+    && entry.details.expectedLeaf === 'old-node'
+    && entry.details.observedLeaf === 'good-node'), true);
+  assert.equal(events.some((entry) => entry.event === 'external-selection-validation-completed'
+    && entry.details.admitted === true
+    && entry.details.maxMs === 120), true);
+  const state = JSON.parse(await readFile(config.files.state, 'utf8'));
+  assert.equal(state.currentSelection, 'good-node');
+  assert.equal(state.externalSelectionPendingAdmission, undefined);
+  assert.equal(state.lastExternalSelection.verified, true);
+});
+
+test('legacy selection state is revalidated once and replaced when candidate admission fails', async (t) => {
+  const mock = await startMockController({
+    initialSelected: 'legacy-node',
+    candidates: ['legacy-node', 'good-node'],
+    delayResolver: ({ name }) => name === 'legacy-node' ? 700 : 100,
+  });
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  await writeFile(config.files.state, JSON.stringify({
+    currentSelection: 'legacy-node',
+    currentLeaf: 'legacy-node',
+  }));
+  const events = [];
+  const controller = new MihomoController(config.controller, {});
+  const watchdog = new Watchdog({
+    controller,
+    config,
+    logger: async (level, event, details) => events.push({ level, event, details }),
+  });
+
+  const result = await watchdog.runOnce({ dryRun: false });
+  assert.equal(result.status, 'switched');
+  assert.deepEqual(mock.switches, ['good-node']);
+  assert.equal(events.some((entry) => entry.event === 'external-selection-detected'), false);
+  assert.equal(events.some((entry) => entry.event === 'baseline-revalidation'
+    && entry.details.admitted === false), true);
+  const state = JSON.parse(await readFile(config.files.state, 'utf8'));
+  assert.equal(state.currentSelection, 'good-node');
+  assert.equal(state.selectionAdmissionVersion, 1);
+  assert.equal(state.externalSelectionPendingAdmission, undefined);
+  assert.equal(state.lastBaselineRevalidation.verified, false);
+});
+
+test('legacy selection state records the admission version after strict baseline acceptance', async (t) => {
+  const mock = await startMockController({ initialSelected: 'good-node' });
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  await writeFile(config.files.state, JSON.stringify({
+    currentSelection: 'good-node',
+    currentLeaf: 'good-node',
+  }));
+  const events = [];
+  const controller = new MihomoController(config.controller, {});
+  const watchdog = new Watchdog({
+    controller,
+    config,
+    logger: async (level, event, details) => events.push({ level, event, details }),
+  });
+
+  const result = await watchdog.runOnce({ dryRun: false });
+  assert.equal(result.status, 'baseline-revalidated');
+  assert.deepEqual(mock.switches, []);
+  assert.equal(events.some((entry) => entry.event === 'baseline-revalidation'
+    && entry.details.admitted === true), true);
+  const state = JSON.parse(await readFile(config.files.state, 'utf8'));
+  assert.equal(state.selectionAdmissionVersion, 1);
+  assert.equal(state.externalSelectionPendingAdmission, undefined);
+  assert.equal(state.lastBaselineRevalidation.verified, true);
+});
+
+test('unadmitted external selection immediately scans and every select still uses beforeSwitch', async (t) => {
+  const mock = await startMockController({
+    initialSelected: 'external-node',
+    candidates: ['external-node', 'good-node'],
+    delayResolver: ({ name }) => name === 'external-node' ? 700 : 100,
+  });
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  config.policy.latencyFailureCycles = 5;
+  config.policy.minimumDwellSeconds = 600;
+  await writeFile(config.files.state, JSON.stringify({
+    currentSelection: 'old-node',
+    currentLeaf: 'old-node',
+    lastSwitchAt: new Date().toISOString(),
+    candidateScanBackoffUntil: new Date(Date.now() + 600_000).toISOString(),
+    lastCandidateScanOutcome: 'no-stable-candidate',
+  }));
+  let beforeSwitchCalls = 0;
+  const events = [];
+  const controller = new MihomoController(config.controller, {});
+  const watchdog = new Watchdog({
+    controller,
+    config,
+    logger: async (level, event, details) => events.push({ level, event, details }),
+    beforeSwitch: async () => { beforeSwitchCalls += 1; },
+  });
+
+  const result = await watchdog.runOnce({ dryRun: false });
+  assert.equal(result.status, 'switched');
+  assert.equal(mock.getSelected(), 'good-node');
+  assert.deepEqual(mock.switches, ['good-node']);
+  assert.equal(beforeSwitchCalls, 1);
+  assert.equal(events.some((entry) => entry.event === 'external-selection-validation-completed'
+    && entry.details.admitted === false), true);
+  assert.equal(events.some((entry) => entry.event === 'current-node-evaluated'
+    && entry.details.health === 'external-selection-rejected'), true);
+  assert.equal(events.some((entry) => entry.event === 'node-switched'
+    && entry.details.reason === 'external-selection-rejected'), true);
+  const state = JSON.parse(await readFile(config.files.state, 'utf8'));
+  assert.equal(state.currentSelection, 'good-node');
+  assert.equal(state.externalSelectionPendingAdmission, undefined);
+  assert.equal(state.lastSwitch.source, 'sentinel');
+});
+
+test('unadmitted external selection remains pending when no replacement is available', async (t) => {
+  const mock = await startMockController({
+    initialSelected: 'external-node',
+    candidates: ['external-node'],
+    delayResolver: () => 700,
+  });
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  await writeFile(config.files.state, JSON.stringify({
+    currentSelection: 'old-node',
+    currentLeaf: 'old-node',
+  }));
+  const controller = new MihomoController(config.controller, {});
+  const watchdog = new Watchdog({ controller, config, logger: async () => {} });
+
+  const first = await watchdog.runOnce({ dryRun: false });
+  const second = await watchdog.runOnce({ dryRun: false });
+  assert.equal(first.status, 'no-candidate');
+  assert.equal(second.status, 'scan-backoff');
+  assert.deepEqual(mock.switches, []);
+  const state = JSON.parse(await readFile(config.files.state, 'utf8'));
+  assert.equal(state.currentSelection, 'old-node');
+  assert.equal(state.externalSelectionPendingAdmission.to, 'external-node');
+  assert.equal(state.lastExternalSelection.verified, false);
+});
+
 test('active degraded node is removed from quarantine before failure threshold returns', async (t) => {
   const mock = await startMockController({ initialSelected: 'degraded-node' });
   t.after(() => mock.server.close());
@@ -344,6 +553,83 @@ test('emergency failure bypasses both failure threshold and minimum dwell', asyn
   const result = await watchdog.runOnce({ dryRun: false });
   assert.equal(result.status, 'switched');
   assert.equal(mock.getSelected(), 'good-node');
+});
+
+test('latency spike confirmation recovery does not switch immediately', async (t) => {
+  const mock = await startMockController({
+    initialSelected: 'spike-node',
+    candidates: ['spike-node', 'good-node'],
+    delayResolver: ({ name, probeCount }) => {
+      if (name === 'spike-node') return probeCount === 1 ? 2600 : 100;
+      return 100;
+    },
+  });
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  config.policy.latencyFailureCycles = 5;
+  config.policy.minimumDwellSeconds = 600;
+  config.policy.hardFailureConfirmSeconds = 0.001;
+  await writeFile(config.files.state, JSON.stringify({
+    currentSelection: 'spike-node',
+    currentLeaf: 'spike-node',
+    selectionAdmissionVersion: 1,
+    lastSwitchAt: new Date().toISOString(),
+  }));
+  const events = [];
+  const controller = new MihomoController(config.controller, {});
+  const watchdog = new Watchdog({
+    controller,
+    config,
+    logger: async (level, event, details) => events.push({ level, event, details }),
+  });
+
+  const result = await watchdog.runOnce({ dryRun: false });
+  assert.equal(result.status, 'transient-recovered');
+  assert.equal(mock.getSelected(), 'spike-node');
+  assert.deepEqual(mock.switches, []);
+  assert.equal(events.some((entry) => entry.event === 'current-node-evaluated'
+    && entry.details.health === 'latency-spike'
+    && entry.details.quality === 'unacceptable'), true);
+  assert.equal(events.some((entry) => entry.event === 'immediate-failure-confirmed'
+    && entry.details.trigger === 'latency-spike'
+    && entry.details.confirmed === false), true);
+});
+
+test('confirmed latency spike bypasses ordinary latency cycles and minimum dwell', async (t) => {
+  const mock = await startMockController({
+    initialSelected: 'spike-node',
+    candidates: ['spike-node', 'good-node'],
+    delayResolver: ({ name, probeCount }) => {
+      if (name === 'spike-node') return probeCount <= 2 ? 2600 : 100;
+      return 100;
+    },
+  });
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  config.policy.latencyFailureCycles = 5;
+  config.policy.minimumDwellSeconds = 600;
+  config.policy.hardFailureConfirmSeconds = 0.001;
+  await writeFile(config.files.state, JSON.stringify({
+    currentSelection: 'spike-node',
+    currentLeaf: 'spike-node',
+    selectionAdmissionVersion: 1,
+    lastSwitchAt: new Date().toISOString(),
+  }));
+  const events = [];
+  const controller = new MihomoController(config.controller, {});
+  const watchdog = new Watchdog({
+    controller,
+    config,
+    logger: async (level, event, details) => events.push({ level, event, details }),
+  });
+
+  const result = await watchdog.runOnce({ dryRun: false });
+  assert.equal(result.status, 'switched');
+  assert.equal(mock.getSelected(), 'good-node');
+  assert.deepEqual(mock.switches, ['good-node']);
+  assert.equal(events.some((entry) => entry.event === 'immediate-failure-confirmed'
+    && entry.details.trigger === 'latency-spike'
+    && entry.details.confirmed === true), true);
 });
 
 test('ordinary latency degradation still respects minimum dwell', async (t) => {
@@ -500,9 +786,10 @@ test('candidate scan backoff suppresses repeated full scans after no candidate',
 
   const first = await watchdog.runOnce({ dryRun: false });
   const second = await watchdog.runOnce({ dryRun: false });
-  assert.equal(first.status, 'no-improvement');
+  assert.equal(first.status, 'no-candidate');
   assert.equal(second.status, 'scan-backoff');
   assert.equal(events.filter((entry) => entry.event === 'candidate-scan-started').length, 1);
+  assert.equal(events.some((entry) => entry.event === 'no-stable-candidate'), true);
   assert.deepEqual(mock.switches, []);
 });
 

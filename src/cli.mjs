@@ -4,6 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from './config.mjs';
 import { MihomoController } from './controller.mjs';
+import { enforceGuardrails, enforceRuntimeMode } from './guardrails.mjs';
 import { probeRealLinks } from './link-probe.mjs';
 import { buildStatusSnapshot, createRotatingLogger, formatStatus } from './observability.mjs';
 import { Watchdog } from './watchdog.mjs';
@@ -99,7 +100,45 @@ async function main() {
     retainedFiles: config.logging?.retainedFiles,
   });
   const controller = new MihomoController(config.controller);
-  const watchdog = new Watchdog({ controller, config, logger });
+  // null 强制首轮独立检查落日志，状态页才能证明 5 秒守卫确实在运行。
+  let lastRuntimeGuardStatus = null;
+  let runtimeGuardQueue = Promise.resolve();
+  const runRuntimeGuard = () => {
+    const execute = async () => {
+      const runtimeGuard = await enforceRuntimeMode({
+        controller,
+        expectedMode: config.guardrails.expectedRuntimeMode,
+        autoRepair: config.guardrails.autoRepair,
+        dryRun: !options.apply,
+      });
+      if (runtimeGuard.status !== 'ok' || lastRuntimeGuardStatus !== runtimeGuard.status) {
+        await logger(
+          runtimeGuard.ready ? 'info' : 'warn',
+          'runtime-mode-guard-evaluated',
+          runtimeGuard,
+        );
+      }
+      lastRuntimeGuardStatus = runtimeGuard.status;
+      return runtimeGuard;
+    };
+    const next = runtimeGuardQueue.then(execute, execute);
+    runtimeGuardQueue = next.catch(() => {});
+    return next;
+  };
+  const watchdog = new Watchdog({
+    controller,
+    config,
+    logger,
+    beforeSwitch: async () => {
+      if (!config.guardrails.enabled) return;
+      const runtimeGuard = await runRuntimeGuard();
+      if (!runtimeGuard.ready) {
+        const error = new Error('运行模式守卫未就绪，禁止节点切换');
+        error.code = 'GUARDRAIL_BLOCKED';
+        throw error;
+      }
+    },
+  });
   await logger('info', 'watchdog-started', {
     mode: options.run ? 'continuous' : 'once',
     apply: options.apply,
@@ -117,27 +156,53 @@ async function main() {
   process.on('SIGINT', () => void stop('SIGINT'));
   process.on('SIGTERM', () => void stop('SIGTERM'));
 
+  const runtimeGuardTimer = options.run && options.apply && config.guardrails.enabled
+    ? setInterval(async () => {
+        if (stopping) return;
+        try {
+          await runRuntimeGuard();
+        } catch (error) {
+          // 定时守卫不能产生未处理的 Promise 拒绝；失败状态会在切换前再次核验并保持 fail-closed。
+          await logger('error', 'runtime-mode-guard-failed', {
+            errorType: error?.name ?? 'Error',
+          });
+        }
+      }, config.guardrails.runtimeModeCheckIntervalSeconds * 1000)
+    : null;
+  runtimeGuardTimer?.unref();
+
   try {
     do {
       const cycleStartedAt = Date.now();
       try {
-        let linkTelemetry = null;
-        if (config.telemetry?.enabled) {
-          try {
-            linkTelemetry = await probeRealLinks(config.telemetry);
-            await logger('info', 'link-telemetry', { metrics: linkTelemetry });
-          } catch (error) {
-            // 遥测只提供辅助信号；任何意外都不能阻断节点健康检查与故障恢复。
-            linkTelemetry = { enabled: true, error: 'telemetry-cycle-error' };
-            await logger('warn', 'link-telemetry-failed', { errorType: error?.name ?? 'Error' });
-          }
-        }
-        const result = await watchdog.runOnce({
+        const guardrail = await enforceGuardrails({
+          controller,
+          guardrails: config.guardrails,
+          guardStateFile: config.files.guardrailState,
           dryRun: !options.apply,
-          forceScan: options.forceScan,
-          linkTelemetry,
         });
-        await logger('info', 'watchdog-cycle-completed', { status: result.status });
+        await logger(guardrail.ready ? 'info' : 'warn', 'guardrail-evaluated', guardrail);
+        if (!guardrail.ready) {
+          await logger('warn', 'watchdog-cycle-completed', { status: guardrail.status });
+        } else {
+          let linkTelemetry = null;
+          if (config.telemetry?.enabled) {
+            try {
+              linkTelemetry = await probeRealLinks(config.telemetry);
+              await logger('info', 'link-telemetry', { metrics: linkTelemetry });
+            } catch (error) {
+              // 遥测只提供辅助信号；任何意外都不能阻断节点健康检查与故障恢复。
+              linkTelemetry = { enabled: true, error: 'telemetry-cycle-error' };
+              await logger('warn', 'link-telemetry-failed', { errorType: error?.name ?? 'Error' });
+            }
+          }
+          const result = await watchdog.runOnce({
+            dryRun: !options.apply,
+            forceScan: options.forceScan,
+            linkTelemetry,
+          });
+          await logger('info', 'watchdog-cycle-completed', { status: result.status });
+        }
       } catch (error) {
         await logger('error', 'watchdog-cycle-failed', { error: error.message });
         if (!options.run) throw error;
@@ -148,6 +213,7 @@ async function main() {
       if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
     } while (!stopping);
   } finally {
+    if (runtimeGuardTimer) clearInterval(runtimeGuardTimer);
     if (!stopping) await releaseLock();
   }
 }
