@@ -179,6 +179,29 @@ test('health classification distinguishes hard, partial, and latency failures', 
   ).stable, false);
 });
 
+test('候选连续验证任一轮不合格时不能被另一轮平均值掩盖', async (t) => {
+  const mock = await startMockController({
+    candidates: ['bad-node', 'mixed-node'],
+    delayResolver: ({ name, probeCount }) => {
+      if (name === 'bad-node') return null;
+      if (name === 'mixed-node') return probeCount % 2 === 0 ? 1100 : 100;
+      return 100;
+    },
+  });
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  const watchdog = new Watchdog({
+    controller: new MihomoController(config.controller),
+    config,
+    logger: async () => {},
+  });
+
+  const result = await watchdog.runOnce({ dryRun: true, forceScan: true });
+
+  assert.equal(result.status, 'no-candidate', JSON.stringify([...mock.probeCounts.entries()]));
+  assert.deepEqual(mock.switches, []);
+});
+
 test('watchdog switches an unhealthy node to a validated candidate', async (t) => {
   const mock = await startMockController();
   t.after(() => mock.server.close());

@@ -328,3 +328,23 @@ test('status exposes runtime mode guard failures and switch blocking', async () 
   assert.ok(snapshot.warnings.some((message) => message.includes('任何节点切换均被禁止')));
   assert.match(formatStatus(snapshot), /运行模式守卫\s+: blocked/);
 });
+
+test('status exposes Clash Verge process guard failures and recovery', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'route-sentinel-process-guard-'));
+  const stateFile = path.join(root, 'state.json');
+  const logFile = path.join(root, 'watchdog.ndjson');
+  await writeFile(stateFile, '{}');
+  await writeFile(logFile, `${JSON.stringify({
+    timestamp: '2026-10-23T10:00:00.000Z',
+    event: 'clash-verge-process-guard-evaluated',
+    status: 'blocked',
+    ready: false,
+    issues: ['clash-verge-not-running', 'clash-verge-start-backoff'],
+    repairs: [],
+  })}\n`);
+
+  const snapshot = await buildStatusSnapshot({ stateFile, logFile });
+  assert.equal(snapshot.processGuard.status, 'blocked');
+  assert.ok(snapshot.warnings.some((message) => message.includes('客户端进程守卫未就绪')));
+  assert.match(formatStatus(snapshot), /客户端进程守卫\s+: blocked/);
+});

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -18,11 +18,11 @@ async function withConfig(value, action) {
 }
 
 const minimal = {
-  configVersion: 3,
+  configVersion: 4,
   groups: { target: 'PROXY', candidates: 'Candidates' },
 };
 
-test('v1 配置可内存迁移到 v3 并补齐新默认值', async () => {
+test('v1 配置可内存迁移到 v4 并补齐新默认值', async () => {
   await withConfig({ groups: minimal.groups }, async (configPath) => {
     const config = await loadConfig(configPath);
     assert.equal(config.configVersion, CURRENT_CONFIG_VERSION);
@@ -34,15 +34,26 @@ test('v1 配置可内存迁移到 v3 并补齐新默认值', async () => {
     assert.equal(config.telemetry.enabled, true);
     assert.equal(config.guardrails.expectedRuntimeMode, 'rule');
     assert.equal(config.guardrails.disableClashVergeDnsOverride, true);
+    assert.equal(config.guardrails.ensureClashVergeRunning, false);
+    assert.equal(config.guardrails.clashVergeExecutable, '');
   });
 });
 
-test('v2 配置可内存迁移到 v3 且不会静默启用外部配置修改', async () => {
+test('v2 配置可内存迁移到 v4 且不会静默启用外部配置修改', async () => {
   await withConfig({ ...minimal, configVersion: 2 }, async (configPath) => {
     const config = await loadConfig(configPath);
     assert.equal(config.configVersion, CURRENT_CONFIG_VERSION);
     assert.equal(config.guardrails.enabled, false);
     assert.equal(config.guardrails.autoRepair, true);
+  });
+});
+
+test('v3 配置迁移到 v4 时不会自动启用客户端进程守卫', async () => {
+  await withConfig({ ...minimal, configVersion: 3, guardrails: { enabled: true } }, async (configPath) => {
+    const config = await loadConfig(configPath);
+    assert.equal(config.configVersion, CURRENT_CONFIG_VERSION);
+    assert.equal(config.guardrails.enabled, true);
+    assert.equal(config.guardrails.ensureClashVergeRunning, false);
   });
 });
 
@@ -53,7 +64,7 @@ test('未来配置版本被明确拒绝', async () => {
 });
 
 test('示例占位组名会给出可操作错误', async () => {
-  await withConfig({ configVersion: 3 }, async (configPath) => {
+  await withConfig({ configVersion: 4 }, async (configPath) => {
     await assert.rejects(loadConfig(configPath), /仍是占位值.*实际存在的策略组名/);
   });
 });
@@ -73,6 +84,9 @@ for (const [label, override, expected] of [
   ['遥测 URL 不得内嵌凭据', { telemetry: { proxyUrl: 'http://user:pass@example.com/' } }, /telemetry URL.*凭据/],
   ['配置守卫禁止 direct 目标模式', { guardrails: { expectedRuntimeMode: 'direct' } }, /expectedRuntimeMode.*不允许 direct/],
   ['Clash Verge 配置目录必须是绝对路径', { guardrails: { clashVergeAppDir: './relative' } }, /clashVergeAppDir.*绝对路径/],
+  ['Clash Verge 自动启动要求绝对可执行文件路径', { guardrails: { ensureClashVergeRunning: true } }, /ensureClashVergeRunning.*clashVergeExecutable/],
+  ['Clash Verge 可执行文件名必须匹配', { guardrails: { clashVergeExecutable: 'C:\\Tools\\other.exe' } }, /clashVergeExecutable.*clash-verge\.exe/],
+  ['Clash Verge 启动退避必须至少五秒', { guardrails: { clashVergeStartBackoffSeconds: 4 } }, /clashVergeStartBackoffSeconds.*5/],
   ['扫描 URL 数不得超过 URL 数组', { probes: { scanUrlCount: 3 } }, /scanUrlCount.*urls/],
   ['候选节点门槛不得更宽', { probes: { candidateMaxAverageMs: 900 } }, /候选节点延迟准入线/],
   ['候选短名单必须覆盖尝试数', { probes: { topCandidates: 2 } }, /topCandidates.*maxSwitchAttempts/],
@@ -104,4 +118,23 @@ test('配置分区必须是 JSON 对象', async () => {
   await withConfig({ ...minimal, telemetry: false }, async (configPath) => {
     await assert.rejects(loadConfig(configPath), /telemetry 必须是 JSON 对象/);
   });
+});
+
+test('README 逐项解释示例配置中的全部字段', async () => {
+  const example = JSON.parse(await readFile(path.resolve('config.example.json'), 'utf8'));
+  const readme = await readFile(path.resolve('README.md'), 'utf8');
+  const paths = [];
+
+  function collect(value, prefix = '') {
+    for (const [key, child] of Object.entries(value)) {
+      const field = prefix ? `${prefix}.${key}` : key;
+      if (child && typeof child === 'object' && !Array.isArray(child)) collect(child, field);
+      else paths.push(field);
+    }
+  }
+
+  collect(example);
+  for (const field of paths) {
+    assert.ok(readme.includes(`\`${field}\``), `README 缺少配置字段说明：${field}`);
+  }
 });

@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import {
   disableClashVergeDnsOverride,
+  enforceClashVergeAvailability,
   enforceGuardrails,
   enforceRuntimeMode,
   inspectClashVergeDnsOverride,
@@ -48,9 +49,175 @@ const baseGuardrails = Object.freeze({
   enabled: true,
   autoRepair: true,
   expectedRuntimeMode: 'rule',
+  ensureClashVergeRunning: false,
+  clashVergeExecutable: '',
+  clashVergeStartBackoffSeconds: 30,
+  clashVergeStartupTimeoutSeconds: 20,
   disableClashVergeDnsOverride: true,
   clashVergeAppDir: '',
   restartClashVergeOnDnsRepair: true,
+});
+
+async function createFakeClashVergeExecutable() {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'route-sentinel-app-'));
+  const executable = path.join(directory, 'clash-verge.exe');
+  await writeFile(executable, '', 'utf8');
+  return executable;
+}
+
+test('客户端进程守卫默认关闭且不检查或启动 Clash Verge', async () => {
+  let calls = 0;
+  const result = await enforceClashVergeAvailability({
+    controller: new MockController(),
+    guardrails: baseGuardrails,
+    dryRun: false,
+    platform: 'win32',
+    resolveRunningExecutable: async () => { calls += 1; return null; },
+    startExecutable: async () => { calls += 1; },
+  });
+  assert.equal(result.status, 'ok');
+  assert.equal(calls, 0);
+});
+
+test('客户端进程守卫可隐藏拉起缺失的 Clash Verge 并等待 Controller', async () => {
+  const executable = await createFakeClashVergeExecutable();
+  let running = false;
+  const starts = [];
+  const controller = new MockController();
+  const supervisorState = {};
+  const guardrails = {
+    ...baseGuardrails,
+    ensureClashVergeRunning: true,
+    clashVergeExecutable: executable,
+    clashVergeStartBackoffSeconds: 30,
+    clashVergeStartupTimeoutSeconds: 2,
+  };
+  const dependencies = {
+    resolveRunningExecutable: async () => running ? executable : null,
+    startExecutable: async (target) => { starts.push(target); running = true; },
+  };
+
+  const repaired = await enforceClashVergeAvailability({
+    controller,
+    guardrails,
+    dryRun: false,
+    platform: 'win32',
+    supervisorState,
+    ...dependencies,
+  });
+  assert.equal(repaired.status, 'repaired');
+  assert.deepEqual(repaired.repairs, ['clash-verge-started']);
+  assert.deepEqual(starts, [executable]);
+
+  const healthy = await enforceClashVergeAvailability({
+    controller,
+    guardrails,
+    dryRun: false,
+    platform: 'win32',
+    supervisorState,
+    ...dependencies,
+  });
+  assert.equal(healthy.status, 'ok');
+  assert.equal(starts.length, 1);
+});
+
+test('客户端进程自动启动失败后进入退避且保持 fail-closed', async () => {
+  const executable = await createFakeClashVergeExecutable();
+  let attempts = 0;
+  const supervisorState = {};
+  const guardrails = {
+    ...baseGuardrails,
+    ensureClashVergeRunning: true,
+    clashVergeExecutable: executable,
+    clashVergeStartBackoffSeconds: 30,
+    clashVergeStartupTimeoutSeconds: 1,
+  };
+  const dependencies = {
+    controller: new MockController(),
+    guardrails,
+    dryRun: false,
+    platform: 'win32',
+    supervisorState,
+    now: () => 1000,
+    resolveRunningExecutable: async () => null,
+    startExecutable: async () => { attempts += 1; throw new Error('start failed'); },
+  };
+
+  const failed = await enforceClashVergeAvailability(dependencies);
+  const backedOff = await enforceClashVergeAvailability(dependencies);
+  assert.equal(failed.status, 'blocked');
+  assert.ok(failed.unresolved.includes('clash-verge-start-failed'));
+  assert.equal(backedOff.status, 'blocked');
+  assert.ok(backedOff.unresolved.includes('clash-verge-start-backoff'));
+  assert.equal(attempts, 1);
+});
+
+test('启动命令返回但客户端进程未存活时不能误报修复成功', async () => {
+  const executable = await createFakeClashVergeExecutable();
+  let clock = 1000;
+  let starts = 0;
+  const supervisorState = {};
+  const result = await enforceClashVergeAvailability({
+    controller: new MockController(),
+    guardrails: {
+      ...baseGuardrails,
+      ensureClashVergeRunning: true,
+      clashVergeExecutable: executable,
+      clashVergeStartupTimeoutSeconds: 1,
+    },
+    dryRun: false,
+    platform: 'win32',
+    now: () => clock,
+    wait: async (milliseconds) => { clock += milliseconds; },
+    supervisorState,
+    resolveRunningExecutable: async () => null,
+    startExecutable: async () => { starts += 1; },
+  });
+
+  assert.equal(result.status, 'blocked');
+  assert.ok(result.unresolved.includes('clash-verge-startup-timeout'));
+  assert.equal(starts, 1);
+
+  const backedOff = await enforceClashVergeAvailability({
+    controller: new MockController(),
+    guardrails: {
+      ...baseGuardrails,
+      ensureClashVergeRunning: true,
+      clashVergeExecutable: executable,
+      clashVergeStartBackoffSeconds: 30,
+      clashVergeStartupTimeoutSeconds: 1,
+    },
+    dryRun: false,
+    platform: 'win32',
+    now: () => clock,
+    wait: async (milliseconds) => { clock += milliseconds; },
+    supervisorState,
+    resolveRunningExecutable: async () => null,
+    startExecutable: async () => { starts += 1; },
+  });
+  assert.equal(backedOff.status, 'blocked');
+  assert.ok(backedOff.unresolved.includes('clash-verge-start-backoff'));
+  assert.equal(starts, 1);
+});
+
+test('Dry Run 只报告 Clash Verge 预计启动且不修改外部状态', async () => {
+  const executable = await createFakeClashVergeExecutable();
+  let starts = 0;
+  const result = await enforceClashVergeAvailability({
+    controller: new MockController(),
+    guardrails: {
+      ...baseGuardrails,
+      ensureClashVergeRunning: true,
+      clashVergeExecutable: executable,
+    },
+    dryRun: true,
+    platform: 'win32',
+    resolveRunningExecutable: async () => null,
+    startExecutable: async () => { starts += 1; },
+  });
+  assert.equal(result.status, 'would-repair');
+  assert.equal(result.ready, false);
+  assert.equal(starts, 0);
 });
 
 test('独立运行模式守卫可在长周期之间快速修复 direct', async () => {

@@ -14,6 +14,7 @@
 - 使用公共对照 URL 识别上游整体故障，避免无意义换节点。
 - 记录 HTTPS 的 TLS/TTFB 与 WebSocket 链路指标，结构化日志按大小轮转。
 - 配置版本化：兼容无版本的 v1，拒绝未来的不兼容版本。
+- Windows 可选客户端进程守卫：服务启动时或运行中发现 Clash Verge 退出，可按退避策略后台恢复。
 - Windows 使用隐藏的 Windows Script Host 启动计划任务，后台运行时不显示 Node.js 终端窗口。
 - 默认单次 Dry Run；必须显式使用 `--apply` 才会修改节点选择。
 
@@ -53,31 +54,117 @@ node .\src\cli.mjs --config .\config.json --status-json
 
 `--status` 只读 Controller、状态和日志，不获取守护进程锁，不发起探测或切换。
 
-## 配置重点
+## 完整配置参考
 
-- `configVersion`：当前为 `3`。v1/v2 配置会在内存中迁移，原文件不会被改写。
-- `groups.target`：需要被切换的 Selector。必须把示例的 `CHANGE_ME_TARGET_SELECTOR` 改为实际组名。
-- `groups.candidates`：包含实际节点的候选组。必须把 `CHANGE_ME_CANDIDATE_GROUP` 改为实际组名。
-- `probes.urls`：真实业务目标，应至少配置两个。
-- `probes.controlUrls`：不依赖 OpenAI 的公共对照目标，用于区分节点故障和上游故障。
-- `currentRounds`：每轮对当前节点的探测次数。
-- `partialFailureCycles`：部分请求失败多少个周期后切换。
-- `latencyFailureCycles`：纯延迟退化多少个周期后评估切换。
-- `includeRegex` / `excludeRegex`：限制允许参与切换的节点名称。
-- `minimumDwellSeconds`：只约束纯延迟优化的最短驻留时间；不阻止故障恢复。
-- `minimumImprovementMs` / `minimumImprovementRatio`：延迟型切换所需的最小收益。
-- `policy.immediateMaxSingleMs`：不可接受尖峰的立即确认线，默认 2500 ms；必须高于当前节点单次健康上限。
-- `failedNodeQuarantineSeconds`：故障节点隔离时间。
-- `candidateScanBackoffSeconds`：没有合格候选时的再扫描退避，默认 120 秒。
-- `switchBudgetCount` / `switchBudgetWindowSeconds`：滚动时间窗内的最大切换数，默认 10 分钟内 3 次。
-- `logging.maxBytes` / `logging.retainedFiles`：单个日志的轮转阈值和保留份数。
-- `telemetry.*`：通过本地代理检查 HTTPS TLS/TTFB 和 WebSocket；对不同客户端需要调整 `proxyUrl`。
-- `guardrails.expectedRuntimeMode`：允许 `rule` 或 `global`，默认强制为 `rule`；禁止把 `direct` 设为目标模式。
-- `guardrails.runtimeModeCheckIntervalSeconds`：独立运行模式守卫的检查间隔，默认 5 秒；候选扫描再慢也不会让手动 `direct` 长时间生效。
-- `guardrails.disableClashVergeDnsOverride`：使用 Clash Verge Named Pipe 时，检查当前订阅的 DNS 覆写并自动关闭。
-- `guardrails.clashVergeAppDir`：Windows Named Pipe 模式可留空并自动发现；HTTP Controller、Linux 和 macOS 必须填写绝对路径后才会检测 DNS 覆写。
-- `guardrails.restartClashVergeOnDnsRepair`：Windows 修复 DNS 覆写后自动隐藏重启 Clash Verge，使修复进入运行态。
-- `files.guardrailState`：保存“DNS 已修改但尚未确认重载”的持久债务；只有运行态复核成功才会清除。
+以下字段与 `config.example.json` 一一对应。时间字段未特别说明时单位为秒，延迟字段单位为毫秒。
+
+### 根配置与 Controller
+
+| 字段 | 默认值 | 说明 |
+|---|---:|---|
+| `configVersion` | `4` | 配置格式版本。旧版配置只在内存中迁移，原文件不会被改写。 |
+| `controller.transport` | `auto` | Controller 连接方式：`auto`、`http` 或 `pipe`；`auto` 在 Windows 优先发现 Clash Verge Named Pipe。 |
+| `controller.url` | `http://127.0.0.1:9090` | HTTP Controller 地址；使用 `http` 时生效，也是 `auto` 无法发现管道时的后备地址。 |
+| `controller.pipePath` | 空 | 显式 Named Pipe 路径；留空时按 `pipePattern` 自动发现。 |
+| `controller.pipePattern` | `^verge-mihomo-(production\|sidecar-release)-` | 自动发现 Named Pipe 的正则表达式。 |
+| `controller.secretEnv` | `MIHOMO_CONTROLLER_SECRET` | Controller 密钥所在的环境变量名；配置文件不保存密钥值。 |
+| `controller.requestTimeoutMs` | `5000` | Controller API 单次请求超时。 |
+
+### 代理组
+
+| 字段 | 默认值 | 说明 |
+|---|---:|---|
+| `groups.target` | 占位符 | Sentinel 实际控制的 Selector，必须替换 `CHANGE_ME_TARGET_SELECTOR`。 |
+| `groups.candidates` | 占位符 | 提供可选节点的代理组，必须替换 `CHANGE_ME_CANDIDATE_GROUP`。 |
+
+### 探测与候选准入
+
+| 字段 | 默认值 | 说明 |
+|---|---:|---|
+| `probes.urls` | ChatGPT、OpenAI API | 真实业务探测 URL 列表，至少两个 HTTP/HTTPS 地址。 |
+| `probes.controlUrls` | Cloudflare 204 | 非 OpenAI 对照 URL，用于区分节点故障与上游服务故障。 |
+| `probes.timeoutMs` | `5000` | 单次 URL 探测超时。 |
+| `probes.currentRounds` | `2` | 每周期对当前节点执行的探测轮数。 |
+| `probes.currentMinSuccessRate` | `1` | 当前节点健康所需成功率；`1` 表示 100%。 |
+| `probes.currentMaxAverageMs` | `800` | 当前节点可接受的平均延迟上限。 |
+| `probes.currentMaxSingleMs` | `1500` | 当前节点可接受的单次最大延迟上限。 |
+| `probes.scanRounds` | `1` | 初筛每个候选的探测轮数。 |
+| `probes.scanUrlCount` | `1` | 初筛使用 `urls` 前 N 个地址。 |
+| `probes.validationRounds` | `2` | 候选进入切换前必须连续通过的严格验证轮数。 |
+| `probes.topCandidates` | `6` | 初筛后进入严格验证的候选数量上限。 |
+| `probes.parallelism` | `4` | 候选初筛并发数。 |
+| `probes.candidateMinSuccessRate` | `1` | 候选准入成功率；默认要求 100%。 |
+| `probes.candidateMaxAverageMs` | `600` | 候选准入平均延迟上限。 |
+| `probes.candidateMaxSingleMs` | `1200` | 候选准入单次最大延迟上限。 |
+| `probes.includeRegex` | 空 | 只允许名称匹配该正则的节点；空表示不限制。 |
+| `probes.excludeRegex` | 空 | 排除名称匹配该正则的节点；空表示不排除。 |
+
+### 切换策略
+
+| 字段 | 默认值 | 说明 |
+|---|---:|---|
+| `policy.intervalSeconds` | `30` | 主健康检查周期；上一轮超时则完成后立即进入下一轮。 |
+| `policy.partialFailureCycles` | `2` | 部分请求失败连续达到该周期数后触发候选扫描。 |
+| `policy.latencyFailureCycles` | `3` | 纯延迟退化连续达到该周期数后评估切换。 |
+| `policy.hardFailureConfirmSeconds` | `5` | 硬故障或不可接受尖峰的复核等待时间。 |
+| `policy.minimumDwellSeconds` | `120` | 纯延迟优化的最短驻留时间；故障恢复不受此限制。 |
+| `policy.minimumImprovementMs` | `200` | 延迟型切换要求候选至少改善的绝对延迟。 |
+| `policy.minimumImprovementRatio` | `0.2` | 延迟型切换要求候选至少改善的比例；默认 20%。绝对值与比例满足其一即可。 |
+| `policy.failedNodeQuarantineSeconds` | `900` | 失败节点隔离时间。 |
+| `policy.maxSwitchAttempts` | `3` | 单次恢复流程最多尝试的候选数量。 |
+| `policy.postSwitchDelaySeconds` | `2` | 切换后开始复核前的等待时间。 |
+| `policy.postSwitchRounds` | `2` | 切换后新节点必须通过的验证轮数。 |
+| `policy.rollbackOnFailure` | `true` | 新节点验证失败时，仅在原节点重新合格后允许回滚。 |
+| `policy.emergencySuccessRate` | `0.5` | 成功率小于或等于该值视为硬故障。 |
+| `policy.emergencyMaxAverageMs` | `3000` | 平均延迟超过该值视为硬故障。 |
+| `policy.immediateMaxSingleMs` | `2500` | 任一次真实探测超过该值即进入快速复核。 |
+| `policy.candidateScanBackoffSeconds` | `120` | 没有合格候选后的再次扫描退避。 |
+| `policy.switchBudgetCount` | `3` | 滚动窗口内允许的最大切换次数。 |
+| `policy.switchBudgetWindowSeconds` | `600` | 切换预算的滚动窗口长度。 |
+| `policy.upstreamFailureMinCandidates` | `3` | 至少多少个候选呈现同类业务失败时，可结合对照 URL 判定上游故障并抑制切换。 |
+
+### 日志与真实链路遥测
+
+| 字段 | 默认值 | 说明 |
+|---|---:|---|
+| `logging.maxBytes` | `5242880` | 单个 NDJSON 日志文件达到该字节数后轮转。 |
+| `logging.retainedFiles` | `14` | 保留的轮转日志份数。 |
+| `telemetry.enabled` | `true` | 是否额外检测经本地代理访问 HTTPS 与 WebSocket 的真实链路。 |
+| `telemetry.proxyUrl` | `http://127.0.0.1:7897` | 遥测使用的本地 HTTP 代理地址，应与客户端监听端口一致。 |
+| `telemetry.httpsUrl` | `https://chatgpt.com/` | HTTPS/TLS/TTFB 遥测目标。 |
+| `telemetry.websocketUrl` | Codex Responses WebSocket | WebSocket 握手遥测目标。 |
+| `telemetry.timeoutMs` | `5000` | 每项遥测超时。 |
+
+### 配置与客户端进程守卫
+
+| 字段 | 默认值 | 说明 |
+|---|---:|---|
+| `guardrails.enabled` | `true` | 是否启用运行模式、客户端进程及 DNS 覆写守卫。关闭后不执行这些检查或修复。 |
+| `guardrails.autoRepair` | `true` | 是否实际执行自动纠正；`false` 时只报告 `would-repair` 并阻止切换。 |
+| `guardrails.expectedRuntimeMode` | `rule` | 期望 Mihomo 模式，只允许 `rule` 或 `global`；禁止把 `direct` 作为目标模式。 |
+| `guardrails.runtimeModeCheckIntervalSeconds` | `5` | 独立守卫检查周期，同时用于发现客户端被关闭。 |
+| `guardrails.ensureClashVergeRunning` | `false` | Windows 可选进程守卫。设为 `true` 后，服务启动时或运行中发现 Clash Verge 未运行，会后台启动它；准备主动退出客户端前应先停止 Sentinel 或关闭本项。 |
+| `guardrails.clashVergeExecutable` | 空 | Clash Verge 可执行文件的可信绝对路径；启用进程守卫时必填且文件名必须是 `clash-verge.exe`。已运行进程路径不一致时拒绝重复启动。 |
+| `guardrails.clashVergeStartBackoffSeconds` | `30` | 启动失败或超时后的最短重试间隔，避免持续拉起进程。 |
+| `guardrails.clashVergeStartupTimeoutSeconds` | `20` | 启动后等待 Controller 恢复的最长时间；超时则保持故障关闭并进入退避。 |
+| `guardrails.disableClashVergeDnsOverride` | `true` | 是否检查当前订阅的 DNS 覆写，并在发现错误开启时自动关闭。 |
+| `guardrails.clashVergeAppDir` | 空 | Clash Verge 应用数据目录。Windows Named Pipe 模式可留空自动发现；HTTP Controller、Linux 和 macOS 需填写绝对路径才检测 DNS 覆写。 |
+| `guardrails.restartClashVergeOnDnsRepair` | `true` | Windows 修复 DNS 覆写后是否隐藏重启 Clash Verge，使持久化修改进入运行态。 |
+
+进程守卫只在 Windows 上执行，不会杀死或强制重启一个已经运行的正常客户端。若启动文件缺失、运行进程路径与配置不符、启动失败或 Controller 未在超时内恢复，Sentinel 会保持 `blocked`，停止探测与切换，并按退避时间重试。开源默认关闭此功能，避免用户主动退出客户端时被意外拉起。
+
+若 Clash Verge 恰好在健康探测期间退出，本轮 Controller 请求可能中断；持续运行模式会立即经过同一守卫队列恢复客户端，将该轮记录为 `watchdog-cycle-interrupted-by-client-restart`，下一周期继续检查，而不是把已恢复的退出误报为持续故障。
+
+### 状态文件
+
+所有相对路径都以 `config.json` 所在目录为基准；从其他目录运行时，应优先用 `--status` 输出的绝对日志路径。
+
+| 字段 | 默认值 | 说明 |
+|---|---:|---|
+| `files.state` | `./var/state.json` | 健康周期、节点准入、隔离和切换预算状态文件。 |
+| `files.log` | `./var/watchdog.ndjson` | 结构化运行日志；在配置目录中可用 `Get-Content .\\var\\watchdog.ndjson -Wait` 实时查看。 |
+| `files.lock` | `./var/watchdog.lock` | 单实例锁文件，防止重复守护进程同时切换。 |
+| `files.guardrailState` | `./var/guardrails.json` | DNS 已修改但尚未确认重载的持久债务；只有运行态复核成功才会清除。 |
 
 配置在启动时严格校验：轮数、并发数、周期和预算必须是整数，成功率必须在 0–1 内，正则必须可编译，业务探测 URL 只允许 HTTP/HTTPS，遥测 URL 必须匹配各自协议。无效配置会在连接 Controller 或切换节点前终止。
 
@@ -85,13 +172,14 @@ node .\src\cli.mjs --config .\config.json --status-json
 
 每个监控周期都会先执行配置守卫，再进行链路探测和节点切换：
 
-1. 每个主周期读取 Mihomo `/configs`；独立守卫还会每 5 秒检查一次。运行模式被人为切成 `direct` 时立即改回配置的 `rule` 或 `global` 并复核。
-2. 运行模式只通过 Mihomo 官方 API 修复，不读取或重写可能包含节点与凭据的 `config.yaml`；Clash Verge 重启后最多 5 秒会再次纠正。
-3. 检查当前订阅的 DNS 覆写状态；Windows 仅定位需要关闭的布尔字段，在停止同一会话的 Clash Verge 后原位修改，不生成包含其他配置的临时副本。
-4. 隐藏重启 Clash Verge 后，同时复核持久化开关、生成配置已刷新、Controller 恢复和运行模式；本周期暂停节点切换。
-5. DNS 重载债务写入独立状态文件，跨周期和服务重启保留。任何修复或复核失败都会持续进入 `blocked`，停止探测和切换。
+1. 可选的 Windows 客户端进程守卫先检查同一用户会话中的 `clash-verge.exe`；未运行时按配置的可信路径隐藏启动，并等待 Controller 恢复。启动失败会进入退避，不会高速重试。
+2. 每个主周期读取 Mihomo `/configs`；独立守卫还会按 `runtimeModeCheckIntervalSeconds` 检查。运行模式被人为切成 `direct` 时立即改回配置的 `rule` 或 `global` 并复核。
+3. 运行模式只通过 Mihomo 官方 API 修复，不读取或重写可能包含节点与凭据的 `config.yaml`；Clash Verge 重启后会再次纠正。
+4. 检查当前订阅的 DNS 覆写状态；Windows 仅定位需要关闭的布尔字段，在停止同一会话的 Clash Verge 后原位修改，不生成包含其他配置的临时副本。
+5. 隐藏重启 Clash Verge 后，同时复核持久化开关、生成配置已刷新、Controller 恢复和运行模式；本周期暂停节点切换。
+6. DNS 重载债务写入独立状态文件，跨周期和服务重启保留。任何修复或复核失败都会持续进入 `blocked`，停止探测和切换。
 
-默认单次命令是 Dry Run：只报告 `would-repair`，不会修改 Mihomo 或 Clash Verge。计划任务使用 `--apply`，会自动修复。`--status` 中的“配置守卫”会显示最近状态、问题数和修复数。
+默认单次命令是 Dry Run：只报告 `would-repair`，不会修改 Mihomo 或 Clash Verge。计划任务使用 `--apply`，会自动修复。`--status` 分别显示“客户端进程守卫”和“配置守卫”的最近状态、问题与修复结果。
 
 Windows 可自动完成上述 DNS 修复闭环。Linux 和 macOS 只有显式配置 `guardrails.clashVergeAppDir` 时才检测，且当前不修改第三方配置；发现 DNS 覆写时保持 `blocked` 并给出问题代码。
 
@@ -226,6 +314,7 @@ sh ./scripts/service-unix.sh status
 - `var/state.json`：当前节点、连续失败、最近扫描/切换、隔离节点和滚动切换预算。Dry Run 不写此文件。
 - `var/watchdog.ndjson`：结构化运行日志，包含健康结果和 TLS/TTFB/WebSocket 指标，不记录 controller secret 或节点服务器地址。达到 `logging.maxBytes` 后轮转，保留 `logging.retainedFiles` 份。
 - `var/watchdog.lock`：防止重复实例。
+- `var/guardrails.json`：保存 DNS 修复后的待重载/待复核债务，问题确认解决后自动清除。
 
 Windows 的 `service-windows.bat status` 以及 Unix 的 `service-unix.sh status` 用于查看服务层状态；业务状态使用 CLI `--status` 或便于机器处理的 `--status-json`。
 

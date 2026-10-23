@@ -50,6 +50,20 @@ function isStable(result, thresholds) {
     && result.maxMs <= thresholds.maxSingleMs;
 }
 
+function isStableAcrossRounds(result, thresholds) {
+  const samplesByRound = new Map();
+  for (const sample of result.samples ?? []) {
+    const round = sample.round ?? 1;
+    if (!samplesByRound.has(round)) samplesByRound.set(round, []);
+    samplesByRound.get(round).push(sample);
+  }
+  return samplesByRound.size > 0
+    && [...samplesByRound.values()].every((samples) => isStable(
+      summarizeSamples(result.node, samples),
+      thresholds,
+    ));
+}
+
 function classifyHealth(result, thresholds, policy) {
   const emergency = result.successRate <= policy.emergencySuccessRate
     || result.averageMs > policy.emergencyMaxAverageMs;
@@ -246,7 +260,7 @@ export class Watchdog {
     const validated = await mapLimit(shortlist, Math.min(this.config.probes.parallelism, shortlist.length),
       (result) => this.probeNode(result.node, this.config.probes.validationRounds, this.config.probes.urls));
     const stable = validated
-      .filter((result) => isStable(result, this.candidateThresholds()))
+      .filter((result) => isStableAcrossRounds(result, this.candidateThresholds()))
       .sort((a, b) => a.score - b.score);
     await this.log('info', 'candidate-validation-completed', {
       stable: stable.map((result) => ({
@@ -347,7 +361,7 @@ export class Watchdog {
         this.config.probes.validationRounds,
         this.config.probes.urls,
       );
-      const admitted = isStable(current, this.candidateThresholds());
+      const admitted = isStableAcrossRounds(current, this.candidateThresholds());
       const admissionRecord = {
         at: new Date().toISOString(),
         from: pendingAdmission.from,
@@ -568,7 +582,7 @@ export class Watchdog {
       return { status: 'upstream-outage', current, control: upstreamOutage.control };
     }
     if (health.status === 'latency-degraded' && !selectionAdmissionRejected && candidates.length > 0) {
-      const improvement = Math.max(
+      const improvement = Math.min(
         this.config.policy.minimumImprovementMs,
         current.averageMs * this.config.policy.minimumImprovementRatio,
       );
@@ -639,7 +653,7 @@ export class Watchdog {
         this.config.policy.postSwitchRounds,
         this.config.probes.urls,
       );
-      if (isStable(verification, this.candidateThresholds())) {
+      if (isStableAcrossRounds(verification, this.candidateThresholds())) {
         quarantineNode(
           state,
           currentLeaf,

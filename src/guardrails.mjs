@@ -385,6 +385,98 @@ function publicResult(status, details = {}) {
   };
 }
 
+export async function enforceClashVergeAvailability({
+  controller,
+  guardrails,
+  dryRun = true,
+  platform = process.platform,
+  supervisorState = {},
+  now = () => Date.now(),
+  resolveRunningExecutable = resolveClashVergeWindows,
+  startExecutable = startClashVergeWindows,
+  wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+} = {}) {
+  if (!guardrails?.enabled || !guardrails.ensureClashVergeRunning) return publicResult('ok');
+  if (platform !== 'win32') {
+    return publicResult('blocked', {
+      issues: ['clash-verge-autostart-unsupported'],
+      unresolved: ['clash-verge-autostart-unsupported'],
+    });
+  }
+
+  let executable;
+  let runningExecutable;
+  try {
+    executable = validateClashVergeExecutable(guardrails.clashVergeExecutable);
+    if (!await exists(executable)) throw new Error('configured executable does not exist');
+    runningExecutable = await resolveRunningExecutable({ allowMissing: true });
+  } catch {
+    return publicResult('blocked', {
+      issues: ['clash-verge-executable-unavailable'],
+      unresolved: ['clash-verge-executable-unavailable'],
+    });
+  }
+
+  if (runningExecutable) {
+    if (!sameWindowsPath(runningExecutable, executable)) {
+      return publicResult('blocked', {
+        issues: ['clash-verge-executable-mismatch'],
+        unresolved: ['clash-verge-executable-mismatch'],
+      });
+    }
+    supervisorState.nextAttemptAtMs = 0;
+    return publicResult('ok');
+  }
+
+  const issues = ['clash-verge-not-running'];
+  if (!guardrails.autoRepair || dryRun) {
+    return publicResult('would-repair', { issues, unresolved: issues });
+  }
+
+  const nowMs = now();
+  if ((supervisorState.nextAttemptAtMs ?? 0) > nowMs) {
+    const blockedIssues = [...issues, 'clash-verge-start-backoff'];
+    return publicResult('blocked', { issues: blockedIssues, unresolved: blockedIssues });
+  }
+  try {
+    await startExecutable(executable);
+  } catch {
+    supervisorState.nextAttemptAtMs = now() + (guardrails.clashVergeStartBackoffSeconds * 1000);
+    const failedIssues = [...issues, 'clash-verge-start-failed'];
+    return publicResult('blocked', { issues: failedIssues, unresolved: failedIssues });
+  }
+
+  const deadline = nowMs + (guardrails.clashVergeStartupTimeoutSeconds * 1000);
+  let consecutiveReadyChecks = 0;
+  do {
+    try {
+      const startedExecutable = await resolveRunningExecutable({ allowMissing: true });
+      if (!startedExecutable) throw new Error('Clash Verge process is not ready');
+      if (!sameWindowsPath(startedExecutable, executable)) {
+        const mismatchIssues = [...issues, 'clash-verge-executable-mismatch'];
+        return publicResult('blocked', { issues: mismatchIssues, unresolved: mismatchIssues });
+      }
+      await controller.getConfigs();
+      consecutiveReadyChecks += 1;
+      if (consecutiveReadyChecks >= 2) {
+        supervisorState.nextAttemptAtMs = 0;
+        return publicResult('repaired', {
+          issues,
+          repairs: ['clash-verge-started'],
+        });
+      }
+    } catch {
+      consecutiveReadyChecks = 0;
+    }
+    if (now() >= deadline) break;
+    await wait(500);
+  } while (true);
+
+  supervisorState.nextAttemptAtMs = now() + (guardrails.clashVergeStartBackoffSeconds * 1000);
+  const timeoutIssues = [...issues, 'clash-verge-startup-timeout'];
+  return publicResult('blocked', { issues: timeoutIssues, unresolved: timeoutIssues });
+}
+
 export async function enforceRuntimeMode({ controller, expectedMode, autoRepair = true, dryRun = true } = {}) {
   try {
     const runtime = await controller.getConfigs();

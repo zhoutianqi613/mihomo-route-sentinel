@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 
-export const CURRENT_CONFIG_VERSION = 3;
+export const CURRENT_CONFIG_VERSION = 4;
 
 export const defaults = Object.freeze({
   configVersion: CURRENT_CONFIG_VERSION,
@@ -73,6 +73,10 @@ export const defaults = Object.freeze({
     autoRepair: true,
     expectedRuntimeMode: 'rule',
     runtimeModeCheckIntervalSeconds: 5,
+    ensureClashVergeRunning: false,
+    clashVergeExecutable: '',
+    clashVergeStartBackoffSeconds: 30,
+    clashVergeStartupTimeoutSeconds: 20,
     disableClashVergeDnsOverride: true,
     clashVergeAppDir: '',
     restartClashVergeOnDnsRepair: true,
@@ -308,6 +312,28 @@ function validate(config) {
     config.guardrails.runtimeModeCheckIntervalSeconds,
     'guardrails.runtimeModeCheckIntervalSeconds',
     2,
+  );
+  requireBoolean(config.guardrails.ensureClashVergeRunning, 'guardrails.ensureClashVergeRunning');
+  if (typeof config.guardrails.clashVergeExecutable !== 'string') {
+    throw new Error('guardrails.clashVergeExecutable 必须是字符串');
+  }
+  if (config.guardrails.clashVergeExecutable
+      && (!path.isAbsolute(config.guardrails.clashVergeExecutable)
+        || path.basename(config.guardrails.clashVergeExecutable).toLowerCase() !== 'clash-verge.exe')) {
+    throw new Error('guardrails.clashVergeExecutable 必须是 clash-verge.exe 的绝对路径或空字符串');
+  }
+  if (config.guardrails.ensureClashVergeRunning && !config.guardrails.clashVergeExecutable) {
+    throw new Error('启用 guardrails.ensureClashVergeRunning 时必须配置 guardrails.clashVergeExecutable');
+  }
+  requireInteger(
+    config.guardrails.clashVergeStartBackoffSeconds,
+    'guardrails.clashVergeStartBackoffSeconds',
+    5,
+  );
+  requireInteger(
+    config.guardrails.clashVergeStartupTimeoutSeconds,
+    'guardrails.clashVergeStartupTimeoutSeconds',
+    1,
   );
   requireBoolean(
     config.guardrails.disableClashVergeDnsOverride,

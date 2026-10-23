@@ -175,6 +175,13 @@ const GUARDRAIL_ISSUE_TEXT = Object.freeze({
   'dns-repair-unsupported': '当前平台不支持安全自动修复 DNS 覆写',
   'dns-reload-pending': 'DNS 修复正在等待客户端重载确认',
   'clash-verge-reload-failed': 'Clash Verge 重载或运行态复核失败',
+  'clash-verge-autostart-unsupported': '当前平台不支持自动启动 Clash Verge',
+  'clash-verge-executable-unavailable': 'Clash Verge 可执行文件不可用',
+  'clash-verge-executable-mismatch': '正在运行的 Clash Verge 与配置路径不一致',
+  'clash-verge-not-running': 'Clash Verge 未运行',
+  'clash-verge-start-backoff': 'Clash Verge 自动启动正在退避',
+  'clash-verge-start-failed': 'Clash Verge 自动启动失败',
+  'clash-verge-startup-timeout': 'Clash Verge 启动后 Controller 未在限时内就绪',
 });
 
 function explainGuardrailIssue(issue) {
@@ -281,6 +288,7 @@ export async function buildStatusSnapshot({ stateFile, logFile, controller, targ
   const evaluation = latestByEvent(records, 'current-node-evaluated');
   const telemetry = telemetryForEvaluation(records, evaluation);
   const guardrail = latestByEvent(records, 'guardrail-evaluated');
+  const processGuard = latestByEvent(records, 'clash-verge-process-guard-evaluated');
   const runtimeModeGuard = latestByEvent(records, 'runtime-mode-guard-evaluated');
   const current = live && !live.error
     ? live
@@ -324,6 +332,12 @@ export async function buildStatusSnapshot({ stateFile, logFile, controller, targ
       : 'unknown';
     warnings.push(`配置守卫未就绪，链路探测与节点切换已暂停：${issueText}`);
   }
+  if (processGuard?.ready === false) {
+    const issueText = Array.isArray(processGuard.issues) && processGuard.issues.length
+      ? processGuard.issues.map(explainGuardrailIssue).join(', ')
+      : 'unknown';
+    warnings.push(`客户端进程守卫未就绪，任何节点切换均被禁止：${issueText}`);
+  }
   if (runtimeModeGuard?.ready === false) {
     const issueText = Array.isArray(runtimeModeGuard.issues) && runtimeModeGuard.issues.length
       ? runtimeModeGuard.issues.map(explainGuardrailIssue).join(', ')
@@ -352,6 +366,13 @@ export async function buildStatusSnapshot({ stateFile, logFile, controller, targ
       ready: guardrail.ready ?? null,
       issues: guardrail.issues ?? [],
       repairs: guardrail.repairs ?? [],
+    } : null,
+    processGuard: processGuard ? {
+      at: processGuard.timestamp ?? null,
+      status: processGuard.status ?? null,
+      ready: processGuard.ready ?? null,
+      issues: processGuard.issues ?? [],
+      repairs: processGuard.repairs ?? [],
     } : null,
     externalSelectionAdmission,
     runtimeModeGuard: runtimeModeGuard ? {
@@ -396,6 +417,9 @@ export function formatStatus(snapshot) {
   const guardrailText = snapshot.guardrails
     ? `${display(snapshot.guardrails.status)}，问题 ${snapshot.guardrails.issues.length}，修复 ${snapshot.guardrails.repairs.length}`
     : '尚无数据';
+  const processGuardText = snapshot.processGuard
+    ? `${display(snapshot.processGuard.status)}，问题 ${snapshot.processGuard.issues.length}，修复 ${snapshot.processGuard.repairs.length}`
+    : '尚无检查记录';
   const externalAdmissionText = snapshot.externalSelectionAdmission
     ? `外部节点待准入/已拒绝，正在寻找合格候选：${display(snapshot.externalSelectionAdmission.to)}（叶子 ${display(snapshot.externalSelectionAdmission.leaf)}）`
     : '无';
@@ -417,6 +441,7 @@ export function formatStatus(snapshot) {
     `HTTPS 真实链路 : ${httpsTelemetry ? `网络 ${httpsTelemetry.networkOk ? '成功' : '失败'}，HTTP ${display(httpsTelemetry.statusCode)}，代理 TCP ${display(httpsTelemetry.connectMs, ' ms')}，CONNECT ${display(httpsTelemetry.tunnelMs, ' ms')}，TLS ${display(httpsTelemetry.tlsMs, ' ms')}，TTFB ${display(httpsTelemetry.ttfbMs, ' ms')}` : '尚无数据'}`,
     `WebSocket 链路 : ${websocketTelemetry ? `网络 ${websocketTelemetry.networkOk ? '成功' : '失败'}，升级 ${websocketTelemetry.websocketOk ? '成功' : '未成功'}，HTTP ${display(websocketTelemetry.statusCode)}，代理 TCP ${display(websocketTelemetry.connectMs, ' ms')}，CONNECT ${display(websocketTelemetry.tunnelMs, ' ms')}，TLS ${display(websocketTelemetry.tlsMs, ' ms')}，TTFB ${display(websocketTelemetry.ttfbMs, ' ms')}` : '尚无数据'}`,
     `配置守卫       : ${guardrailText}`,
+    `客户端进程守卫 : ${processGuardText}`,
     `外部节点准入   : ${externalAdmissionText}`,
     `运行模式守卫   : ${runtimeGuardText}`,
     `日志路径       : ${snapshot.files.log}`,

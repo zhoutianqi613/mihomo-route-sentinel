@@ -1,5 +1,5 @@
 {
-  "configVersion": 3,
+  "configVersion": 4,
   "controller": {
     "transport": "auto",
     "url": "http://127.0.0.1:9090",
@@ -73,6 +73,10 @@
     "autoRepair": true,
     "expectedRuntimeMode": "rule",
     "runtimeModeCheckIntervalSeconds": 5,
+    "ensureClashVergeRunning": false,
+    "clashVergeExecutable": "",
+    "clashVergeStartBackoffSeconds": 30,
+    "clashVergeStartupTimeoutSeconds": 20,
     "disableClashVergeDnsOverride": true,
     "clashVergeAppDir": "",
     "restartClashVergeOnDnsRepair": true

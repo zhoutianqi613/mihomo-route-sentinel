@@ -4,7 +4,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from './config.mjs';
 import { MihomoController } from './controller.mjs';
-import { enforceGuardrails, enforceRuntimeMode } from './guardrails.mjs';
+import {
+  enforceClashVergeAvailability,
+  enforceGuardrails,
+  enforceRuntimeMode,
+} from './guardrails.mjs';
 import { probeRealLinks } from './link-probe.mjs';
 import { buildStatusSnapshot, createRotatingLogger, formatStatus } from './observability.mjs';
 import { Watchdog } from './watchdog.mjs';
@@ -101,10 +105,38 @@ async function main() {
   });
   const controller = new MihomoController(config.controller);
   // null 强制首轮独立检查落日志，状态页才能证明 5 秒守卫确实在运行。
+  let lastProcessGuardSignature = null;
   let lastRuntimeGuardStatus = null;
-  let runtimeGuardQueue = Promise.resolve();
-  const runRuntimeGuard = () => {
-    const execute = async () => {
+  // 进程/运行模式守卫与 DNS 修复共享队列，避免 DNS 原位修改期间被进程守卫提前拉起客户端。
+  let guardQueue = Promise.resolve();
+  const enqueueGuard = (execute) => {
+    const next = guardQueue.then(execute, execute);
+    guardQueue = next.catch(() => {});
+    return next;
+  };
+  const clashVergeSupervisorState = {};
+  const runRuntimeGuard = () => enqueueGuard(async () => {
+      const processGuard = await enforceClashVergeAvailability({
+        controller,
+        guardrails: config.guardrails,
+        dryRun: !options.apply,
+        supervisorState: clashVergeSupervisorState,
+      });
+      const processGuardSignature = JSON.stringify({
+        status: processGuard.status,
+        issues: processGuard.issues,
+        unresolved: processGuard.unresolved,
+      });
+      if (processGuardSignature !== lastProcessGuardSignature || processGuard.repairs.length > 0) {
+        await logger(
+          processGuard.ready ? 'info' : 'warn',
+          'clash-verge-process-guard-evaluated',
+          processGuard,
+        );
+      }
+      lastProcessGuardSignature = processGuardSignature;
+      if (!processGuard.ready) return processGuard;
+
       const runtimeGuard = await enforceRuntimeMode({
         controller,
         expectedMode: config.guardrails.expectedRuntimeMode,
@@ -120,11 +152,7 @@ async function main() {
       }
       lastRuntimeGuardStatus = runtimeGuard.status;
       return runtimeGuard;
-    };
-    const next = runtimeGuardQueue.then(execute, execute);
-    runtimeGuardQueue = next.catch(() => {});
-    return next;
-  };
+  });
   const watchdog = new Watchdog({
     controller,
     config,
@@ -144,6 +172,16 @@ async function main() {
     apply: options.apply,
     controller: controller.describe(),
   });
+
+  if (config.guardrails.enabled) {
+    try {
+      await runRuntimeGuard();
+    } catch (error) {
+      await logger('error', 'runtime-guard-initialization-failed', {
+        errorType: error?.name ?? 'Error',
+      });
+    }
+  }
 
   let stopping = false;
   const stop = async (signal) => {
@@ -175,12 +213,12 @@ async function main() {
     do {
       const cycleStartedAt = Date.now();
       try {
-        const guardrail = await enforceGuardrails({
+        const guardrail = await enqueueGuard(() => enforceGuardrails({
           controller,
           guardrails: config.guardrails,
           guardStateFile: config.files.guardrailState,
           dryRun: !options.apply,
-        });
+        }));
         await logger(guardrail.ready ? 'info' : 'warn', 'guardrail-evaluated', guardrail);
         if (!guardrail.ready) {
           await logger('warn', 'watchdog-cycle-completed', { status: guardrail.status });
@@ -204,7 +242,22 @@ async function main() {
           await logger('info', 'watchdog-cycle-completed', { status: result.status });
         }
       } catch (error) {
-        await logger('error', 'watchdog-cycle-failed', { error: error.message });
+        let recoveredController = false;
+        if (options.run && config.guardrails.enabled && error?.code === 'ENOENT') {
+          try {
+            const recovery = await runRuntimeGuard();
+            recoveredController = recovery.ready;
+          } catch {
+            recoveredController = false;
+          }
+        }
+        if (recoveredController) {
+          await logger('warn', 'watchdog-cycle-interrupted-by-client-restart', {
+            errorType: error?.code ?? error?.name ?? 'Error',
+          });
+        } else {
+          await logger('error', 'watchdog-cycle-failed', { error: error.message });
+        }
         if (!options.run) throw error;
       }
       if (!options.run || stopping) break;
