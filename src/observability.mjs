@@ -225,7 +225,7 @@ function normalizePolicyState(state, policy = {}) {
     : [];
   // 与核心策略一致：恢复性回滚用于审计，但不消耗切换预算；旧版字符串记录仍计入。
   const budgetHistory = switchHistory.filter((entry) => (
-    typeof entry === 'string' || entry.kind !== 'recovery-rollback'
+    typeof entry === 'string' || (entry.kind !== 'recovery-rollback' && entry.budgetExempt !== true)
   ));
   const used = state.switchesInWindow ?? budgetHistory.length;
   const limit = state.switchBudgetLimit ?? policy.switchBudgetCount ?? null;
@@ -326,6 +326,9 @@ export async function buildStatusSnapshot({ stateFile, logFile, controller, targ
   if (externalSelectionAdmission) {
     warnings.push('外部节点待准入/已拒绝，正在寻找合格候选');
   }
+  if (state.provisionalFallback) {
+    warnings.push('当前节点尚未通过严格准入；服务会优先执行恢复性复测或切换');
+  }
   if (guardrail?.ready === false) {
     const issueText = Array.isArray(guardrail.issues) && guardrail.issues.length
       ? guardrail.issues.map(explainGuardrailIssue).join(', ')
@@ -387,6 +390,17 @@ export async function buildStatusSnapshot({ stateFile, logFile, controller, targ
       partial: state.consecutivePartialFailures ?? 0,
       latency: state.consecutiveLatencyFailures ?? 0,
     },
+    degradationWindow: {
+      cycles: Array.isArray(state.degradationWindow) ? state.degradationWindow.length : 0,
+      failures: Array.isArray(state.degradationWindow)
+        ? state.degradationWindow.filter((entry) => entry?.degraded).length
+        : 0,
+      required: policy?.degradationWindowFailures ?? null,
+      size: policy?.degradationWindowCycles ?? null,
+    },
+    lastDecision: state.lastDecision ?? null,
+    lastCandidateScan: state.lastCandidateScan ?? null,
+    provisionalFallback: state.provisionalFallback ?? null,
     lastSwitch: state.lastSwitch ? { at: state.lastSwitchAt ?? null, ...state.lastSwitch } : null,
     quarantinedNodes,
     ...policyState,
@@ -426,6 +440,15 @@ export function formatStatus(snapshot) {
   const runtimeGuardText = snapshot.runtimeModeGuard
     ? `${display(snapshot.runtimeModeGuard.status)}，问题 ${snapshot.runtimeModeGuard.issues.length}，修复 ${snapshot.runtimeModeGuard.repairs.length}`
     : '尚无检查记录（需确认服务已加载最新版）';
+  const decisionText = snapshot.lastDecision
+    ? `${display(snapshot.lastDecision.action)} / ${display(snapshot.lastDecision.reason)} / ${display(snapshot.lastDecision.at)}`
+    : '-';
+  const scanText = snapshot.lastCandidateScan
+    ? `${display(snapshot.lastCandidateScan.at)}，原因 ${display(snapshot.lastCandidateScan.reason)}，抽样 ${display(snapshot.lastCandidateScan.sampledCount)}，严格复测 ${display(snapshot.lastCandidateScan.validatedCount)}，合格 ${(snapshot.lastCandidateScan.stable ?? []).join('、') || '无'}；淘汰 ${(snapshot.lastCandidateScan.rejected ?? []).slice(0, 3).map((entry) => `${entry.node}[${(entry.reasons ?? []).join('/') || '未知'}]`).join('、') || '无'}`
+    : '-';
+  const provisionalText = snapshot.provisionalFallback
+    ? `${display(snapshot.provisionalFallback.selection)}（${display(snapshot.provisionalFallback.profile)}，等待严格准入）`
+    : '无';
   const lines = [
     'Mihomo Route Sentinel 运行状态',
     `当前选择       : ${display(snapshot.current?.selected)}`,
@@ -434,6 +457,10 @@ export function formatStatus(snapshot) {
     `探测结果       : 成功率 ${snapshot.probe?.successRate == null ? '-' : `${Math.round(snapshot.probe.successRate * 100)}%`}，平均 ${display(snapshot.probe?.averageMs, ' ms')}，最大 ${display(snapshot.probe?.maxMs, ' ms')}`,
     `健康/质量      : ${display(snapshot.probe?.health)} / ${display(snapshot.probe?.quality)}`,
     `连续失败       : 总计 ${snapshot.consecutiveFailures.overall}，部分失败 ${snapshot.consecutiveFailures.partial}，延迟退化 ${snapshot.consecutiveFailures.latency}`,
+    `滚动延迟退化   : ${snapshot.degradationWindow.failures}/${snapshot.degradationWindow.cycles}（触发 ${display(snapshot.degradationWindow.required)}/${display(snapshot.degradationWindow.size)}）`,
+    `最近决策       : ${decisionText}`,
+    `最近候选扫描   : ${scanText}`,
+    `临时候选状态   : ${provisionalText}`,
     `最近切换       : ${switchText}`,
     `隔离节点       : ${quarantine}`,
     `扫描退避       : ${backoff}`,

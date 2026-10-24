@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 
-export const CURRENT_CONFIG_VERSION = 4;
+export const CURRENT_CONFIG_VERSION = 5;
 
 export const defaults = Object.freeze({
   configVersion: CURRENT_CONFIG_VERSION,
@@ -26,9 +26,10 @@ export const defaults = Object.freeze({
     currentMaxAverageMs: 800,
     currentMaxSingleMs: 1500,
     scanRounds: 1,
-    scanUrlCount: 1,
+    scanUrlCount: 2,
     validationRounds: 2,
     topCandidates: 6,
+    maxValidationCandidates: 18,
     parallelism: 4,
     candidateMinSuccessRate: 1,
     candidateMaxAverageMs: 600,
@@ -40,6 +41,9 @@ export const defaults = Object.freeze({
     intervalSeconds: 30,
     partialFailureCycles: 2,
     latencyFailureCycles: 3,
+    degradationWindowCycles: 10,
+    degradationWindowFailures: 3,
+    optimizationIntervalSeconds: 900,
     hardFailureConfirmSeconds: 5,
     minimumDwellSeconds: 120,
     minimumImprovementMs: 200,
@@ -183,6 +187,13 @@ function migrate(parsed) {
   if (version < 3 && parsed.guardrails === undefined) {
     migrated.guardrails = { enabled: false };
   }
+  if (version < 5) {
+    migrated.probes = {
+      ...(parsed.probes ?? {}),
+      // v1-v4 未配置该字段时的默认值为 1；保持旧行为，避免单 URL 配置升级后失效。
+      scanUrlCount: parsed.probes?.scanUrlCount ?? 1,
+    };
+  }
   return migrated;
 }
 
@@ -233,6 +244,7 @@ function validate(config) {
     scanUrlCount: 1,
     validationRounds: 1,
     topCandidates: 1,
+    maxValidationCandidates: 1,
     parallelism: 1,
   })) requireInteger(config.probes[name], `probes.${name}`, minimum);
   requireRate(config.probes.currentMinSuccessRate, 'probes.currentMinSuccessRate');
@@ -261,6 +273,9 @@ function validate(config) {
     intervalSeconds: 5,
     partialFailureCycles: 1,
     latencyFailureCycles: 1,
+    degradationWindowCycles: 1,
+    degradationWindowFailures: 1,
+    optimizationIntervalSeconds: 0,
     hardFailureConfirmSeconds: 0,
     minimumDwellSeconds: 0,
     minimumImprovementMs: 0,
@@ -289,6 +304,12 @@ function validate(config) {
   }
   if (config.probes.topCandidates < config.policy.maxSwitchAttempts) {
     throw new Error('probes.topCandidates 不能小于 policy.maxSwitchAttempts');
+  }
+  if (config.probes.maxValidationCandidates < config.probes.topCandidates) {
+    throw new Error('probes.maxValidationCandidates 不能小于 probes.topCandidates');
+  }
+  if (config.policy.degradationWindowFailures > config.policy.degradationWindowCycles) {
+    throw new Error('policy.degradationWindowFailures 不能大于 policy.degradationWindowCycles');
   }
   requireInteger(config.logging.maxBytes, 'logging.maxBytes', 1024);
   requireInteger(config.logging.retainedFiles, 'logging.retainedFiles', 1);

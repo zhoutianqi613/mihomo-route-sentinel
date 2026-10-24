@@ -457,6 +457,7 @@ test('unadmitted external selection immediately scans and every select still use
     lastSwitchAt: new Date().toISOString(),
     candidateScanBackoffUntil: new Date(Date.now() + 600_000).toISOString(),
     lastCandidateScanOutcome: 'no-stable-candidate',
+    degradationWindow: Array.from({ length: 3 }, () => ({ degraded: true })),
   }));
   let beforeSwitchCalls = 0;
   const events = [];
@@ -616,6 +617,9 @@ test('latency spike confirmation recovery does not switch immediately', async (t
   assert.equal(events.some((entry) => entry.event === 'immediate-failure-confirmed'
     && entry.details.trigger === 'latency-spike'
     && entry.details.confirmed === false), true);
+  assert.equal(events.some((entry) => entry.event === 'current-node-evaluated'
+    && entry.details.selectionSource === 'immediate-confirmation'
+    && entry.details.health === 'healthy'), true);
 });
 
 test('confirmed latency spike bypasses ordinary latency cycles and minimum dwell', async (t) => {
@@ -688,7 +692,7 @@ test('failed post-switch verification quarantines candidate and tries the next o
   assert.equal(state.quarantinedNodes['flaky-node'].reason, 'post-switch-verification-failed');
 });
 
-test('unverified fallback records the retained node and removes its quarantine', async (t) => {
+test('unsafe failed candidates are not reselected as fallback', async (t) => {
   const mock = await startMockController({
     candidates: ['bad-node', 'fallback-a', 'fallback-b'],
     delayResolver: ({ name, probeCount }) => {
@@ -704,19 +708,411 @@ test('unverified fallback records the retained node and removes its quarantine',
   const watchdog = new Watchdog({ controller, config, logger: async () => {} });
 
   const result = await watchdog.runOnce({ dryRun: false });
-  assert.equal(result.status, 'unverified-fallback');
-  assert.equal(mock.getSelected(), 'fallback-a');
+  assert.equal(result.status, 'degraded-fallback');
+  assert.equal(mock.getSelected(), 'fallback-b');
   const state = JSON.parse(await readFile(config.files.state, 'utf8'));
-  assert.equal(state.lastSwitch.to, 'fallback-a');
-  assert.equal(state.lastSwitch.reason, 'unverified-fallback');
+  assert.equal(state.lastSwitch.to, 'fallback-b');
+  assert.equal(state.lastSwitch.reason, 'degraded-fallback');
   assert.equal(state.lastSwitch.verified, false);
   assert.ok(Number.isFinite(Date.parse(state.lastSwitchAt)));
-  assert.equal(state.quarantinedNodes['fallback-a'], undefined);
+  assert.equal(state.quarantinedNodes['fallback-a'].reason, 'post-switch-verification-failed');
   assert.equal(state.quarantinedNodes['fallback-b'].reason, 'post-switch-verification-failed');
   assert.equal(state.quarantinedNodes['bad-node'].reason, 'hard-failure');
 });
 
-test('each candidate selection consumes budget and an unverified fallback cannot exceed it', async (t) => {
+test('post-switch failure may retain only a candidate that still meets current health thresholds', async (t) => {
+  const mock = await startMockController({
+    candidates: ['bad-node', 'provisional-node'],
+    delayResolver: ({ name, probeCount }) => {
+      if (name === 'bad-node') return null;
+      return probeCount <= 3 ? 100 : 700;
+    },
+  });
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  config.policy.rollbackOnFailure = false;
+  config.policy.maxSwitchAttempts = 1;
+  const watchdog = new Watchdog({
+    controller: new MihomoController(config.controller, {}),
+    config,
+    logger: async () => {},
+  });
+
+  const result = await watchdog.runOnce({ dryRun: false });
+
+  assert.equal(result.status, 'provisional-fallback');
+  assert.equal(mock.getSelected(), 'provisional-node');
+  const state = JSON.parse(await readFile(config.files.state, 'utf8'));
+  assert.equal(state.lastSwitch.reason, 'provisional-fallback');
+  assert.equal(state.provisionalFallback.profile, 'current-threshold');
+  assert.equal(state.selectionAdmissionVersion, undefined);
+  assert.equal(state.quarantinedNodes['provisional-node'], undefined);
+});
+
+test('a provisional candidate does not prevent a later strict candidate from succeeding', async (t) => {
+  const mock = await startMockController({
+    candidates: ['bad-node', 'provisional-node', 'strict-node'],
+    delayResolver: ({ name, probeCount }) => {
+      if (name === 'bad-node') return null;
+      if (name === 'provisional-node') return probeCount <= 3 ? 100 : 700;
+      return 400;
+    },
+  });
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  config.policy.rollbackOnFailure = false;
+  config.policy.maxSwitchAttempts = 2;
+  const watchdog = new Watchdog({
+    controller: new MihomoController(config.controller, {}),
+    config,
+    logger: async () => {},
+  });
+
+  const result = await watchdog.runOnce({ dryRun: false });
+
+  assert.equal(result.status, 'switched');
+  assert.equal(mock.getSelected(), 'strict-node');
+  assert.deepEqual(mock.switches, ['provisional-node', 'strict-node']);
+});
+
+test('best current-stable provisional is restored without consuming switch budget', async (t) => {
+  const mock = await startMockController({
+    candidates: ['bad-node', 'provisional-a', 'provisional-b'],
+    delayResolver: ({ name, probeCount }) => {
+      if (name === 'bad-node') return null;
+      if (name === 'provisional-a') return probeCount <= 3 ? 100 : 700;
+      return probeCount <= 3 ? 150 : 800;
+    },
+  });
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  config.policy.rollbackOnFailure = false;
+  config.policy.maxSwitchAttempts = 2;
+  config.policy.switchBudgetCount = 2;
+  const watchdog = new Watchdog({
+    controller: new MihomoController(config.controller, {}),
+    config,
+    logger: async () => {},
+  });
+
+  const result = await watchdog.runOnce({ dryRun: false });
+
+  assert.equal(result.status, 'provisional-fallback');
+  assert.equal(mock.getSelected(), 'provisional-a');
+  assert.deepEqual(mock.switches, ['provisional-a', 'provisional-b', 'provisional-a']);
+  const state = JSON.parse(await readFile(config.files.state, 'utf8'));
+  assert.equal(state.switchHistory.at(-1).kind, 'provisional-recovery');
+  assert.equal(state.switchHistory.at(-1).budgetExempt, true);
+});
+
+test('an unverified degraded selection gets one audited recovery attempt despite exhausted budget', async (t) => {
+  const mock = await startMockController();
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  config.policy.switchBudgetCount = 1;
+  await writeFile(config.files.state, JSON.stringify({
+    currentSelection: 'bad-node',
+    currentLeaf: 'bad-node',
+    provisionalFallback: { profile: 'unverified', selection: 'bad-node' },
+    switchHistory: [{
+      timestamp: new Date().toISOString(),
+      from: 'old-node',
+      to: 'bad-node',
+      kind: 'candidate-attempt',
+    }],
+  }));
+  const events = [];
+  const watchdog = new Watchdog({
+    controller: new MihomoController(config.controller, {}),
+    config,
+    logger: async (level, event, details) => events.push({ level, event, details }),
+  });
+
+  const result = await watchdog.runOnce({ dryRun: false });
+
+  assert.equal(result.status, 'switched');
+  assert.equal(mock.getSelected(), 'good-node');
+  assert.equal(events.some((entry) => entry.event === 'degraded-recovery-budget-exempted'), true);
+  const state = JSON.parse(await readFile(config.files.state, 'utf8'));
+  assert.equal(state.switchHistory.some((entry) => entry.kind === 'degraded-recovery'
+    && entry.budgetExempt === true), true);
+});
+
+test('rolling intermittent latency degradation triggers optimization after healthy recovery', async (t) => {
+  const mock = await startMockController({
+    initialSelected: 'acceptable-node',
+    candidates: ['acceptable-node', 'good-node'],
+    delayResolver: ({ name }) => name === 'acceptable-node' ? 700 : 100,
+  });
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  config.policy.optimizationIntervalSeconds = 0;
+  config.policy.degradationWindowCycles = 10;
+  config.policy.degradationWindowFailures = 3;
+  await writeFile(config.files.state, JSON.stringify({
+    currentSelection: 'acceptable-node',
+    currentLeaf: 'acceptable-node',
+    selectionAdmissionVersion: 1,
+    degradationWindow: [
+      { degraded: true, status: 'latency-degraded' },
+      { degraded: false, status: 'healthy' },
+      { degraded: true, status: 'latency-spike' },
+      { degraded: true, status: 'latency-degraded' },
+    ],
+  }));
+  const watchdog = new Watchdog({
+    controller: new MihomoController(config.controller, {}),
+    config,
+    logger: async () => {},
+  });
+
+  const result = await watchdog.runOnce({ dryRun: true });
+
+  assert.equal(result.status, 'would-switch');
+  assert.equal(result.candidate.node, 'good-node');
+});
+
+test('rolling degradation triggers on the cycle that reaches its threshold', async (t) => {
+  const mock = await startMockController({
+    initialSelected: 'degraded-node',
+    candidates: ['degraded-node', 'good-node'],
+    delayResolver: ({ name }) => name === 'degraded-node' ? 900 : 100,
+  });
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  config.policy.latencyFailureCycles = 9;
+  config.policy.optimizationIntervalSeconds = 0;
+  config.policy.degradationWindowCycles = 10;
+  config.policy.degradationWindowFailures = 3;
+  await writeFile(config.files.state, JSON.stringify({
+    currentSelection: 'degraded-node',
+    currentLeaf: 'degraded-node',
+    selectionAdmissionVersion: 1,
+    degradationWindow: [
+      { degraded: true, status: 'latency-degraded' },
+      { degraded: false, status: 'healthy' },
+      { degraded: true, status: 'latency-degraded' },
+      { degraded: false, status: 'healthy' },
+    ],
+  }));
+  const watchdog = new Watchdog({
+    controller: new MihomoController(config.controller, {}),
+    config,
+    logger: async () => {},
+  });
+
+  const result = await watchdog.runOnce({ dryRun: true });
+
+  assert.equal(result.status, 'would-switch');
+  assert.equal(result.candidate.node, 'good-node');
+});
+
+test('strict admission of a changed node clears degradation history before policy evaluation', async (t) => {
+  const mock = await startMockController({
+    initialSelected: 'good-node',
+    candidates: ['good-node', 'slow-node'],
+  });
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  config.policy.optimizationIntervalSeconds = 0;
+  await writeFile(config.files.state, JSON.stringify({
+    currentSelection: 'old-node',
+    currentLeaf: 'old-node',
+    selectionAdmissionVersion: 1,
+    degradationWindow: Array.from({ length: 3 }, () => ({ degraded: true })),
+  }));
+  const watchdog = new Watchdog({
+    controller: new MihomoController(config.controller, {}),
+    config,
+    logger: async () => {},
+  });
+
+  const result = await watchdog.runOnce({ dryRun: false });
+
+  assert.equal(result.status, 'external-selection-admitted');
+  const state = JSON.parse(await readFile(config.files.state, 'utf8'));
+  assert.deepEqual(state.degradationWindow, [{
+    at: state.degradationWindow[0].at,
+    degraded: false,
+    status: 'healthy',
+  }]);
+});
+
+test('strict baseline recovery upgrades provisional switch audit state', async (t) => {
+  const mock = await startMockController({ initialSelected: 'good-node' });
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  config.policy.optimizationIntervalSeconds = 0;
+  await writeFile(config.files.state, JSON.stringify({
+    currentSelection: 'good-node',
+    currentLeaf: 'good-node',
+    lastSwitchAt: '2026-10-24T00:00:00.000Z',
+    lastSwitch: {
+      from: 'bad-node',
+      to: 'good-node',
+      reason: 'degraded-fallback',
+      verified: false,
+      source: 'sentinel',
+    },
+    provisionalFallback: { profile: 'unverified', selection: 'good-node' },
+  }));
+  const watchdog = new Watchdog({
+    controller: new MihomoController(config.controller, {}),
+    config,
+    logger: async () => {},
+  });
+
+  const result = await watchdog.runOnce({ dryRun: false });
+
+  assert.equal(result.status, 'baseline-revalidated');
+  const state = JSON.parse(await readFile(config.files.state, 'utf8'));
+  assert.equal(state.lastSwitch.reason, 'strict-admission-recovered');
+  assert.equal(state.lastSwitch.provisionalReason, 'degraded-fallback');
+  assert.equal(state.lastSwitch.verified, true);
+  assert.ok(Number.isFinite(Date.parse(state.lastSwitch.strictlyAdmittedAt)));
+});
+
+test('periodic optimization keeps an acceptable node when improvement is insufficient', async (t) => {
+  const mock = await startMockController({
+    initialSelected: 'acceptable-node',
+    candidates: ['acceptable-node', 'slightly-better-node'],
+    delayResolver: ({ name }) => name === 'acceptable-node' ? 700 : 580,
+  });
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  config.policy.optimizationIntervalSeconds = 1;
+  await writeFile(config.files.state, JSON.stringify({
+    currentSelection: 'acceptable-node',
+    currentLeaf: 'acceptable-node',
+    selectionAdmissionVersion: 1,
+    lastOptimizationScanAt: new Date(0).toISOString(),
+  }));
+  const watchdog = new Watchdog({
+    controller: new MihomoController(config.controller, {}),
+    config,
+    logger: async () => {},
+  });
+
+  const result = await watchdog.runOnce({ dryRun: true });
+
+  assert.equal(result.status, 'no-improvement');
+  assert.deepEqual(mock.switches, []);
+});
+
+test('adaptive validation continues past a noisy first batch', async (t) => {
+  const noisy = ['noisy-1', 'noisy-2', 'noisy-3'];
+  const mock = await startMockController({
+    candidates: ['bad-node', ...noisy, 'stable-later'],
+    delayResolver: ({ name, probeCount }) => {
+      if (name === 'bad-node') return null;
+      if (noisy.includes(name)) return probeCount === 1 ? 50 : null;
+      return 100;
+    },
+  });
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  config.probes.topCandidates = 3;
+  config.probes.maxValidationCandidates = 6;
+  config.policy.maxSwitchAttempts = 3;
+  const watchdog = new Watchdog({
+    controller: new MihomoController(config.controller, {}),
+    config,
+    logger: async () => {},
+  });
+
+  const result = await watchdog.runOnce({ dryRun: true, forceScan: true });
+
+  assert.equal(result.status, 'would-switch');
+  assert.equal(result.candidate.node, 'stable-later');
+});
+
+test('post-switch verification probes the resolved leaf of a nested selector', async () => {
+  let selected = 'bad-node';
+  const probed = [];
+  const controller = {
+    async getProxy(name) {
+      if (name === 'XFLTD') return { type: 'Selector', now: selected };
+      if (name === 'candidates') return { type: 'URLTest', all: ['bad-node', 'nested-good'] };
+      if (name === 'nested-good') return { type: 'Selector', now: 'leaf-good' };
+      return { type: 'VLESS', name };
+    },
+    async getDelay(node) {
+      probed.push(node);
+      if (node === 'bad-node') throw Object.assign(new Error('timeout'), { status: 504 });
+      if (node === 'nested-good' && probed.filter((value) => value === node).length > 3) {
+        throw Object.assign(new Error('group delay unavailable'), { status: 504 });
+      }
+      return 100;
+    },
+    async select(group, node) {
+      assert.equal(group, 'XFLTD');
+      selected = node;
+    },
+  };
+  const config = await makeConfig('http://127.0.0.1:1');
+  config.policy.postSwitchRounds = 2;
+  const watchdog = new Watchdog({ controller, config, logger: async () => {} });
+
+  const result = await watchdog.runOnce({ dryRun: false });
+
+  assert.equal(result.status, 'switched');
+  assert.equal(selected, 'nested-good');
+  assert.ok(probed.filter((node) => node === 'leaf-good').length >= 2);
+});
+
+test('rollback verifies the actual leaf after a dynamic selector is restored', async () => {
+  let selected = 'previous-group';
+  let rollbackSelected = false;
+  const counts = new Map();
+  const events = [];
+  const controller = {
+    async getProxy(name) {
+      if (name === 'XFLTD') return { type: 'Selector', now: selected };
+      if (name === 'candidates') return { type: 'URLTest', all: ['candidate-a'] };
+      if (name === 'previous-group') {
+        return { type: 'Selector', now: rollbackSelected ? 'leaf-new' : 'leaf-old' };
+      }
+      return { type: 'VLESS', name };
+    },
+    async getDelay(node) {
+      const count = (counts.get(node) ?? 0) + 1;
+      counts.set(node, count);
+      if (node === 'leaf-old') {
+        if (count === 1) throw Object.assign(new Error('timeout'), { status: 504 });
+        return 100;
+      }
+      if (node === 'candidate-a') {
+        if (count <= 3) return 100;
+        throw Object.assign(new Error('post-switch failed'), { status: 504 });
+      }
+      if (node === 'leaf-new') throw Object.assign(new Error('changed leaf failed'), { status: 504 });
+      return 100;
+    },
+    async select(group, node) {
+      assert.equal(group, 'XFLTD');
+      selected = node;
+      if (node === 'previous-group') rollbackSelected = true;
+    },
+  };
+  const config = await makeConfig('http://127.0.0.1:1');
+  config.policy.maxSwitchAttempts = 1;
+  const watchdog = new Watchdog({
+    controller,
+    config,
+    logger: async (level, event, details) => events.push({ level, event, details }),
+  });
+
+  const result = await watchdog.runOnce({ dryRun: false });
+
+  assert.equal(result.status, 'degraded-fallback');
+  assert.equal(selected, 'previous-group');
+  const state = JSON.parse(await readFile(config.files.state, 'utf8'));
+  assert.equal(state.currentLeaf, 'leaf-new');
+  assert.equal(events.some((entry) => entry.event === 'switch-recovery-rollback-failed'
+    && entry.details.leaf === 'leaf-new'), true);
+});
+
+test('each candidate selection consumes budget and degraded fallback cannot exceed it', async (t) => {
   const mock = await startMockController({
     candidates: ['bad-node', 'candidate-a', 'candidate-b', 'candidate-c'],
     delayResolver: ({ name, probeCount }) => {
@@ -739,7 +1135,7 @@ test('each candidate selection consumes budget and an unverified fallback cannot
   });
 
   const result = await watchdog.runOnce({ dryRun: false });
-  assert.equal(result.status, 'unverified-fallback');
+  assert.equal(result.status, 'degraded-fallback');
   assert.deepEqual(mock.switches, ['candidate-a', 'candidate-b']);
   assert.equal(mock.getSelected(), 'candidate-b');
   const state = JSON.parse(await readFile(config.files.state, 'utf8'));
@@ -749,13 +1145,12 @@ test('each candidate selection consumes budget and an unverified fallback cannot
     'candidate-attempt',
   ]);
   assert.equal(state.lastSwitch.to, 'candidate-b');
-  assert.equal(state.quarantinedNodes['candidate-b'], undefined);
+  assert.equal(state.quarantinedNodes['candidate-b'].reason, 'post-switch-verification-failed');
   assert.equal(state.quarantinedNodes['candidate-a'].reason, 'post-switch-verification-failed');
   assert.equal(state.quarantinedNodes['candidate-c'], undefined);
   assert.equal(events.some((entry) => entry.event === 'switch-budget-exhausted'
     && entry.details.blockedCandidate === 'candidate-c'), true);
-  assert.equal(events.some((entry) => entry.event === 'fallback-selection-budget-exhausted'
-    && entry.details.retained === 'candidate-b'), true);
+  assert.equal(events.some((entry) => entry.event === 'fallback-selection-budget-exhausted'), false);
 });
 
 test('recovery rollback is audited but exempt from the candidate switch budget', async (t) => {

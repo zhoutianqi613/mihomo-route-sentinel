@@ -1,5 +1,5 @@
 {
-  "configVersion": 4,
+  "configVersion": 5,
   "controller": {
     "transport": "auto",
     "url": "http://127.0.0.1:9090",
@@ -26,9 +26,10 @@
     "currentMaxAverageMs": 800,
     "currentMaxSingleMs": 1500,
     "scanRounds": 1,
-    "scanUrlCount": 1,
+    "scanUrlCount": 2,
     "validationRounds": 2,
     "topCandidates": 6,
+    "maxValidationCandidates": 18,
     "parallelism": 4,
     "candidateMinSuccessRate": 1,
     "candidateMaxAverageMs": 600,
@@ -40,6 +41,9 @@
     "intervalSeconds": 30,
     "partialFailureCycles": 2,
     "latencyFailureCycles": 3,
+    "degradationWindowCycles": 10,
+    "degradationWindowFailures": 3,
+    "optimizationIntervalSeconds": 900,
     "hardFailureConfirmSeconds": 5,
     "minimumDwellSeconds": 120,
     "minimumImprovementMs": 200,

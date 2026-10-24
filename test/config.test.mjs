@@ -18,11 +18,11 @@ async function withConfig(value, action) {
 }
 
 const minimal = {
-  configVersion: 4,
+  configVersion: 5,
   groups: { target: 'PROXY', candidates: 'Candidates' },
 };
 
-test('v1 配置可内存迁移到 v4 并补齐新默认值', async () => {
+test('v1 配置可内存迁移到当前版本并补齐新默认值', async () => {
   await withConfig({ groups: minimal.groups }, async (configPath) => {
     const config = await loadConfig(configPath);
     assert.equal(config.configVersion, CURRENT_CONFIG_VERSION);
@@ -39,7 +39,7 @@ test('v1 配置可内存迁移到 v4 并补齐新默认值', async () => {
   });
 });
 
-test('v2 配置可内存迁移到 v4 且不会静默启用外部配置修改', async () => {
+test('v2 配置可内存迁移到当前版本且不会静默启用外部配置修改', async () => {
   await withConfig({ ...minimal, configVersion: 2 }, async (configPath) => {
     const config = await loadConfig(configPath);
     assert.equal(config.configVersion, CURRENT_CONFIG_VERSION);
@@ -48,12 +48,24 @@ test('v2 配置可内存迁移到 v4 且不会静默启用外部配置修改', a
   });
 });
 
-test('v3 配置迁移到 v4 时不会自动启用客户端进程守卫', async () => {
+test('v3 配置迁移到当前版本时不会自动启用客户端进程守卫', async () => {
   await withConfig({ ...minimal, configVersion: 3, guardrails: { enabled: true } }, async (configPath) => {
     const config = await loadConfig(configPath);
     assert.equal(config.configVersion, CURRENT_CONFIG_VERSION);
     assert.equal(config.guardrails.enabled, true);
     assert.equal(config.guardrails.ensureClashVergeRunning, false);
+  });
+});
+
+test('v4 单业务 URL 配置升级后保持旧版单 URL 初筛行为', async () => {
+  await withConfig({
+    ...minimal,
+    configVersion: 4,
+    probes: { urls: ['https://service.example/'] },
+  }, async (configPath) => {
+    const config = await loadConfig(configPath);
+    assert.equal(config.configVersion, CURRENT_CONFIG_VERSION);
+    assert.equal(config.probes.scanUrlCount, 1);
   });
 });
 
@@ -64,7 +76,7 @@ test('未来配置版本被明确拒绝', async () => {
 });
 
 test('示例占位组名会给出可操作错误', async () => {
-  await withConfig({ configVersion: 4 }, async (configPath) => {
+  await withConfig({ configVersion: CURRENT_CONFIG_VERSION }, async (configPath) => {
     await assert.rejects(loadConfig(configPath), /仍是占位值.*实际存在的策略组名/);
   });
 });
@@ -90,6 +102,8 @@ for (const [label, override, expected] of [
   ['扫描 URL 数不得超过 URL 数组', { probes: { scanUrlCount: 3 } }, /scanUrlCount.*urls/],
   ['候选节点门槛不得更宽', { probes: { candidateMaxAverageMs: 900 } }, /候选节点延迟准入线/],
   ['候选短名单必须覆盖尝试数', { probes: { topCandidates: 2 } }, /topCandidates.*maxSwitchAttempts/],
+  ['候选验证上限不得小于单批数量', { probes: { maxValidationCandidates: 5 } }, /maxValidationCandidates.*topCandidates/],
+  ['滚动退化次数不得超过窗口', { policy: { degradationWindowCycles: 2, degradationWindowFailures: 3 } }, /degradationWindowFailures.*degradationWindowCycles/],
   ['立即响应尖峰必须高于当前单次健康线', { policy: { immediateMaxSingleMs: 1500 } }, /immediateMaxSingleMs.*currentMaxSingleMs/],
 ]) {
   test(label, async () => {

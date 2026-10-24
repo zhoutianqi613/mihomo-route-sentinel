@@ -62,7 +62,7 @@ node .\src\cli.mjs --config .\config.json --status-json
 
 | 字段 | 默认值 | 说明 |
 |---|---:|---|
-| `configVersion` | `4` | 配置格式版本。旧版配置只在内存中迁移，原文件不会被改写。 |
+| `configVersion` | `5` | 配置格式版本。旧版配置只在内存中迁移，原文件不会被改写。 |
 | `controller.transport` | `auto` | Controller 连接方式：`auto`、`http` 或 `pipe`；`auto` 在 Windows 优先发现 Clash Verge Named Pipe。 |
 | `controller.url` | `http://127.0.0.1:9090` | HTTP Controller 地址；使用 `http` 时生效，也是 `auto` 无法发现管道时的后备地址。 |
 | `controller.pipePath` | 空 | 显式 Named Pipe 路径；留空时按 `pipePattern` 自动发现。 |
@@ -89,9 +89,10 @@ node .\src\cli.mjs --config .\config.json --status-json
 | `probes.currentMaxAverageMs` | `800` | 当前节点可接受的平均延迟上限。 |
 | `probes.currentMaxSingleMs` | `1500` | 当前节点可接受的单次最大延迟上限。 |
 | `probes.scanRounds` | `1` | 初筛每个候选的探测轮数。 |
-| `probes.scanUrlCount` | `1` | 初筛使用 `urls` 前 N 个地址。 |
+| `probes.scanUrlCount` | `2` | 初筛使用 `urls` 前 N 个地址；默认同时覆盖 ChatGPT 与 OpenAI API，降低单目标偶然值误导排序的概率。 |
 | `probes.validationRounds` | `2` | 候选进入切换前必须连续通过的严格验证轮数。 |
-| `probes.topCandidates` | `6` | 初筛后进入严格验证的候选数量上限。 |
+| `probes.topCandidates` | `6` | 每批进入严格验证的候选数量；一批不足时会继续验证下一批。 |
+| `probes.maxValidationCandidates` | `18` | 单次扫描最多严格验证的候选总数，避免初筛瞬时抖动把真正稳定的节点排除在前 6 名之外。 |
 | `probes.parallelism` | `4` | 候选初筛并发数。 |
 | `probes.candidateMinSuccessRate` | `1` | 候选准入成功率；默认要求 100%。 |
 | `probes.candidateMaxAverageMs` | `600` | 候选准入平均延迟上限。 |
@@ -106,6 +107,9 @@ node .\src\cli.mjs --config .\config.json --status-json
 | `policy.intervalSeconds` | `30` | 主健康检查周期；上一轮超时则完成后立即进入下一轮。 |
 | `policy.partialFailureCycles` | `2` | 部分请求失败连续达到该周期数后触发候选扫描。 |
 | `policy.latencyFailureCycles` | `3` | 纯延迟退化连续达到该周期数后评估切换。 |
+| `policy.degradationWindowCycles` | `10` | 统计间歇性延迟退化的滚动周期数，健康周期不会再直接抹掉历史尖峰。 |
+| `policy.degradationWindowFailures` | `3` | 滚动窗口内达到该退化次数即触发择优扫描。不得大于窗口周期数。 |
+| `policy.optimizationIntervalSeconds` | `900` | 当前节点不是“优秀”时执行周期择优的间隔；`0` 表示关闭周期择优。 |
 | `policy.hardFailureConfirmSeconds` | `5` | 硬故障或不可接受尖峰的复核等待时间。 |
 | `policy.minimumDwellSeconds` | `120` | 纯延迟优化的最短驻留时间；故障恢复不受此限制。 |
 | `policy.minimumImprovementMs` | `200` | 延迟型切换要求候选至少改善的绝对延迟。 |
@@ -122,6 +126,10 @@ node .\src\cli.mjs --config .\config.json --status-json
 | `policy.switchBudgetCount` | `3` | 滚动窗口内允许的最大切换次数。 |
 | `policy.switchBudgetWindowSeconds` | `600` | 切换预算的滚动窗口长度。 |
 | `policy.upstreamFailureMinCandidates` | `3` | 至少多少个候选呈现同类业务失败时，可结合对照 URL 判定上游故障并抑制切换。 |
+
+延迟等级同时看平均值与单次最大值：优秀为平均不超过 500 ms 且最大不超过 1000 ms；可接受为平均不超过 800 ms 且最大不超过 1500 ms；退化为平均 800–1200 ms 或最大 1500–2500 ms；不可接受为平均超过 1200 ms 或最大超过 2500 ms；硬故障为成功率不超过 50% 或平均超过 3000 ms。平均值不会覆盖尖峰，决策还同时使用成功率、最大值、滚动退化次数、连续周期以及 HTTPS/WebSocket 的 TLS、TTFB 真实链路指标。
+
+周期择优、滚动退化和纯延迟切换均要求候选先通过严格准入，并相对当前节点至少改善 200 ms 或 20%（满足任一条件）。故障恢复不受改善幅度限制。切后若候选未达到严格准入线但每轮仍满足当前健康线，只能作为“临时候选”保活，并在下一周期重新严格准入；低于当前健康线的失败候选不会被主动重新选回。
 
 ### 日志与真实链路遥测
 
@@ -193,10 +201,14 @@ Windows 可自动完成上述 DNS 修复闭环。Linux 和 macOS 只有显式配
 | 瞬时异常 | 尚未达到对应的连续周期阈值 | 记录，不切换 |
 | 部分失败 | 成功率高于 50% 但低于 100%，连续 2 个周期 | 立即扫描和切换，不受最短驻留限制 |
 | 延迟退化 | 100% 成功，但平均或单次延迟超标，连续 3 个周期 | 最短驻留结束后，仅切换到至少改善 200 ms 或 20% 的候选 |
+| 间歇性退化 | 最近 10 个周期累计 3 次延迟退化或尖峰 | 达到第 3 次的当周期触发择优扫描，仍遵守最短驻留与改善门槛 |
+| 周期择优 | 当前节点健康但未达到“优秀”，且距离上次择优已满 15 分钟 | 扫描严格合格候选，仅在改善至少 200 ms 或 20% 时切换；配置为 `0` 可关闭 |
 | 不可接受尖峰 | 任一真实探测超过 `immediateMaxSingleMs`（默认 2500 ms），但尚未达到硬故障 | 5 秒后确认；仍为尖峰则立即扫描，不受普通连续周期与最短驻留限制 |
 | 硬故障 | 成功率不超过 50% 或平均延迟超过 3000 ms | 5 秒后确认；仍失败则立即扫描，不受普通连续周期与最短驻留限制 |
 
 候选必须 100% 成功、平均延迟不超过 600 ms、单次不超过 1200 ms，并连续两轮验证合格。切换后再次验证两轮；失败候选隔离 15 分钟并继续尝试下一个，最多尝试 3 个。只有原节点重新探测合格时才允许回滚。找不到合格候选后退避 120 秒；10 分钟最多切换 3 次。业务目标整体失败但对照 URL 正常时，按上游故障处理并抑制切换风暴。
+
+默认周期择优会初筛候选组全部节点，并按每批 6 个、最多 18 个进行严格复测。以 50 个候选、2 个业务 URL 估算，单轮最坏约 172 次延迟请求；15 分钟一次的理论上限约 1.65 万次/天。实际会在取得足够候选后提前停止。资源受限或节点很多时可增大 `policy.optimizationIntervalSeconds`，或设为 `0` 关闭周期择优；故障转移不受该开关影响。
 
 如果用户或其他程序在 Sentinel 之外改变目标 Selector，或嵌套代理组解析出的实际叶子节点发生变化，实际选择会与最近已准入状态比对并记录 `external-selection-detected`。新节点必须使用业务 URL 按候选门槛立即完成严格多轮准入；未通过时立即扫描其他候选，并把待准入状态保留到成功准入或 Sentinel 完成切换。Mihomo UI 中的 `5000 ms` history/占位显示不参与准入判断。
 

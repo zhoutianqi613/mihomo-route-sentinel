@@ -348,3 +348,31 @@ test('status exposes Clash Verge process guard failures and recovery', async () 
   assert.ok(snapshot.warnings.some((message) => message.includes('客户端进程守卫未就绪')));
   assert.match(formatStatus(snapshot), /客户端进程守卫\s+: blocked/);
 });
+
+test('status warns about provisional fallback and explains rejected candidates', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'route-sentinel-provisional-'));
+  const stateFile = path.join(root, 'state.json');
+  const logFile = path.join(root, 'watchdog.ndjson');
+  await writeFile(stateFile, JSON.stringify({
+    provisionalFallback: {
+      selection: 'temporary-node',
+      profile: 'current-threshold',
+    },
+    lastCandidateScan: {
+      at: '2026-10-24T00:00:00.000Z',
+      reason: 'periodic-optimization',
+      sampledCount: 50,
+      validatedCount: 6,
+      stable: ['good-node'],
+      rejected: [{ node: 'fast-but-flaky', reasons: ['success-rate'] }],
+    },
+  }));
+  await writeFile(logFile, '');
+
+  const snapshot = await buildStatusSnapshot({ stateFile, logFile });
+  const output = formatStatus(snapshot);
+
+  assert.ok(snapshot.warnings.some((message) => message.includes('尚未通过严格准入')));
+  assert.match(output, /合格 good-node/);
+  assert.match(output, /fast-but-flaky\[success-rate\]/);
+});
