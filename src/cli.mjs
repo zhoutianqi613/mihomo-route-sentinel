@@ -80,6 +80,12 @@ async function acquireLock(lockFile) {
 async function main() {
   const options = parseArgs(process.argv.slice(2));
   if (options.help) { printHelp(); return; }
+  const packageMetadata = JSON.parse(await readFile(path.join(projectRoot, 'package.json'), 'utf8'));
+  const runtime = {
+    version: packageMetadata.version,
+    pid: process.pid,
+    startedAt: new Date().toISOString(),
+  };
   const config = await loadConfig(options.config);
   if (options.status || options.statusJson) {
     if (options.run || options.apply || options.forceScan) {
@@ -157,6 +163,7 @@ async function main() {
     controller,
     config,
     logger,
+    runtime,
     beforeSwitch: async () => {
       if (!config.guardrails.enabled) return;
       const runtimeGuard = await runRuntimeGuard();
@@ -168,6 +175,7 @@ async function main() {
     },
   });
   await logger('info', 'watchdog-started', {
+    runtime,
     mode: options.run ? 'continuous' : 'once',
     apply: options.apply,
     controller: controller.describe(),
@@ -212,6 +220,7 @@ async function main() {
   try {
     do {
       const cycleStartedAt = Date.now();
+      let backgroundWake = null;
       try {
         const guardrail = await enqueueGuard(() => enforceGuardrails({
           controller,
@@ -238,7 +247,9 @@ async function main() {
             dryRun: !options.apply,
             forceScan: options.forceScan,
             linkTelemetry,
+            backgroundScan: options.run,
           });
+          backgroundWake = result.backgroundWake ?? null;
           await logger('info', 'watchdog-cycle-completed', { status: result.status });
         }
       } catch (error) {
@@ -263,7 +274,17 @@ async function main() {
       if (!options.run || stopping) break;
       const cycleElapsedMs = Date.now() - cycleStartedAt;
       const waitMs = Math.max(0, (config.policy.intervalSeconds * 1000) - cycleElapsedMs);
-      if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
+      if (waitMs > 0) {
+        await new Promise((resolve) => {
+          const timer = setTimeout(resolve, waitMs);
+          if (backgroundWake) {
+            backgroundWake.finally(() => {
+              clearTimeout(timer);
+              resolve();
+            });
+          }
+        });
+      }
     } while (!stopping);
   } finally {
     if (runtimeGuardTimer) clearInterval(runtimeGuardTimer);

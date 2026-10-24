@@ -131,6 +131,17 @@ export class MihomoController {
     return result.data.delay;
   }
 
+  async getGroupDelays(name, url, timeoutMs) {
+    const query = new URLSearchParams({ url, timeout: String(timeoutMs) });
+    const result = await this.request('GET', `/group/${encodeURIComponent(name)}/delay?${query}`);
+    if (!result.data || typeof result.data !== 'object' || Array.isArray(result.data)) {
+      throw new Error('代理组延迟响应格式无效');
+    }
+    const delays = new Map(Object.entries(result.data).filter(([, delay]) => Number.isFinite(delay)));
+    if (delays.size === 0) throw new Error('代理组延迟响应没有有效节点');
+    return delays;
+  }
+
   async select(group, name) {
     await this.request('PUT', `/proxies/${encodeURIComponent(group)}`, { name });
   }

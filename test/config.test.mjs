@@ -100,6 +100,8 @@ for (const [label, override, expected] of [
   ['Clash Verge 可执行文件名必须匹配', { guardrails: { clashVergeExecutable: 'C:\\Tools\\other.exe' } }, /clashVergeExecutable.*clash-verge\.exe/],
   ['Clash Verge 启动退避必须至少五秒', { guardrails: { clashVergeStartBackoffSeconds: 4 } }, /clashVergeStartBackoffSeconds.*5/],
   ['扫描 URL 数不得超过 URL 数组', { probes: { scanUrlCount: 3 } }, /scanUrlCount.*urls/],
+  ['发现超时必须小于扫描截止', { probes: { discoveryTimeoutMs: 3000 } }, /discoveryTimeoutMs.*scanDeadlineMs/],
+  ['扫描截止不得超过三秒', { probes: { scanDeadlineMs: 3001 } }, /scanDeadlineMs.*3000/],
   ['候选节点门槛不得更宽', { probes: { candidateMaxAverageMs: 900 } }, /候选节点延迟准入线/],
   ['候选短名单必须覆盖尝试数', { probes: { topCandidates: 2 } }, /topCandidates.*maxSwitchAttempts/],
   ['候选验证上限不得小于单批数量', { probes: { maxValidationCandidates: 5 } }, /maxValidationCandidates.*topCandidates/],

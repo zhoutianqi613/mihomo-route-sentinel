@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 
-export const CURRENT_CONFIG_VERSION = 5;
+export const CURRENT_CONFIG_VERSION = 6;
 
 export const defaults = Object.freeze({
   configVersion: CURRENT_CONFIG_VERSION,
@@ -21,6 +21,8 @@ export const defaults = Object.freeze({
     urls: ['https://chatgpt.com/', 'https://api.openai.com/v1/models'],
     controlUrls: ['https://cp.cloudflare.com/generate_204'],
     timeoutMs: 5000,
+    discoveryTimeoutMs: 1200,
+    scanDeadlineMs: 3000,
     currentRounds: 2,
     currentMinSuccessRate: 1,
     currentMaxAverageMs: 800,
@@ -239,6 +241,8 @@ function validate(config) {
   requireUrlList(config.probes.controlUrls, 'probes.controlUrls');
   for (const [name, minimum] of Object.entries({
     timeoutMs: 100,
+    discoveryTimeoutMs: 100,
+    scanDeadlineMs: 500,
     currentRounds: 1,
     scanRounds: 1,
     scanUrlCount: 1,
@@ -247,6 +251,12 @@ function validate(config) {
     maxValidationCandidates: 1,
     parallelism: 1,
   })) requireInteger(config.probes[name], `probes.${name}`, minimum);
+  if (config.probes.discoveryTimeoutMs >= config.probes.scanDeadlineMs) {
+    throw new Error('probes.discoveryTimeoutMs 必须小于 probes.scanDeadlineMs');
+  }
+  if (config.probes.scanDeadlineMs > 3000) {
+    throw new Error('probes.scanDeadlineMs 不得超过 3000 ms');
+  }
   requireRate(config.probes.currentMinSuccessRate, 'probes.currentMinSuccessRate');
   requireRate(config.probes.candidateMinSuccessRate, 'probes.candidateMinSuccessRate');
   for (const name of ['currentMaxAverageMs', 'currentMaxSingleMs', 'candidateMaxAverageMs', 'candidateMaxSingleMs']) {

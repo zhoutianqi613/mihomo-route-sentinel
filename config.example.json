@@ -1,5 +1,5 @@
 {
-  "configVersion": 5,
+  "configVersion": 6,
   "controller": {
     "transport": "auto",
     "url": "http://127.0.0.1:9090",
@@ -21,6 +21,8 @@
       "https://cp.cloudflare.com/generate_204"
     ],
     "timeoutMs": 5000,
+    "discoveryTimeoutMs": 1200,
+    "scanDeadlineMs": 3000,
     "currentRounds": 2,
     "currentMinSuccessRate": 1,
     "currentMaxAverageMs": 800,

@@ -9,7 +9,7 @@
 - Linux、macOS、路由器等环境可使用标准 HTTP Controller。
 - secret 仅从环境变量读取，不写入配置或日志。
 - 区分瞬时异常、部分失败、延迟退化和硬故障。
-- 全节点快速扫描后，只对前 N 名多轮复测。
+- 全节点扫描优先使用 Mihomo 组级 delay API，并在 3 秒硬预算内完成多轮准入；扫描在独立异步通道运行，不占住健康主循环。
 - 最短驻留、改善幅度、节点隔离、扫描退避和切换预算避免节点抖动。
 - 使用公共对照 URL 识别上游整体故障，避免无意义换节点。
 - 记录 HTTPS 的 TLS/TTFB 与 WebSocket 链路指标，结构化日志按大小轮转。
@@ -62,7 +62,7 @@ node .\src\cli.mjs --config .\config.json --status-json
 
 | 字段 | 默认值 | 说明 |
 |---|---:|---|
-| `configVersion` | `5` | 配置格式版本。旧版配置只在内存中迁移，原文件不会被改写。 |
+| `configVersion` | `6` | 配置格式版本。旧版配置只在内存中迁移，原文件不会被改写。 |
 | `controller.transport` | `auto` | Controller 连接方式：`auto`、`http` 或 `pipe`；`auto` 在 Windows 优先发现 Clash Verge Named Pipe。 |
 | `controller.url` | `http://127.0.0.1:9090` | HTTP Controller 地址；使用 `http` 时生效，也是 `auto` 无法发现管道时的后备地址。 |
 | `controller.pipePath` | 空 | 显式 Named Pipe 路径；留空时按 `pipePattern` 自动发现。 |
@@ -84,6 +84,8 @@ node .\src\cli.mjs --config .\config.json --status-json
 | `probes.urls` | ChatGPT、OpenAI API | 真实业务探测 URL 列表，至少两个 HTTP/HTTPS 地址。 |
 | `probes.controlUrls` | Cloudflare 204 | 非 OpenAI 对照 URL，用于区分节点故障与上游服务故障。 |
 | `probes.timeoutMs` | `5000` | 单次 URL 探测超时。 |
+| `probes.discoveryTimeoutMs` | `1200` | 全候选快速发现的单目标超时。本机 58 节点实测约 1.2 秒可返回约 42 个结果；发现阶段优先使用 Mihomo 组级 delay API。 |
+| `probes.scanDeadlineMs` | `3000` | 一次候选发现与准入扫描的硬截止，最大允许值为 3000 ms；截止后忽略尚未完成的探测，避免扫描占住健康主循环。 |
 | `probes.currentRounds` | `2` | 每周期对当前节点执行的探测轮数。 |
 | `probes.currentMinSuccessRate` | `1` | 当前节点健康所需成功率；`1` 表示 100%。 |
 | `probes.currentMaxAverageMs` | `800` | 当前节点可接受的平均延迟上限。 |
@@ -91,9 +93,9 @@ node .\src\cli.mjs --config .\config.json --status-json
 | `probes.scanRounds` | `1` | 初筛每个候选的探测轮数。 |
 | `probes.scanUrlCount` | `2` | 初筛使用 `urls` 前 N 个地址；默认同时覆盖 ChatGPT 与 OpenAI API，降低单目标偶然值误导排序的概率。 |
 | `probes.validationRounds` | `2` | 候选进入切换前必须连续通过的严格验证轮数。 |
-| `probes.topCandidates` | `6` | 每批进入严格验证的候选数量；一批不足时会继续验证下一批。 |
+| `probes.topCandidates` | `6` | 保留的首选候选窗口与旧配置兼容字段；v6 在统一硬截止内并发验证至 `maxValidationCandidates`，不再逐批等待。 |
 | `probes.maxValidationCandidates` | `18` | 单次扫描最多严格验证的候选总数，避免初筛瞬时抖动把真正稳定的节点排除在前 6 名之外。 |
-| `probes.parallelism` | `4` | 候选初筛并发数。 |
+| `probes.parallelism` | `4` | 旧版/兼容探测并发提示值；v6 组级 API 由 Mihomo 核心并发，API 不可用时使用受 3 秒统一截止约束的并行降级路径。 |
 | `probes.candidateMinSuccessRate` | `1` | 候选准入成功率；默认要求 100%。 |
 | `probes.candidateMaxAverageMs` | `600` | 候选准入平均延迟上限。 |
 | `probes.candidateMaxSingleMs` | `1200` | 候选准入单次最大延迟上限。 |
@@ -129,7 +131,7 @@ node .\src\cli.mjs --config .\config.json --status-json
 
 延迟等级同时看平均值与单次最大值：优秀为平均不超过 500 ms 且最大不超过 1000 ms；可接受为平均不超过 800 ms 且最大不超过 1500 ms；退化为平均 800–1200 ms 或最大 1500–2500 ms；不可接受为平均超过 1200 ms 或最大超过 2500 ms；硬故障为成功率不超过 50% 或平均超过 3000 ms。平均值不会覆盖尖峰，决策还同时使用成功率、最大值、滚动退化次数、连续周期以及 HTTPS/WebSocket 的 TLS、TTFB 真实链路指标。
 
-周期择优、滚动退化和纯延迟切换均要求候选先通过严格准入，并相对当前节点至少改善 200 ms 或 20%（满足任一条件）。故障恢复不受改善幅度限制。切后若候选未达到严格准入线但每轮仍满足当前健康线，只能作为“临时候选”保活，并在下一周期重新严格准入；低于当前健康线的失败候选不会被主动重新选回。
+周期择优、滚动退化和纯延迟切换优先使用通过严格准入、且相对当前节点至少改善 200 ms 或 20%（满足任一条件）的候选。当前节点已不健康时，若某个复测候选每轮仍满足当前健康线，可作为“临时候选”：系统先尝试严格候选，严格候选切后全部失败才继续尝试临时候选；完全没有严格候选时则直接从临时候选恢复。切后验证未达到严格准入线但仍满足当前健康线时也采用同一保活机制。临时候选会在下一周期重新严格准入；低于当前健康线的失败候选不会被主动重新选回。周期择优不会为了普通性能优化而使用临时候选。
 
 ### 日志与真实链路遥测
 
@@ -193,7 +195,7 @@ Windows 可自动完成上述 DNS 修复闭环。Linux 和 macOS 只有显式配
 
 ## 自动切换策略
 
-正常模式按 30 秒固定起始节拍检查，每轮对 ChatGPT 和 OpenAI API 各探测两次。如果一轮扫描本身超过 30 秒，下一轮会在完成后立即开始，不再额外等待：
+正常模式按 30 秒固定起始节拍检查，每轮对 ChatGPT 和 OpenAI API 各探测两次。候选扫描不会在主循环内等待：服务启动单实例后台扫描后，当前节点健康通道仍可继续运行；扫描一完成便提前唤醒决策周期，无需等满 30 秒。
 
 | 状态 | 判定 | 动作 |
 |---|---|---|
@@ -206,9 +208,11 @@ Windows 可自动完成上述 DNS 修复闭环。Linux 和 macOS 只有显式配
 | 不可接受尖峰 | 任一真实探测超过 `immediateMaxSingleMs`（默认 2500 ms），但尚未达到硬故障 | 5 秒后确认；仍为尖峰则立即扫描，不受普通连续周期与最短驻留限制 |
 | 硬故障 | 成功率不超过 50% 或平均延迟超过 3000 ms | 5 秒后确认；仍失败则立即扫描，不受普通连续周期与最短驻留限制 |
 
-候选必须 100% 成功、平均延迟不超过 600 ms、单次不超过 1200 ms，并连续两轮验证合格。切换后再次验证两轮；失败候选隔离 15 分钟并继续尝试下一个，最多尝试 3 个。只有原节点重新探测合格时才允许回滚。找不到合格候选后退避 120 秒；10 分钟最多切换 3 次。业务目标整体失败但对照 URL 正常时，按上游故障处理并抑制切换风暴。
+候选必须 100% 成功、平均延迟不超过 600 ms、单次不超过 1200 ms，并连续两轮验证合格。3 秒扫描产生的是快速候选池；正式服务在改变路由前还会对单个候选执行串行多轮准入门禁，门禁失败的节点不消耗切换预算、不会触发 Codex 断线，并会被隔离。切换后再次验证两轮；失败候选隔离 15 分钟并继续尝试下一个，最多尝试 3 个。只有原节点重新探测合格时才允许回滚。找不到合格候选后退避 120 秒；10 分钟最多切换 3 次。业务目标整体失败但对照 URL 正常时，按上游故障处理并抑制切换风暴。
 
-默认周期择优会初筛候选组全部节点，并按每批 6 个、最多 18 个进行严格复测。以 50 个候选、2 个业务 URL 估算，单轮最坏约 172 次延迟请求；15 分钟一次的理论上限约 1.65 万次/天。实际会在取得足够候选后提前停止。资源受限或节点很多时可增大 `policy.optimizationIntervalSeconds`，或设为 `0` 关闭周期择优；故障转移不受该开关影响。
+v6 快速路径使用 Mihomo 组级 delay API：默认初筛为 `1 轮 × 2 URL`，严格复测为 `2 轮 × 2 URL`，最多只需 6 个本地 Controller 请求，而不是按节点累计数百个请求。全流程受 `scanDeadlineMs=3000` 硬截止；组级 API 不可用时才全并发降级，未在截止前完成的样本直接淘汰。扫描任务单实例运行，旧选择恢复或发生变化后，已完成的过期结果会被丢弃，不能触发误切换。
+
+扫描使用同一 Node.js 服务内的异步 I/O 通道，而不是操作系统子进程。网络探测不是 CPU 密集任务；子进程会额外引入 Controller 凭据传递、Named Pipe 重连、日志合并、取消和孤儿进程清理问题。健康检查通道、后台扫描通道和串行切换通道彼此分离：扫描只负责发现，单候选切前门禁负责安全，真正的路由修改始终串行且单实例。
 
 如果用户或其他程序在 Sentinel 之外改变目标 Selector，或嵌套代理组解析出的实际叶子节点发生变化，实际选择会与最近已准入状态比对并记录 `external-selection-detected`。新节点必须使用业务 URL 按候选门槛立即完成严格多轮准入；未通过时立即扫描其他候选，并把待准入状态保留到成功准入或 Sentinel 完成切换。Mihomo UI 中的 `5000 ms` history/占位显示不参与准入判断。
 
@@ -323,12 +327,12 @@ sh ./scripts/service-unix.sh status
 
 ## 运行文件
 
-- `var/state.json`：当前节点、连续失败、最近扫描/切换、隔离节点和滚动切换预算。Dry Run 不写此文件。
+- `var/state.json`：当前节点、连续失败、后台扫描状态、最近扫描/切换、隔离节点和滚动切换预算。Dry Run 不写此文件。
 - `var/watchdog.ndjson`：结构化运行日志，包含健康结果和 TLS/TTFB/WebSocket 指标，不记录 controller secret 或节点服务器地址。达到 `logging.maxBytes` 后轮转，保留 `logging.retainedFiles` 份。
 - `var/watchdog.lock`：防止重复实例。
 - `var/guardrails.json`：保存 DNS 修复后的待重载/待复核债务，问题确认解决后自动清除。
 
-Windows 的 `service-windows.bat status` 以及 Unix 的 `service-unix.sh status` 用于查看服务层状态；业务状态使用 CLI `--status` 或便于机器处理的 `--status-json`。
+Windows 的 `service-windows.bat status` 以及 Unix 的 `service-unix.sh status` 用于查看服务层状态；业务状态使用 CLI `--status` 或便于机器处理的 `--status-json`。状态会显示后台进程实际写入的程序版本、PID 和启动时间，用于识别任务虽为 Running 但仍加载旧代码的情况；同时展示后台扫描状态、扫描耗时、3 秒截止是否触发，以及严格/临时候选。
 
 ## 开源许可
 

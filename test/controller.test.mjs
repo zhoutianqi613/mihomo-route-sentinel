@@ -18,6 +18,18 @@ test('controller exposes runtime config read and patch operations', async () => 
   ]);
 });
 
+test('controller parses Mihomo group delay results', async () => {
+  const controller = Object.create(MihomoController.prototype);
+  controller.request = async (method, requestPath) => {
+    assert.equal(method, 'GET');
+    assert.match(requestPath, /^\/group\/candidates\/delay\?/);
+    return { status: 200, data: { 'node-a': 123, 'node-b': 456, invalid: null } };
+  };
+
+  const delays = await controller.getGroupDelays('candidates', 'https://example.com/', 1200);
+  assert.deepEqual([...delays], [['node-a', 123], ['node-b', 456]]);
+});
+
 test('temporary pipe disappearance does not permanently fall back to HTTP', async () => {
   const controller = Object.create(MihomoController.prototype);
   controller.config = { transport: 'auto', pipePath: '', pipePattern: 'verge-mihomo' };

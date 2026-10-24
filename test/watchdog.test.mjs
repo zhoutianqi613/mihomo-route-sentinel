@@ -138,6 +138,24 @@ test('summarizeSamples prioritizes success rate before latency', () => {
   assert.equal(stable.successRate, 1);
 });
 
+test('runtime metadata is persisted for deployed-version verification', async (t) => {
+  const mock = await startMockController({ initialSelected: 'good-node' });
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  const runtime = { version: 'test-version', pid: 1234, startedAt: '2026-10-24T00:00:00.000Z' };
+  const watchdog = new Watchdog({
+    controller: new MihomoController(config.controller, {}),
+    config,
+    runtime,
+    logger: async () => {},
+  });
+
+  await watchdog.runOnce({ dryRun: false });
+
+  const state = JSON.parse(await readFile(config.files.state, 'utf8'));
+  assert.deepEqual(state.runtime, runtime);
+});
+
 test('health classification distinguishes hard, partial, and latency failures', () => {
   const thresholds = { minSuccessRate: 1, maxAverageMs: 800, maxSingleMs: 1500 };
   const policy = {
@@ -749,6 +767,67 @@ test('post-switch failure may retain only a candidate that still meets current h
   assert.equal(state.quarantinedNodes['provisional-node'], undefined);
 });
 
+test('scan-level current-stable candidate is used when no strict candidate survives validation', async (t) => {
+  const mock = await startMockController({
+    candidates: ['bad-node', 'provisional-node', 'slow-node'],
+    delayResolver: ({ name }) => {
+      if (name === 'bad-node') return null;
+      if (name === 'provisional-node') return 700;
+      return 1600;
+    },
+  });
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  config.policy.rollbackOnFailure = false;
+  config.policy.maxSwitchAttempts = 1;
+  const events = [];
+  const watchdog = new Watchdog({
+    controller: new MihomoController(config.controller, {}),
+    config,
+    logger: async (level, event, details) => events.push({ level, event, details }),
+  });
+
+  const result = await watchdog.runOnce({ dryRun: false });
+
+  assert.equal(result.status, 'provisional-fallback');
+  assert.equal(mock.getSelected(), 'provisional-node');
+  const state = JSON.parse(await readFile(config.files.state, 'utf8'));
+  assert.deepEqual(state.lastCandidateScan.stable, []);
+  assert.deepEqual(state.lastCandidateScan.provisional, ['provisional-node']);
+  assert.equal(state.provisionalFallback.selection, 'provisional-node');
+  assert.equal(events.some((entry) => entry.event === 'provisional-candidates-selected'), true);
+});
+
+test('scan-level provisional is attempted after every strict candidate fails post-switch verification', async (t) => {
+  const mock = await startMockController({
+    candidates: ['bad-node', 'strict-then-fails', 'provisional-node'],
+    delayResolver: ({ name, probeCount }) => {
+      if (name === 'bad-node') return null;
+      if (name === 'strict-then-fails') return probeCount <= 3 ? 400 : null;
+      return 700;
+    },
+  });
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  config.policy.rollbackOnFailure = false;
+  config.policy.maxSwitchAttempts = 2;
+  const watchdog = new Watchdog({
+    controller: new MihomoController(config.controller, {}),
+    config,
+    logger: async () => {},
+  });
+
+  const result = await watchdog.runOnce({ dryRun: false });
+
+  assert.equal(result.status, 'provisional-fallback');
+  assert.deepEqual(mock.switches, ['strict-then-fails', 'provisional-node']);
+  assert.equal(mock.getSelected(), 'provisional-node');
+  const state = JSON.parse(await readFile(config.files.state, 'utf8'));
+  assert.deepEqual(state.lastCandidateScan.stable, ['strict-then-fails']);
+  assert.deepEqual(state.lastCandidateScan.provisional, ['provisional-node']);
+  assert.equal(state.provisionalFallback.selection, 'provisional-node');
+});
+
 test('a provisional candidate does not prevent a later strict candidate from succeeding', async (t) => {
   const mock = await startMockController({
     candidates: ['bad-node', 'provisional-node', 'strict-node'],
@@ -1026,6 +1105,31 @@ test('adaptive validation continues past a noisy first batch', async (t) => {
   assert.equal(result.candidate.node, 'stable-later');
 });
 
+test('unhealthy recovery validates the ranked pool concurrently within one deadline', async (t) => {
+  const mock = await startMockController({
+    candidates: ['bad-node', 'strict-a', 'strict-b', 'strict-c', 'strict-d', 'strict-e', 'strict-f'],
+    delayResolver: ({ name }) => name === 'bad-node' ? null : 100,
+  });
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  config.probes.topCandidates = 3;
+  config.probes.maxValidationCandidates = 6;
+  config.policy.maxSwitchAttempts = 3;
+  const events = [];
+  const watchdog = new Watchdog({
+    controller: new MihomoController(config.controller, {}),
+    config,
+    logger: async (level, event, details) => events.push({ level, event, details }),
+  });
+
+  const result = await watchdog.runOnce({ dryRun: true });
+
+  assert.equal(result.status, 'would-switch');
+  const validation = events.find((entry) => entry.event === 'candidate-validation-completed');
+  assert.equal(validation.details.validatedCount, 6);
+  assert.equal(validation.details.stable.length, 6);
+});
+
 test('post-switch verification probes the resolved leaf of a nested selector', async () => {
   let selected = 'bad-node';
   const probed = [];
@@ -1285,4 +1389,82 @@ test('reachable control URL prevents switching and backs off during a shared ups
   assert.equal(events.filter((entry) => entry.event === 'candidate-scan-started').length, 1);
   const state = JSON.parse(await readFile(config.files.state, 'utf8'));
   assert.equal(state.lastCandidateScanOutcome, 'upstream-outage');
+});
+
+test('candidate scan has a hard deadline even when every probe hangs', async () => {
+  const config = await makeConfig('http://127.0.0.1:1');
+  config.probes.discoveryTimeoutMs = 100;
+  config.probes.scanDeadlineMs = 500;
+  const never = () => new Promise(() => {});
+  const controller = {
+    async getProxy(name) {
+      if (name === 'candidates') return { type: 'URLTest', all: ['node-a', 'node-b'] };
+      return { type: 'VLESS', name };
+    },
+    getGroupDelays: never,
+    getDelay: never,
+  };
+  const watchdog = new Watchdog({ controller, config, logger: async () => {} });
+
+  const startedAt = performance.now();
+  const result = await watchdog.findCandidates('bad-node');
+  const elapsedMs = performance.now() - startedAt;
+
+  assert.ok(elapsedMs < 750, `扫描耗时 ${Math.round(elapsedMs)} ms`);
+  assert.equal(result.deadlineReached, true);
+  assert.deepEqual(result.stable, []);
+});
+
+test('background candidate scan does not block repeated current health checks', async (t) => {
+  const mock = await startMockController();
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  let finishScan;
+  const deferredScan = new Promise((resolve) => { finishScan = resolve; });
+  const watchdog = new Watchdog({
+    controller: new MihomoController(config.controller, {}),
+    config,
+    logger: async () => {},
+  });
+  watchdog.findCandidates = async () => deferredScan;
+
+  const first = await watchdog.runOnce({ dryRun: true, backgroundScan: true });
+  const second = await watchdog.runOnce({ dryRun: true, backgroundScan: true });
+  assert.equal(first.status, 'candidate-scan-started');
+  assert.equal(second.status, 'candidate-scan-in-progress');
+  assert.ok((mock.probeCounts.get(`bad-node\u0000${config.probes.urls[0]}`) ?? 0) >= 2);
+
+  finishScan({
+    stable: [], provisional: [], sampled: [], validated: [], rejected: [],
+    durationMs: 10, deadlineMs: 3000, deadlineReached: false,
+  });
+  await first.backgroundWake;
+  const third = await watchdog.runOnce({ dryRun: true, backgroundScan: true });
+  assert.equal(third.status, 'no-candidate');
+});
+
+test('background mode rejects a stale fast candidate before changing routes', async (t) => {
+  const mock = await startMockController({
+    candidates: ['bad-node', 'good-node'],
+    delayResolver: ({ name, probeCount }) => {
+      if (name === 'bad-node') return null;
+      return probeCount >= 4 ? null : 100;
+    },
+  });
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  const events = [];
+  const watchdog = new Watchdog({
+    controller: new MihomoController(config.controller, {}),
+    config,
+    logger: async (level, event) => events.push({ level, event }),
+  });
+
+  const started = await watchdog.runOnce({ dryRun: false, backgroundScan: true });
+  await started.backgroundWake;
+  const decided = await watchdog.runOnce({ dryRun: false, backgroundScan: true });
+
+  assert.equal(decided.status, 'no-pre-switch-candidate');
+  assert.deepEqual(mock.switches, []);
+  assert.equal(events.some((entry) => entry.event === 'candidate-pre-switch-rejected'), true);
 });

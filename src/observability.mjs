@@ -349,6 +349,7 @@ export async function buildStatusSnapshot({ stateFile, logFile, controller, targ
   }
   return {
     generatedAt: new Date().toISOString(),
+    runtime: state.runtime ?? null,
     current,
     probe: evaluation ? {
       at: evaluation.timestamp ?? null,
@@ -399,6 +400,7 @@ export async function buildStatusSnapshot({ stateFile, logFile, controller, targ
       size: policy?.degradationWindowCycles ?? null,
     },
     lastDecision: state.lastDecision ?? null,
+    candidateScan: state.candidateScan ?? null,
     lastCandidateScan: state.lastCandidateScan ?? null,
     provisionalFallback: state.provisionalFallback ?? null,
     lastSwitch: state.lastSwitch ? { at: state.lastSwitchAt ?? null, ...state.lastSwitch } : null,
@@ -444,13 +446,17 @@ export function formatStatus(snapshot) {
     ? `${display(snapshot.lastDecision.action)} / ${display(snapshot.lastDecision.reason)} / ${display(snapshot.lastDecision.at)}`
     : '-';
   const scanText = snapshot.lastCandidateScan
-    ? `${display(snapshot.lastCandidateScan.at)}，原因 ${display(snapshot.lastCandidateScan.reason)}，抽样 ${display(snapshot.lastCandidateScan.sampledCount)}，严格复测 ${display(snapshot.lastCandidateScan.validatedCount)}，合格 ${(snapshot.lastCandidateScan.stable ?? []).join('、') || '无'}；淘汰 ${(snapshot.lastCandidateScan.rejected ?? []).slice(0, 3).map((entry) => `${entry.node}[${(entry.reasons ?? []).join('/') || '未知'}]`).join('、') || '无'}`
+    ? `${display(snapshot.lastCandidateScan.at)}，原因 ${display(snapshot.lastCandidateScan.reason)}，耗时 ${display(snapshot.lastCandidateScan.durationMs, ' ms')}/${display(snapshot.lastCandidateScan.deadlineMs, ' ms')}，截止 ${snapshot.lastCandidateScan.deadlineReached ? '是' : '否'}，抽样 ${display(snapshot.lastCandidateScan.sampledCount)}，严格复测 ${display(snapshot.lastCandidateScan.validatedCount)}，严格合格 ${(snapshot.lastCandidateScan.stable ?? []).join('、') || '无'}，健康线临时候选 ${(snapshot.lastCandidateScan.provisional ?? []).join('、') || '无'}；淘汰 ${(snapshot.lastCandidateScan.rejected ?? []).slice(0, 3).map((entry) => `${entry.node}[${(entry.reasons ?? []).join('/') || '未知'}]`).join('、') || '无'}`
     : '-';
+  const activeScanText = snapshot.candidateScan
+    ? `${display(snapshot.candidateScan.status)}，开始 ${display(snapshot.candidateScan.startedAt)}，原因 ${display(snapshot.candidateScan.reason)}`
+    : '无';
   const provisionalText = snapshot.provisionalFallback
     ? `${display(snapshot.provisionalFallback.selection)}（${display(snapshot.provisionalFallback.profile)}，等待严格准入）`
     : '无';
   const lines = [
     'Mihomo Route Sentinel 运行状态',
+    `运行版本       : ${display(snapshot.runtime?.version)}（PID ${display(snapshot.runtime?.pid)}，启动 ${display(snapshot.runtime?.startedAt)}）`,
     `当前选择       : ${display(snapshot.current?.selected)}`,
     `当前叶子节点   : ${display(snapshot.current?.leaf)}（来源：${display(snapshot.current?.source)}）`,
     `最近探测       : ${display(snapshot.probe?.at)}`,
@@ -459,6 +465,7 @@ export function formatStatus(snapshot) {
     `连续失败       : 总计 ${snapshot.consecutiveFailures.overall}，部分失败 ${snapshot.consecutiveFailures.partial}，延迟退化 ${snapshot.consecutiveFailures.latency}`,
     `滚动延迟退化   : ${snapshot.degradationWindow.failures}/${snapshot.degradationWindow.cycles}（触发 ${display(snapshot.degradationWindow.required)}/${display(snapshot.degradationWindow.size)}）`,
     `最近决策       : ${decisionText}`,
+    `后台候选扫描   : ${activeScanText}`,
     `最近候选扫描   : ${scanText}`,
     `临时候选状态   : ${provisionalText}`,
     `最近切换       : ${switchText}`,
