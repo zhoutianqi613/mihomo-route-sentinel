@@ -1468,3 +1468,32 @@ test('background mode rejects a stale fast candidate before changing routes', as
   assert.deepEqual(mock.switches, []);
   assert.equal(events.some((entry) => entry.event === 'candidate-pre-switch-rejected'), true);
 });
+
+test('后台切前门禁拒绝不占用实际切换次数', async (t) => {
+  const mock = await startMockController({
+    candidates: ['bad-node', 'stale-a', 'stale-b', 'good-node'],
+    delayResolver: ({ name, probeCount }) => {
+      if (name === 'bad-node') return null;
+      if (name === 'stale-a' || name === 'stale-b') return probeCount <= 3 ? 80 : null;
+      return 120;
+    },
+  });
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  config.probes.topCandidates = 3;
+  config.policy.maxSwitchAttempts = 1;
+  const events = [];
+  const watchdog = new Watchdog({
+    controller: new MihomoController(config.controller, {}),
+    config,
+    logger: async (level, event, details) => events.push({ level, event, details }),
+  });
+
+  const started = await watchdog.runOnce({ dryRun: false, backgroundScan: true });
+  await started.backgroundWake;
+  const decided = await watchdog.runOnce({ dryRun: false, backgroundScan: true });
+
+  assert.equal(decided.status, 'switched');
+  assert.deepEqual(mock.switches, ['good-node']);
+  assert.equal(events.filter((entry) => entry.event === 'candidate-pre-switch-rejected').length, 2);
+});

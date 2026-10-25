@@ -1039,10 +1039,11 @@ export class Watchdog {
     let activeSelection = previousSelection;
     let candidateBudgetExhausted = false;
     let candidateSelectionAttempted = false;
+    let candidateSelectionAttempts = 0;
     let degradedRecoveryExemptionAvailable = degradedRecovery && selectionAdmissionRejected;
     const switchReason = forceScan && scanReason === 'healthy' ? 'forced-optimization' : scanReason;
-    const switchCandidates = candidates.slice(0, this.config.policy.maxSwitchAttempts);
-    for (const nextCandidate of switchCandidates) {
+    for (const nextCandidate of candidates) {
+      if (candidateSelectionAttempts >= this.config.policy.maxSwitchAttempts) break;
       const fromSelection = activeSelection;
       if (backgroundScan) {
         const preSwitchLeaf = await this.resolveLeaf(nextCandidate.node);
@@ -1122,6 +1123,7 @@ export class Watchdog {
       await writeState(this.config.files.state, state);
       await this.controller.select(this.config.groups.target, nextCandidate.node);
       candidateSelectionAttempted = true;
+      candidateSelectionAttempts += 1;
       activeSelection = nextCandidate.node;
       state.currentSelection = activeSelection;
       state.currentLeaf = await this.resolveLeaf(activeSelection);
