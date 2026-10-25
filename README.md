@@ -332,7 +332,7 @@ sh ./scripts/service-unix.sh status
 - `var/watchdog.lock`：防止重复实例。
 - `var/guardrails.json`：保存 DNS 修复后的待重载/待复核债务，问题确认解决后自动清除。
 
-Windows 的 `service-windows.bat status` 以及 Unix 的 `service-unix.sh status` 用于查看服务层状态；业务状态使用 CLI `--status` 或便于机器处理的 `--status-json`。状态会显示后台进程实际写入的程序版本、PID 和启动时间，用于识别任务虽为 Running 但仍加载旧代码的情况；同时展示后台扫描状态、扫描耗时、3 秒截止是否触发，以及严格/临时候选。
+Windows 的 `service-windows.bat status` 以及 Unix 的 `service-unix.sh status` 用于查看服务层状态；业务状态使用 CLI `--status` 或便于机器处理的 `--status-json`。状态会显示后台进程实际写入的程序版本、PID 和启动时间，用于识别任务虽为 Running 但仍加载旧代码的情况；同时展示后台扫描状态、扫描耗时、3 秒截止是否触发，以及严格/临时候选。后台扫描完成后会立即清除 `running` 并写入扫描结果；随后发生的逐节点串行切前门禁不计入扫描耗时。
 
 ## 开源许可
 

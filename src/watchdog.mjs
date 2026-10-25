@@ -973,6 +973,8 @@ export class Watchdog {
       deadlineMs: search.deadlineMs,
       deadlineReached: search.deadlineReached,
     };
+    // 扫描与串行切前门禁是两个阶段；立即落盘可避免状态把后续门禁误报为扫描超时。
+    await persistState();
 
     const upstreamOutage = await this.detectUpstreamOutage(currentLeaf, current, search.sampled);
     if (upstreamOutage) {

@@ -1497,3 +1497,38 @@ test('后台切前门禁拒绝不占用实际切换次数', async (t) => {
   assert.deepEqual(mock.switches, ['good-node']);
   assert.equal(events.filter((entry) => entry.event === 'candidate-pre-switch-rejected').length, 2);
 });
+
+test('后台扫描完成后在串行切前门禁期间不再显示运行中', async (t) => {
+  const mock = await startMockController();
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  const watchdog = new Watchdog({
+    controller: new MihomoController(config.controller, {}),
+    config,
+    logger: async () => {},
+  });
+
+  const started = await watchdog.runOnce({ dryRun: false, backgroundScan: true });
+  await started.backgroundWake;
+  const originalProbeNode = watchdog.probeNode.bind(watchdog);
+  let releaseAdmission;
+  const admissionBlocked = new Promise((resolve) => { releaseAdmission = resolve; });
+  t.after(() => releaseAdmission());
+  watchdog.probeNode = async (node, ...args) => {
+    if (node === 'good-node') await admissionBlocked;
+    return originalProbeNode(node, ...args);
+  };
+  const deciding = watchdog.runOnce({ dryRun: false, backgroundScan: true });
+
+  let state;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    state = JSON.parse(await readFile(config.files.state, 'utf8'));
+    if (!state.candidateScan && state.lastCandidateScan) break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(state.candidateScan, undefined);
+  assert.ok(state.lastCandidateScan.durationMs >= 0);
+
+  releaseAdmission();
+  await deciding;
+});
