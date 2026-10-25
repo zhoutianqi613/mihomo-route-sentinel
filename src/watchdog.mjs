@@ -540,6 +540,9 @@ export class Watchdog {
     const target = await this.controller.getProxy(this.config.groups.target);
     const previousSelection = target.now;
     const currentLeaf = await this.resolveLeaf(previousSelection);
+    const nestedSelection = previousSelection !== currentLeaf;
+    const nestedLeafSelectable = Array.isArray(target.all) && target.all.includes(currentLeaf);
+    const nestedNormalizationRequired = nestedSelection && nestedLeafSelectable;
     getActiveQuarantines(state);
     const acceptedSelection = state.currentSelection ?? null;
     const acceptedLeaf = state.currentLeaf ?? null;
@@ -551,7 +554,7 @@ export class Watchdog {
       && state.externalSelectionPendingAdmission?.leaf === currentLeaf;
     let externalChangeDetected = false;
     let baselineRevalidationStarted = false;
-    if ((selectionChanged || leafChanged) && !pendingMatchesObserved) {
+    if ((selectionChanged || leafChanged || nestedNormalizationRequired) && !pendingMatchesObserved) {
       externalChangeDetected = true;
       state.externalSelectionPendingAdmission = {
         from: acceptedSelection,
@@ -569,6 +572,7 @@ export class Watchdog {
       });
     } else if (state.externalSelectionPendingAdmission
         && state.externalSelectionPendingAdmission.source !== 'baseline'
+        && !pendingMatchesObserved
         && !selectionChanged && !leafChanged) {
       await this.log('info', 'external-selection-reverted', {
         expected: acceptedSelection,
@@ -597,6 +601,57 @@ export class Watchdog {
       ? state.externalSelectionPendingAdmission
       : null;
     const baselineRevalidation = pendingAdmission?.source === 'baseline';
+    if (nestedNormalizationRequired) {
+      if (dryRun) {
+        setDecision('recommend', 'nested-selection-would-normalize', {
+          from: previousSelection,
+          to: currentLeaf,
+        });
+        await this.log('info', 'nested-selection-normalization-dry-run', {
+          from: previousSelection,
+          to: currentLeaf,
+        });
+        return { status: 'would-normalize-nested-selection', from: previousSelection, to: currentLeaf };
+      }
+      await this.beforeSwitch();
+      await this.controller.select(this.config.groups.target, currentLeaf);
+      const normalizedTarget = await this.controller.getProxy(this.config.groups.target);
+      const normalizedLeaf = await this.resolveLeaf(normalizedTarget.now);
+      if (normalizedTarget.now !== currentLeaf || normalizedLeaf !== currentLeaf) {
+        throw new Error(`嵌套代理组规范化失败：期望 ${currentLeaf}，实际 ${normalizedTarget.now}`);
+      }
+      const normalizedAt = new Date().toISOString();
+      state.currentSelection = currentLeaf;
+      state.currentLeaf = currentLeaf;
+      delete state.selectionAdmissionVersion;
+      state.externalSelectionPendingAdmission = {
+        from: acceptedSelection,
+        fromLeaf: acceptedLeaf,
+        to: currentLeaf,
+        leaf: currentLeaf,
+        detectedAt: normalizedAt,
+        source: 'external',
+      };
+      state.lastSelectionNormalization = {
+        at: normalizedAt,
+        from: previousSelection,
+        to: currentLeaf,
+        reason: 'nested-selection',
+        requiresStrictAdmission: true,
+      };
+      setDecision('repair', 'nested-selection-normalized-pending-admission', {
+        from: previousSelection,
+        to: currentLeaf,
+      });
+      await persistState();
+      await this.log('warn', 'nested-selection-normalized', {
+        from: previousSelection,
+        to: currentLeaf,
+        leaf: currentLeaf,
+        requiresStrictAdmission: true,
+      });
+      return { status: 'nested-selection-normalized-pending-admission', from: previousSelection, to: currentLeaf };
+    }
     let selectionAdmissionRejected = false;
     let current;
     if (pendingAdmission) {
@@ -628,6 +683,8 @@ export class Watchdog {
           successRate: current.successRate,
           averageMs: Number.isFinite(current.averageMs) ? Math.round(current.averageMs) : null,
           maxMs: Number.isFinite(current.maxMs) ? current.maxMs : null,
+          normalizationRequired: nestedNormalizationRequired,
+          normalizationSupported: !nestedSelection || nestedLeafSelectable,
         },
       );
       if (admitted) {

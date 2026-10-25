@@ -399,6 +399,79 @@ test('external selection is strictly admitted from real probes and ignores UI 50
   assert.equal(state.lastExternalSelection.verified, true);
 });
 
+test('外部切到嵌套自动组后严格验证叶子并恢复为固定节点', async () => {
+  const config = await makeConfig('http://127.0.0.1:1');
+  let selected = '自动选择';
+  const switches = [];
+  const controller = {
+    async getProxy(name) {
+      if (name === 'XFLTD') {
+        return { type: 'Selector', now: selected, all: ['自动选择', 'leaf-good'] };
+      }
+      if (name === '自动选择') return { type: 'URLTest', now: 'leaf-good' };
+      return { type: 'VLESS', name };
+    },
+    async getDelay() {
+      return 120;
+    },
+    async select(group, node) {
+      assert.equal(group, 'XFLTD');
+      selected = node;
+      switches.push(node);
+    },
+  };
+  const events = [];
+  const watchdog = new Watchdog({
+    controller,
+    config,
+    logger: async (level, event, details) => events.push({ level, event, details }),
+  });
+
+  const result = await watchdog.runOnce({ dryRun: false });
+
+  assert.equal(result.status, 'nested-selection-normalized-pending-admission');
+  assert.equal(selected, 'leaf-good');
+  assert.deepEqual(switches, ['leaf-good']);
+  let state = JSON.parse(await readFile(config.files.state, 'utf8'));
+  assert.equal(state.currentSelection, 'leaf-good');
+  assert.equal(state.currentLeaf, 'leaf-good');
+  assert.equal(state.externalSelectionPendingAdmission.to, 'leaf-good');
+  assert.equal(state.lastSelectionNormalization.from, '自动选择');
+  assert.equal(state.lastSelectionNormalization.to, 'leaf-good');
+  assert.equal(events.some((entry) => entry.event === 'nested-selection-normalized'), true);
+
+  const admission = await watchdog.runOnce({ dryRun: false });
+  assert.equal(admission.status, 'external-selection-admitted');
+  state = JSON.parse(await readFile(config.files.state, 'utf8'));
+  assert.equal(state.externalSelectionPendingAdmission, undefined);
+});
+
+test('Dry Run 只报告嵌套自动组纠正而不修改选择', async () => {
+  const config = await makeConfig('http://127.0.0.1:1');
+  let selected = '自动选择';
+  const controller = {
+    async getProxy(name) {
+      if (name === 'XFLTD') {
+        return { type: 'Selector', now: selected, all: ['自动选择', 'leaf-good'] };
+      }
+      if (name === '自动选择') return { type: 'URLTest', now: 'leaf-good' };
+      return { type: 'VLESS', name };
+    },
+    async getDelay() {
+      return 120;
+    },
+    async select() {
+      selected = 'unexpected';
+    },
+  };
+  const watchdog = new Watchdog({ controller, config, logger: async () => {} });
+
+  const result = await watchdog.runOnce({ dryRun: true });
+
+  assert.equal(result.status, 'would-normalize-nested-selection');
+  assert.equal(selected, '自动选择');
+});
+
 test('legacy selection state is revalidated once and replaced when candidate admission fails', async (t) => {
   const mock = await startMockController({
     initialSelected: 'legacy-node',

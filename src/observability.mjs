@@ -404,6 +404,7 @@ export async function buildStatusSnapshot({ stateFile, logFile, controller, targ
     lastCandidateScan: state.lastCandidateScan ?? null,
     provisionalFallback: state.provisionalFallback ?? null,
     lastSwitch: state.lastSwitch ? { at: state.lastSwitchAt ?? null, ...state.lastSwitch } : null,
+    lastSelectionNormalization: state.lastSelectionNormalization ?? null,
     quarantinedNodes,
     ...policyState,
     files: { state: stateFile, log: logFile },
@@ -421,6 +422,9 @@ export function formatStatus(snapshot) {
     : '无';
   const switchText = snapshot.lastSwitch
     ? `${display(snapshot.lastSwitch.from)} -> ${display(snapshot.lastSwitch.to)} / ${display(snapshot.lastSwitch.reason)} / ${display(snapshot.lastSwitch.at)}`
+    : '-';
+  const normalizationText = snapshot.lastSelectionNormalization
+    ? `${display(snapshot.lastSelectionNormalization.from)} -> ${display(snapshot.lastSelectionNormalization.to)} / ${display(snapshot.lastSelectionNormalization.at)}`
     : '-';
   const backoff = snapshot.scanBackoff?.until
     ? `至 ${snapshot.scanBackoff.until}（原因 ${display(snapshot.scanBackoff.reason)}）`
@@ -469,6 +473,7 @@ export function formatStatus(snapshot) {
     `最近候选扫描   : ${scanText}`,
     `临时候选状态   : ${provisionalText}`,
     `最近切换       : ${switchText}`,
+    `最近代理组纠正 : ${normalizationText}`,
     `隔离节点       : ${quarantine}`,
     `扫描退避       : ${backoff}`,
     `切换预算       : ${budget}`,
