@@ -365,6 +365,14 @@ test('status warns about provisional fallback and explains rejected candidates',
       validatedCount: 6,
       stable: ['good-node'],
       rejected: [{ node: 'fast-but-flaky', reasons: ['success-rate'] }],
+      probeStats: {
+        discovery: {
+          method: 'group-delay', controllerRequests: 2, logicalAttempts: 100,
+        },
+        validation: {
+          method: 'per-node', controllerRequests: 24, logicalAttempts: 24, peakConcurrency: 8,
+        },
+      },
     },
   }));
   await writeFile(logFile, '');
@@ -375,6 +383,7 @@ test('status warns about provisional fallback and explains rejected candidates',
   assert.ok(snapshot.warnings.some((message) => message.includes('尚未通过严格准入')));
   assert.match(output, /合格 good-node/);
   assert.match(output, /fast-but-flaky\[success-rate\]/);
+  assert.match(output, /候选探测负载\s+: 初筛 group-delay：Controller 2，节点测试 100；严格复测 per-node：Controller 24\/24，峰值并发 8/);
 });
 
 test('status exposes candidate snapshot freshness and emergency switch duration', async () => {

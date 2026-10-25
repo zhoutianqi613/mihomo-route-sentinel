@@ -364,34 +364,75 @@ export class Watchdog {
     return summarizeSamples(node, samples);
   }
 
-  async probeCandidatesInParallel(nodes, rounds, urls, deadlineAt) {
+  async probeCandidatesInParallel(nodes, rounds, urls, deadlineAt, {
+    timeoutMs = this.config.probes.timeoutMs,
+  } = {}) {
     const uniqueNodes = [...new Set(nodes)];
-    const attempts = [];
-    for (const node of uniqueNodes) {
+    const logicalAttempts = uniqueNodes.length * rounds * urls.length;
+    let active = 0;
+    let peakConcurrency = 0;
+    let startedAttempts = 0;
+    let completedAttempts = 0;
+    // 同一节点的多轮/多 URL 探测必须串行，避免 Mihomo 同时对一个节点执行多个 URLTest 时互相争用；
+    // 不同节点仍由 parallelism 控制并发，从而在截止内优先完整验证排名靠前的节点。
+    const samplesByNode = await mapLimit(uniqueNodes, this.config.probes.parallelism, async (node) => {
+      const nodeSamples = [];
       for (let round = 1; round <= rounds; round += 1) {
         for (const url of urls) {
-          attempts.push((async () => {
-            const remainingMs = Math.max(1, deadlineAt - Date.now());
-            const timeoutMs = Math.max(1, Math.min(this.config.probes.timeoutMs, remainingMs));
-            try {
-              const delay = await waitUntil(
-                this.controller.getDelay(node, url, timeoutMs),
-                deadlineAt,
-                '切前候选验证超过截止时间',
-              );
-              return { node, round, url, ok: true, delay };
-            } catch (error) {
-              return { node, round, url, ok: false, error: error.status ?? error.code ?? error.message };
-            }
-          })());
+          if (Date.now() >= deadlineAt) {
+            nodeSamples.push({ node, round, url, ok: false, error: 'SCAN_DEADLINE' });
+            continue;
+          }
+          const remainingMs = Math.max(1, deadlineAt - Date.now());
+          const effectiveTimeoutMs = Math.max(1, Math.min(timeoutMs, remainingMs));
+          const abortController = new AbortController();
+          const abortTimer = setTimeout(() => abortController.abort(), remainingMs);
+          active += 1;
+          startedAttempts += 1;
+          peakConcurrency = Math.max(peakConcurrency, active);
+          try {
+            const delay = await waitUntil(
+              this.controller.getDelay(node, url, effectiveTimeoutMs, { signal: abortController.signal }),
+              deadlineAt,
+              '候选验证超过截止时间',
+            );
+            completedAttempts += 1;
+            nodeSamples.push({ node, round, url, ok: true, delay });
+          } catch (error) {
+            completedAttempts += 1;
+            const deadlineReached = Date.now() >= deadlineAt || abortController.signal.aborted;
+            nodeSamples.push({
+              node,
+              round,
+              url,
+              ok: false,
+              error: deadlineReached ? 'SCAN_DEADLINE' : (error.status ?? error.code ?? error.message),
+            });
+          } finally {
+            clearTimeout(abortTimer);
+            active -= 1;
+          }
         }
       }
-    }
-    const samples = await Promise.all(attempts);
-    return uniqueNodes.map((node) => summarizeSamples(
+      return nodeSamples;
+    });
+    const samples = samplesByNode.flat();
+    const results = uniqueNodes.map((node) => summarizeSamples(
       node,
       samples.filter((sample) => sample.node === node),
     ));
+    Object.defineProperty(results, 'probeStats', {
+      enumerable: false,
+      value: {
+        method: 'per-node',
+        logicalAttempts,
+        controllerRequests: startedAttempts,
+        completedAttempts,
+        skippedAttempts: logicalAttempts - startedAttempts,
+        peakConcurrency,
+      },
+    });
+    return results;
   }
 
   createCandidateSnapshot(search, selection, leaf) {
@@ -414,6 +455,7 @@ export class Watchdog {
       durationMs: search.durationMs,
       deadlineMs: search.deadlineMs,
       deadlineReached: search.deadlineReached,
+      probeStats: search.probeStats ?? null,
       candidates: (search.validated ?? []).map((entry) => ({
         ...compact(entry),
         profile: strictNames.has(entry.node)
@@ -448,6 +490,7 @@ export class Watchdog {
       durationMs: snapshot.durationMs,
       deadlineMs: snapshot.deadlineMs,
       deadlineReached: snapshot.deadlineReached,
+      probeStats: snapshot.probeStats ?? null,
       completedAt: snapshot.at,
       source: 'candidate-snapshot',
       ageMs,
@@ -483,6 +526,7 @@ export class Watchdog {
     rounds = this.config.probes.scanRounds,
     timeoutMs = this.config.probes.discoveryTimeoutMs,
     event = 'candidate-discovery-completed',
+    groupSize = candidates.length,
   } = {}) {
     const startedAt = Date.now();
     const phaseDeadline = Math.min(deadlineAt, startedAt + timeoutMs + 200);
@@ -490,14 +534,33 @@ export class Watchdog {
     if (typeof this.controller.getGroupDelays === 'function') {
       for (let round = 1; round <= rounds; round += 1) {
         for (const url of scanUrls) {
-          groupAttempts.push(this.controller.getGroupDelays(this.config.groups.candidates, url, timeoutMs)
-            .then((delays) => ({ round, url, delays })));
+          groupAttempts.push((async () => {
+            const remainingMs = Math.max(1, phaseDeadline - Date.now());
+            const abortController = new AbortController();
+            const abortTimer = setTimeout(() => abortController.abort(), remainingMs);
+            try {
+              const delays = await waitUntil(
+                this.controller.getGroupDelays(
+                  this.config.groups.candidates,
+                  url,
+                  timeoutMs,
+                  { signal: abortController.signal },
+                ),
+                phaseDeadline,
+                '候选组发现超过截止时间',
+              );
+              return { round, url, delays };
+            } finally {
+              clearTimeout(abortTimer);
+            }
+          })());
         }
       }
     }
     const groupResults = (await collectUntil(groupAttempts, phaseDeadline))
       .filter(({ delays }) => candidates.some((node) => delays.has(node)));
     let method = 'group-delay';
+    let probeStats;
     let samples = [];
     if (groupResults.length > 0) {
       samples = candidates.flatMap((node) => groupResults.map(({ round, url, delays }) => (
@@ -505,25 +568,25 @@ export class Watchdog {
           ? { node, round, url, ok: true, delay: delays.get(node) }
           : { node, round, url, ok: false, error: 'discovery-timeout' }
       )));
+      probeStats = {
+        method,
+        controllerRequests: groupAttempts.length,
+        completedRequests: groupResults.length,
+        logicalAttempts: groupAttempts.length * groupSize,
+        completedNodeTests: groupResults.length * groupSize,
+        peakConcurrency: groupAttempts.length,
+      };
     } else {
       method = 'parallel-fallback';
-      const attempts = [];
-      for (const node of candidates) {
-        for (let round = 1; round <= rounds; round += 1) {
-          for (const url of scanUrls) {
-            attempts.push(this.controller.getDelay(node, url, timeoutMs)
-              .then((delay) => ({ node, round, url, ok: true, delay }))
-              .catch((error) => ({
-                node,
-                round,
-                url,
-                ok: false,
-                error: error.status ?? error.code ?? error.message,
-              })));
-          }
-        }
-      }
-      samples = await collectUntil(attempts, Math.min(deadlineAt, Date.now() + timeoutMs + 200));
+      const fallback = await this.probeCandidatesInParallel(
+        candidates,
+        rounds,
+        scanUrls,
+        Math.min(deadlineAt, Date.now() + timeoutMs + 200),
+        { timeoutMs },
+      );
+      samples = fallback.flatMap((result) => result.samples);
+      probeStats = { ...fallback.probeStats, method };
     }
     const byNode = new Map(candidates.map((node) => [node, []]));
     for (const sample of samples) byNode.get(sample.node)?.push(sample);
@@ -533,6 +596,11 @@ export class Watchdog {
       durationMs: Date.now() - startedAt,
       candidateCount: candidates.length,
       responsiveCount: results.filter((result) => result.successes > 0).length,
+      probeStats,
+    });
+    Object.defineProperty(results, 'probeStats', {
+      enumerable: false,
+      value: probeStats,
     });
     return results;
   }
@@ -561,7 +629,9 @@ export class Watchdog {
     const candidates = this.filterCandidates(source.all, currentLeaf, excludedNodes);
     await this.log('info', 'candidate-scan-started', { count: candidates.length });
     const scanUrls = this.config.probes.urls.slice(0, this.config.probes.scanUrlCount);
-    const quickResults = await this.discoverCandidates(candidates, scanUrls, deadlineAt);
+    const quickResults = await this.discoverCandidates(candidates, scanUrls, deadlineAt, {
+      groupSize: source.all.length,
+    });
     const ranked = quickResults
       .filter((result) => result.successes > 0)
       .sort((a, b) => a.score - b.score)
@@ -586,9 +656,17 @@ export class Watchdog {
             rounds: this.config.probes.validationRounds,
             timeoutMs: validationTimeoutMs,
             event: 'candidate-validation-probes-completed',
+            groupSize: source.all.length,
           },
         )
       : [];
+    const validationProbeStats = validated.probeStats ?? {
+      method: 'group-delay',
+      logicalAttempts: 0,
+      controllerRequests: 0,
+      completedRequests: 0,
+      peakConcurrency: 0,
+    };
     const stable = [];
     const provisional = [];
     const strictResults = validated.filter((result) => isStableAcrossRounds(result, this.candidateThresholds()));
@@ -615,6 +693,10 @@ export class Watchdog {
         maxMs: result.maxMs,
       })),
       rejected,
+      probeStats: {
+        discovery: quickResults.probeStats ?? null,
+        validation: validationProbeStats,
+      },
       durationMs: Date.now() - scanStartedAt,
       deadlineMs: this.config.probes.scanDeadlineMs,
       deadlineReached: Date.now() >= deadlineAt,
@@ -625,6 +707,10 @@ export class Watchdog {
       sampled: quickResults,
       validated,
       rejected,
+      probeStats: {
+        discovery: quickResults.probeStats ?? null,
+        validation: validationProbeStats,
+      },
       durationMs: Date.now() - scanStartedAt,
       deadlineMs: this.config.probes.scanDeadlineMs,
       deadlineReached: Date.now() >= deadlineAt,
@@ -1251,6 +1337,7 @@ export class Watchdog {
       durationMs: search.durationMs,
       deadlineMs: search.deadlineMs,
       deadlineReached: search.deadlineReached,
+      probeStats: search.probeStats ?? null,
     };
     // 扫描与串行切前门禁是两个阶段；立即落盘可避免状态把后续门禁误报为扫描超时。
     await persistState();

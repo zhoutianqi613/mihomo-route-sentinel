@@ -1203,6 +1203,40 @@ test('unhealthy recovery validates the ranked pool concurrently within one deadl
   assert.equal(validation.details.stable.length, 6);
 });
 
+test('strict validation remains independent and exposes full group probe load', async () => {
+  const config = await makeConfig('http://127.0.0.1:1');
+  config.probes.urls = ['https://service-a.example/', 'https://service-b.example/'];
+  config.probes.scanUrlCount = 2;
+  config.probes.validationRounds = 2;
+  config.probes.topCandidates = 3;
+  config.probes.maxValidationCandidates = 4;
+  config.probes.parallelism = 2;
+  const members = ['current-node', 'candidate-a', 'candidate-b', 'candidate-c', 'candidate-d', 'candidate-e'];
+  const groupCalls = [];
+  const controller = {
+    async getProxy(name) {
+      assert.equal(name, 'candidates');
+      return { type: 'URLTest', all: members };
+    },
+    async getGroupDelays(group, url) {
+      groupCalls.push({ group, url });
+      return new Map(members.map((node, index) => [node, 100 + index]));
+    },
+    async getDelay() { throw new Error('严格快照复测不应调用 per-node delay'); },
+  };
+  const watchdog = new Watchdog({ controller, config, logger: async () => {} });
+
+  const result = await watchdog.findCandidates('current-node');
+
+  assert.equal(groupCalls.length, 6);
+  assert.equal(result.validated.length, 4);
+  assert.equal(result.validated.every((entry) => entry.attempts === 4 && entry.successRate === 1), true);
+  assert.equal(result.probeStats.discovery.logicalAttempts, members.length * 2);
+  assert.equal(result.probeStats.validation.method, 'group-delay');
+  assert.equal(result.probeStats.validation.controllerRequests, 4);
+  assert.equal(result.probeStats.validation.logicalAttempts, members.length * 4);
+});
+
 test('post-switch verification probes the resolved leaf of a nested selector', async () => {
   let selected = 'bad-node';
   const probed = [];
@@ -1606,13 +1640,19 @@ test('后台扫描完成后在串行切前门禁期间不再显示运行中', as
   await deciding;
 });
 
-test('切前候选验证并行执行，不按候选数量串行累加', async () => {
+test('切前候选验证受 parallelism 限制并在截止内完成', async () => {
   const config = await makeConfig('http://127.0.0.1:1');
   config.probes.urls = ['https://service-a.example/', 'https://service-b.example/'];
   config.probes.validationRounds = 2;
+  config.probes.parallelism = 2;
+  let active = 0;
+  let peakConcurrency = 0;
   const controller = {
     async getDelay() {
-      await new Promise((resolve) => setTimeout(resolve, 120));
+      active += 1;
+      peakConcurrency = Math.max(peakConcurrency, active);
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      active -= 1;
       return 100;
     },
   };
@@ -1623,13 +1663,16 @@ test('切前候选验证并行执行，不按候选数量串行累加', async ()
     ['candidate-a', 'candidate-b', 'candidate-c', 'candidate-d'],
     config.probes.validationRounds,
     config.probes.urls,
-    Date.now() + 1000,
+    Date.now() + 1500,
   );
   const elapsedMs = performance.now() - startedAt;
 
-  assert.ok(elapsedMs < 500, `并行门禁耗时 ${Math.round(elapsedMs)} ms`);
+  assert.ok(elapsedMs >= 250 && elapsedMs < 600, `受控并发门禁耗时 ${Math.round(elapsedMs)} ms`);
   assert.equal(results.length, 4);
   assert.equal(results.every((entry) => entry.successRate === 1), true);
+  assert.equal(peakConcurrency, 2);
+  assert.equal(results.probeStats.peakConcurrency, 2);
+  assert.equal(results.probeStats.controllerRequests, 16);
 });
 
 test('候选快照使用扫描完成时间而不是延迟消费时间', async () => {

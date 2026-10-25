@@ -26,10 +26,13 @@ test('v1 配置可内存迁移到当前版本并补齐新默认值', async () =>
   await withConfig({ groups: minimal.groups }, async (configPath) => {
     const config = await loadConfig(configPath);
     assert.equal(config.configVersion, CURRENT_CONFIG_VERSION);
-    assert.equal(config.probes.parallelism, 4);
+    assert.equal(config.probes.parallelism, 8);
     assert.deepEqual(config.probes.controlUrls, ['https://cp.cloudflare.com/generate_204']);
     assert.equal(config.policy.switchBudgetCount, 3);
     assert.equal(config.policy.immediateMaxSingleMs, 2500);
+    assert.equal(config.policy.intervalSeconds, 30);
+    assert.equal(config.policy.candidateSnapshotRefreshSeconds, 60);
+    assert.equal(config.policy.candidateSnapshotMaxAgeSeconds, 120);
     assert.equal(config.logging.maxBytes, 5242880);
     assert.equal(config.telemetry.enabled, true);
     assert.equal(config.guardrails.expectedRuntimeMode, 'rule');

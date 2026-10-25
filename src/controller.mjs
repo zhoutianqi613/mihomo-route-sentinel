@@ -41,7 +41,7 @@ export class MihomoController {
     return pipePath ? { kind: 'pipe', pipePath } : null;
   }
 
-  async requestOnce(method, requestPath, body) {
+  async requestOnce(method, requestPath, body, { signal } = {}) {
     const payload = body === undefined ? null : Buffer.from(JSON.stringify(body));
     const headers = { Accept: 'application/json' };
     if (payload) {
@@ -51,7 +51,7 @@ export class MihomoController {
     if (this.secret) headers.Authorization = `Bearer ${this.secret}`;
 
     const options = this.transport.kind === 'pipe'
-      ? { socketPath: this.transport.pipePath, path: requestPath, method, headers }
+      ? { socketPath: this.transport.pipePath, path: requestPath, method, headers, signal }
       : {
           protocol: this.transport.url.protocol,
           hostname: this.transport.url.hostname,
@@ -59,6 +59,7 @@ export class MihomoController {
           path: `${this.transport.url.pathname.replace(/\/$/, '')}${requestPath}`,
           method,
           headers,
+          signal,
         };
     const client = this.transport.kind === 'http' && this.transport.url.protocol === 'https:' ? https : http;
 
@@ -93,13 +94,13 @@ export class MihomoController {
     });
   }
 
-  async request(method, requestPath, body) {
+  async request(method, requestPath, body, options) {
     if (this.config.transport === 'auto' && this.transport.kind === 'http') {
       const rediscovered = this.rediscoverPipeTransport();
       if (rediscovered) this.transport = rediscovered;
     }
     try {
-      return await this.requestOnce(method, requestPath, body);
+      return await this.requestOnce(method, requestPath, body, options);
     } catch (error) {
       const recoverable = new Set(['ENOENT', 'ECONNREFUSED', 'ECONNRESET', 'EPIPE', 'ETIMEDOUT']);
       if (!recoverable.has(error?.code)) throw error;
@@ -108,7 +109,7 @@ export class MihomoController {
       // Pipe 重启窗口内可能暂时消失；auto 的 HTTP fallback 也必须持续尝试回到 Pipe。
       if (!rediscovered) throw error;
       this.transport = rediscovered;
-      return this.requestOnce(method, requestPath, body);
+      return this.requestOnce(method, requestPath, body, options);
     }
   }
 
@@ -124,16 +125,16 @@ export class MihomoController {
     return (await this.request('GET', `/proxies/${encodeURIComponent(name)}`)).data;
   }
 
-  async getDelay(name, url, timeoutMs) {
+  async getDelay(name, url, timeoutMs, options) {
     const query = new URLSearchParams({ url, timeout: String(timeoutMs) });
-    const result = await this.request('GET', `/proxies/${encodeURIComponent(name)}/delay?${query}`);
+    const result = await this.request('GET', `/proxies/${encodeURIComponent(name)}/delay?${query}`, undefined, options);
     if (!Number.isFinite(result.data?.delay)) throw new Error('延迟响应缺少 delay');
     return result.data.delay;
   }
 
-  async getGroupDelays(name, url, timeoutMs) {
+  async getGroupDelays(name, url, timeoutMs, options) {
     const query = new URLSearchParams({ url, timeout: String(timeoutMs) });
-    const result = await this.request('GET', `/group/${encodeURIComponent(name)}/delay?${query}`);
+    const result = await this.request('GET', `/group/${encodeURIComponent(name)}/delay?${query}`, undefined, options);
     if (!result.data || typeof result.data !== 'object' || Array.isArray(result.data)) {
       throw new Error('代理组延迟响应格式无效');
     }

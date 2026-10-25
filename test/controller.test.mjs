@@ -30,6 +30,22 @@ test('controller parses Mihomo group delay results', async () => {
   assert.deepEqual([...delays], [['node-a', 123], ['node-b', 456]]);
 });
 
+test('delay requests forward cancellation signals to the controller transport', async () => {
+  const controller = Object.create(MihomoController.prototype);
+  const abortController = new AbortController();
+  let receivedOptions;
+  controller.request = async (method, requestPath, body, options) => {
+    receivedOptions = options;
+    return { status: 200, data: { delay: 123 } };
+  };
+
+  await controller.getDelay('node-a', 'https://example.com/', 1200, {
+    signal: abortController.signal,
+  });
+
+  assert.equal(receivedOptions.signal, abortController.signal);
+});
+
 test('temporary pipe disappearance does not permanently fall back to HTTP', async () => {
   const controller = Object.create(MihomoController.prototype);
   controller.config = { transport: 'auto', pipePath: '', pipePattern: 'verge-mihomo' };

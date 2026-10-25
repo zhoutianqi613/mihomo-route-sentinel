@@ -312,6 +312,7 @@ export async function buildStatusSnapshot({ stateFile, logFile, controller, targ
           ? state.candidateSnapshot.candidates.length : 0,
         selection: state.candidateSnapshot.selection ?? null,
         leaf: state.candidateSnapshot.leaf ?? null,
+        probeStats: state.candidateSnapshot.probeStats ?? null,
       }
     : null;
   const quarantinedNodes = activeQuarantines(state.quarantinedNodes);
@@ -467,6 +468,11 @@ export function formatStatus(snapshot) {
   const scanText = snapshot.lastCandidateScan
     ? `${display(snapshot.lastCandidateScan.at)}，原因 ${display(snapshot.lastCandidateScan.reason)}，耗时 ${display(snapshot.lastCandidateScan.durationMs, ' ms')}/${display(snapshot.lastCandidateScan.deadlineMs, ' ms')}，截止 ${snapshot.lastCandidateScan.deadlineReached ? '是' : '否'}，抽样 ${display(snapshot.lastCandidateScan.sampledCount)}，严格复测 ${display(snapshot.lastCandidateScan.validatedCount)}，严格合格 ${(snapshot.lastCandidateScan.stable ?? []).join('、') || '无'}，健康线临时候选 ${(snapshot.lastCandidateScan.provisional ?? []).join('、') || '无'}；淘汰 ${(snapshot.lastCandidateScan.rejected ?? []).slice(0, 3).map((entry) => `${entry.node}[${(entry.reasons ?? []).join('/') || '未知'}]`).join('、') || '无'}`
     : '-';
+  const discoveryStats = snapshot.lastCandidateScan?.probeStats?.discovery;
+  const validationStats = snapshot.lastCandidateScan?.probeStats?.validation;
+  const probeLoadText = discoveryStats || validationStats
+    ? `初筛 ${display(discoveryStats?.method)}：Controller ${display(discoveryStats?.controllerRequests, '')}，节点测试 ${display(discoveryStats?.logicalAttempts, '')}；严格复测 ${display(validationStats?.method)}：Controller ${display(validationStats?.controllerRequests, '')}/${display(validationStats?.logicalAttempts, '')}，峰值并发 ${display(validationStats?.peakConcurrency, '')}`
+    : '-';
   const activeScanText = snapshot.candidateScan
     ? `${display(snapshot.candidateScan.status)}，开始 ${display(snapshot.candidateScan.startedAt)}，原因 ${display(snapshot.candidateScan.reason)}`
     : '无';
@@ -490,6 +496,7 @@ export function formatStatus(snapshot) {
     `后台候选扫描   : ${activeScanText}`,
     `候选快照       : ${candidateSnapshotText}`,
     `最近候选扫描   : ${scanText}`,
+    `候选探测负载   : ${probeLoadText}`,
     `临时候选状态   : ${provisionalText}`,
     `最近切换       : ${switchText}`,
     `最近代理组纠正 : ${normalizationText}`,
