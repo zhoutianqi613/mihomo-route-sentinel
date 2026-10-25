@@ -1566,7 +1566,7 @@ test('后台切前门禁拒绝不占用实际切换次数', async (t) => {
   await started.backgroundWake;
   const decided = await watchdog.runOnce({ dryRun: false, backgroundScan: true });
 
-  assert.equal(decided.status, 'switched');
+  assert.equal(decided.status, 'emergency-fallback');
   assert.deepEqual(mock.switches, ['good-node']);
   assert.equal(events.filter((entry) => entry.event === 'candidate-pre-switch-rejected').length, 2);
 });
@@ -1604,4 +1604,306 @@ test('后台扫描完成后在串行切前门禁期间不再显示运行中', as
 
   releaseAdmission();
   await deciding;
+});
+
+test('切前候选验证并行执行，不按候选数量串行累加', async () => {
+  const config = await makeConfig('http://127.0.0.1:1');
+  config.probes.urls = ['https://service-a.example/', 'https://service-b.example/'];
+  config.probes.validationRounds = 2;
+  const controller = {
+    async getDelay() {
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      return 100;
+    },
+  };
+  const watchdog = new Watchdog({ controller, config, logger: async () => {} });
+
+  const startedAt = performance.now();
+  const results = await watchdog.probeCandidatesInParallel(
+    ['candidate-a', 'candidate-b', 'candidate-c', 'candidate-d'],
+    config.probes.validationRounds,
+    config.probes.urls,
+    Date.now() + 1000,
+  );
+  const elapsedMs = performance.now() - startedAt;
+
+  assert.ok(elapsedMs < 500, `并行门禁耗时 ${Math.round(elapsedMs)} ms`);
+  assert.equal(results.length, 4);
+  assert.equal(results.every((entry) => entry.successRate === 1), true);
+});
+
+test('候选快照使用扫描完成时间而不是延迟消费时间', async () => {
+  const config = await makeConfig('http://127.0.0.1:1');
+  const watchdog = new Watchdog({ controller: {}, config, logger: async () => {} });
+  const completedAt = '2026-10-25T06:00:00.000Z';
+  const snapshot = watchdog.createCandidateSnapshot({
+    stable: [],
+    provisional: [],
+    validated: [],
+    sampled: [],
+    durationMs: 2500,
+    deadlineMs: 3000,
+    deadlineReached: false,
+    completedAt,
+  }, 'selection', 'leaf');
+
+  assert.equal(snapshot.at, completedAt);
+});
+
+test('硬故障没有 100% 候选时在一秒内切到成功率最高节点', async (t) => {
+  const serviceA = 'https://service-a.example/';
+  const serviceB = 'https://service-b.example/';
+  const mock = await startMockController({
+    candidates: ['bad-node', 'partial-best', 'partial-worse'],
+    delayResolver: ({ name, targetUrl }) => {
+      if (name === 'bad-node') return null;
+      if (name === 'partial-best') return targetUrl === serviceA ? 180 : null;
+      if (name === 'partial-worse') return targetUrl === serviceA ? 480 : null;
+      return null;
+    },
+  });
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  config.probes.urls = [serviceA, serviceB];
+  config.probes.scanUrlCount = 2;
+  config.probes.scanDeadlineMs = 800;
+  config.probes.discoveryTimeoutMs = 200;
+  config.policy.emergencySwitchDeadlineMs = 1000;
+  const events = [];
+  const watchdog = new Watchdog({
+    controller: new MihomoController(config.controller, {}),
+    config,
+    logger: async (level, event, details) => events.push({ level, event, details }),
+  });
+
+  const started = await watchdog.runOnce({ dryRun: false, backgroundScan: true });
+  await started.backgroundWake;
+  const decisionStartedAt = performance.now();
+  const decided = await watchdog.runOnce({ dryRun: false, backgroundScan: true });
+  const decisionMs = performance.now() - decisionStartedAt;
+
+  assert.equal(decided.status, 'emergency-fallback');
+  assert.equal(mock.getSelected(), 'partial-best');
+  assert.ok(decisionMs < 1000, `紧急选择与切换耗时 ${Math.round(decisionMs)} ms`);
+  const switched = events.find((entry) => entry.event === 'emergency-fallback-switched');
+  assert.equal(switched.details.successRate, 0.5);
+  assert.ok(switched.details.decisionDurationMs < 1000);
+  const state = JSON.parse(await readFile(config.files.state, 'utf8'));
+  assert.equal(state.provisionalFallback.profile, 'emergency-best-effort');
+  assert.equal(state.lastSwitch.verified, false);
+});
+
+test('紧急降级在所有候选成功率为零时不制造无收益切换', async (t) => {
+  const mock = await startMockController({
+    candidates: ['bad-node', 'failed-a', 'failed-b'],
+    delayResolver: () => null,
+  });
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  config.probes.scanDeadlineMs = 600;
+  config.probes.discoveryTimeoutMs = 200;
+  config.policy.emergencySwitchDeadlineMs = 1000;
+  const watchdog = new Watchdog({
+    controller: new MihomoController(config.controller, {}),
+    config,
+    logger: async () => {},
+  });
+
+  const started = await watchdog.runOnce({ dryRun: false, backgroundScan: true });
+  await started.backgroundWake;
+  const decided = await watchdog.runOnce({ dryRun: false, backgroundScan: true });
+
+  assert.equal(decided.status, 'no-candidate');
+  assert.deepEqual(mock.switches, []);
+});
+
+test('健康期预热候选快照，故障时复用快照而不重新全局扫描', async (t) => {
+  let currentFailed = false;
+  const mock = await startMockController({
+    initialSelected: 'good-node',
+    candidates: ['good-node', 'cached-candidate'],
+    delayResolver: ({ name }) => {
+      if (name === 'good-node') return currentFailed ? null : 150;
+      if (name === 'cached-candidate') return 180;
+      return null;
+    },
+  });
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  config.policy.candidateSnapshotRefreshSeconds = 30;
+  config.policy.candidateSnapshotMaxAgeSeconds = 60;
+  config.policy.emergencySwitchDeadlineMs = 1000;
+  const events = [];
+  const watchdog = new Watchdog({
+    controller: new MihomoController(config.controller, {}),
+    config,
+    logger: async (level, event, details) => events.push({ level, event, details }),
+  });
+
+  const warmup = await watchdog.runOnce({ dryRun: false, backgroundScan: true });
+  assert.ok(warmup.backgroundWake);
+  await warmup.backgroundWake;
+  await watchdog.runOnce({ dryRun: false, backgroundScan: true });
+  const warmedState = JSON.parse(await readFile(config.files.state, 'utf8'));
+  assert.equal(warmedState.candidateSnapshot.candidates[0].node, 'cached-candidate');
+
+  currentFailed = true;
+  const failureStartedAt = performance.now();
+  const recovered = await watchdog.runOnce({ dryRun: false, backgroundScan: true });
+  const recoveryMs = performance.now() - failureStartedAt;
+
+  assert.equal(recovered.status, 'emergency-fallback');
+  assert.equal(mock.getSelected(), 'cached-candidate');
+  assert.ok(recoveryMs < 1000, `缓存故障转移耗时 ${Math.round(recoveryMs)} ms`);
+  assert.equal(events.filter((entry) => entry.event === 'candidate-scan-started').length, 1);
+  assert.equal(events.some((entry) => entry.event === 'candidate-snapshot-used'), true);
+});
+
+test('切换中断重启后废弃与 Controller 不匹配的旧基线待准入状态', async (t) => {
+  const mock = await startMockController({ initialSelected: 'good-node' });
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  await writeFile(config.files.state, JSON.stringify({
+    currentSelection: 'good-node',
+    currentLeaf: 'good-node',
+    externalSelectionPendingAdmission: {
+      to: 'old-provisional',
+      leaf: 'old-provisional',
+      source: 'baseline',
+    },
+    provisionalFallback: {
+      selection: 'old-provisional',
+      leaf: 'old-provisional',
+      profile: 'unverified',
+    },
+  }));
+  const events = [];
+  const watchdog = new Watchdog({
+    controller: new MihomoController(config.controller, {}),
+    config,
+    logger: async (level, event) => events.push(event),
+  });
+
+  const result = await watchdog.runOnce({ dryRun: false });
+  const state = JSON.parse(await readFile(config.files.state, 'utf8'));
+
+  assert.equal(result.status, 'baseline-revalidated');
+  assert.equal(state.externalSelectionPendingAdmission, undefined);
+  assert.equal(state.provisionalFallback, undefined);
+  assert.equal(state.selectionAdmissionVersion, 1);
+  assert.equal(events.includes('stale-baseline-admission-superseded'), true);
+});
+
+test('基线待准入不能掩盖硬故障或阻止紧急快照切换', async (t) => {
+  const serviceA = 'https://service-a.example/';
+  const serviceB = 'https://service-b.example/';
+  const mock = await startMockController({
+    initialSelected: 'bad-node',
+    candidates: ['bad-node', 'partial-best'],
+    delayResolver: ({ name, targetUrl }) => {
+      if (name === 'bad-node') return null;
+      if (name === 'partial-best') return targetUrl === serviceA ? 180 : null;
+      return null;
+    },
+  });
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  config.probes.urls = [serviceA, serviceB];
+  config.policy.emergencySwitchDeadlineMs = 1000;
+  const now = new Date().toISOString();
+  await writeFile(config.files.state, JSON.stringify({
+    currentSelection: 'bad-node',
+    currentLeaf: 'bad-node',
+    externalSelectionPendingAdmission: {
+      from: 'bad-node',
+      fromLeaf: 'bad-node',
+      to: 'bad-node',
+      leaf: 'bad-node',
+      detectedAt: now,
+      source: 'baseline',
+    },
+    candidateSnapshot: {
+      at: now,
+      selection: 'bad-node',
+      leaf: 'bad-node',
+      durationMs: 100,
+      deadlineMs: 3000,
+      deadlineReached: false,
+      candidates: [{
+        node: 'partial-best',
+        attempts: 4,
+        successes: 2,
+        successRate: 0.5,
+        averageMs: 180,
+        maxMs: 180,
+        jitterMs: 0,
+        score: 500225,
+        profile: 'rejected',
+      }],
+      sampled: [],
+    },
+    candidateScanBackoffUntil: new Date(Date.now() + 60_000).toISOString(),
+    lastCandidateScanOutcome: 'pre-switch-validation-failed',
+  }));
+  const events = [];
+  const watchdog = new Watchdog({
+    controller: new MihomoController(config.controller, {}),
+    config,
+    logger: async (level, event, details) => events.push({ level, event, details }),
+  });
+
+  const result = await watchdog.runOnce({ dryRun: false, backgroundScan: true });
+
+  assert.equal(result.status, 'emergency-fallback');
+  assert.equal(mock.getSelected(), 'partial-best');
+  assert.equal(events.some((entry) => entry.event === 'candidate-scan-backoff-active'), false);
+  assert.equal(events.some((entry) => entry.event === 'candidate-snapshot-used'), true);
+});
+
+test('紧急实时复核全部超时时不盲切新鲜快照节点', async (t) => {
+  let snapshotWarm = true;
+  const mock = await startMockController({
+    initialSelected: 'bad-node',
+    candidates: ['bad-node', 'cached-best'],
+    delayResolver: ({ name }) => {
+      if (name === 'bad-node') return null;
+      if (name === 'cached-best') return snapshotWarm ? 180 : null;
+      return null;
+    },
+  });
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  const now = new Date().toISOString();
+  await writeFile(config.files.state, JSON.stringify({
+    currentSelection: 'bad-node',
+    currentLeaf: 'bad-node',
+    selectionAdmissionVersion: 1,
+    candidateSnapshot: {
+      at: now,
+      selection: 'bad-node',
+      leaf: 'bad-node',
+      durationMs: 100,
+      deadlineMs: 3000,
+      deadlineReached: false,
+      candidates: [{
+        node: 'cached-best', attempts: 2, successes: 2, successRate: 1,
+        averageMs: 180, maxMs: 180, jitterMs: 0, score: 225, profile: 'strict',
+      }],
+      sampled: [],
+    },
+  }));
+  snapshotWarm = false;
+  const events = [];
+  const watchdog = new Watchdog({
+    controller: new MihomoController(config.controller, {}),
+    config,
+    logger: async (level, event, details) => events.push({ level, event, details }),
+  });
+
+  const result = await watchdog.runOnce({ dryRun: false, backgroundScan: true });
+
+  assert.equal(result.status, 'no-pre-switch-candidate');
+  assert.equal(mock.getSelected(), 'bad-node');
+  assert.equal(events.some((entry) => entry.event === 'emergency-fallback-unavailable'), true);
+  assert.equal(events.some((entry) => entry.event === 'emergency-fallback-switched'), false);
 });

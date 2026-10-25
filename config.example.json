@@ -1,5 +1,5 @@
 {
-  "configVersion": 6,
+  "configVersion": 7,
   "controller": {
     "transport": "auto",
     "url": "http://127.0.0.1:9090",
@@ -23,6 +23,7 @@
     "timeoutMs": 5000,
     "discoveryTimeoutMs": 1200,
     "scanDeadlineMs": 3000,
+    "preSwitchValidationDeadlineMs": 3000,
     "currentRounds": 2,
     "currentMinSuccessRate": 1,
     "currentMaxAverageMs": 800,
@@ -61,7 +62,10 @@
     "candidateScanBackoffSeconds": 120,
     "switchBudgetCount": 3,
     "switchBudgetWindowSeconds": 600,
-    "upstreamFailureMinCandidates": 3
+    "upstreamFailureMinCandidates": 3,
+    "candidateSnapshotRefreshSeconds": 30,
+    "candidateSnapshotMaxAgeSeconds": 60,
+    "emergencySwitchDeadlineMs": 1000
   },
   "logging": {
     "maxBytes": 5242880,

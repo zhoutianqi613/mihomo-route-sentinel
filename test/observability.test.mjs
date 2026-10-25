@@ -376,3 +376,40 @@ test('status warns about provisional fallback and explains rejected candidates',
   assert.match(output, /合格 good-node/);
   assert.match(output, /fast-but-flaky\[success-rate\]/);
 });
+
+test('status exposes candidate snapshot freshness and emergency switch duration', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'route-sentinel-snapshot-'));
+  const stateFile = path.join(root, 'state.json');
+  const logFile = path.join(root, 'watchdog.ndjson');
+  const now = new Date().toISOString();
+  await writeFile(stateFile, JSON.stringify({
+    candidateSnapshot: {
+      at: now,
+      selection: 'current-node',
+      leaf: 'current-node',
+      candidates: [{ node: 'fallback-node', successRate: 0.75 }],
+    },
+    lastSwitchAt: now,
+    lastSwitch: {
+      from: 'current-node',
+      to: 'fallback-node',
+      reason: 'emergency-best-effort',
+      verified: false,
+      decisionDurationMs: 420,
+    },
+  }));
+  await writeFile(logFile, '');
+
+  const snapshot = await buildStatusSnapshot({
+    stateFile,
+    logFile,
+    policy: { candidateSnapshotMaxAgeSeconds: 60 },
+  });
+  const output = formatStatus(snapshot);
+
+  assert.equal(snapshot.candidateSnapshot.fresh, true);
+  assert.equal(snapshot.candidateSnapshot.candidateCount, 1);
+  assert.equal(snapshot.lastSwitch.decisionDurationMs, 420);
+  assert.match(output, /候选快照\s+: 新鲜/);
+  assert.match(output, /emergency-best-effort/);
+});

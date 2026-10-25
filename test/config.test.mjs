@@ -102,11 +102,14 @@ for (const [label, override, expected] of [
   ['扫描 URL 数不得超过 URL 数组', { probes: { scanUrlCount: 3 } }, /scanUrlCount.*urls/],
   ['发现超时必须小于扫描截止', { probes: { discoveryTimeoutMs: 3000 } }, /discoveryTimeoutMs.*scanDeadlineMs/],
   ['扫描截止不得超过三秒', { probes: { scanDeadlineMs: 3001 } }, /scanDeadlineMs.*3000/],
+  ['切前并行验证截止不得超过三秒', { probes: { preSwitchValidationDeadlineMs: 3001 } }, /preSwitchValidationDeadlineMs.*3000/],
   ['候选节点门槛不得更宽', { probes: { candidateMaxAverageMs: 900 } }, /候选节点延迟准入线/],
   ['候选短名单必须覆盖尝试数', { probes: { topCandidates: 2 } }, /topCandidates.*maxSwitchAttempts/],
   ['候选验证上限不得小于单批数量', { probes: { maxValidationCandidates: 5 } }, /maxValidationCandidates.*topCandidates/],
   ['滚动退化次数不得超过窗口', { policy: { degradationWindowCycles: 2, degradationWindowFailures: 3 } }, /degradationWindowFailures.*degradationWindowCycles/],
   ['立即响应尖峰必须高于当前单次健康线', { policy: { immediateMaxSingleMs: 1500 } }, /immediateMaxSingleMs.*currentMaxSingleMs/],
+  ['候选快照最大年龄不得小于刷新周期', { policy: { candidateSnapshotRefreshSeconds: 60, candidateSnapshotMaxAgeSeconds: 30 } }, /candidateSnapshotMaxAgeSeconds.*candidateSnapshotRefreshSeconds/],
+  ['紧急切换截止不得超过一秒', { policy: { emergencySwitchDeadlineMs: 1001 } }, /emergencySwitchDeadlineMs.*1000/],
 ]) {
   test(label, async () => {
     await withConfig({ ...minimal, ...override }, async (configPath) => {

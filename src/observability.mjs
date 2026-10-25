@@ -300,6 +300,20 @@ export async function buildStatusSnapshot({ stateFile, logFile, controller, targ
   const warnings = [...stateWarnings, ...logWarnings];
   if (live?.error) warnings.push(live.error);
   const policyState = normalizePolicyState(state, policy);
+  const candidateSnapshotAgeMs = Date.now() - Date.parse(state.candidateSnapshot?.at ?? '');
+  const candidateSnapshot = state.candidateSnapshot
+    ? {
+        at: state.candidateSnapshot.at ?? null,
+        ageMs: Number.isFinite(candidateSnapshotAgeMs) ? Math.max(0, candidateSnapshotAgeMs) : null,
+        maxAgeMs: (policy?.candidateSnapshotMaxAgeSeconds ?? 0) * 1000,
+        fresh: Number.isFinite(candidateSnapshotAgeMs)
+          && candidateSnapshotAgeMs <= (policy?.candidateSnapshotMaxAgeSeconds ?? 0) * 1000,
+        candidateCount: Array.isArray(state.candidateSnapshot.candidates)
+          ? state.candidateSnapshot.candidates.length : 0,
+        selection: state.candidateSnapshot.selection ?? null,
+        leaf: state.candidateSnapshot.leaf ?? null,
+      }
+    : null;
   const quarantinedNodes = activeQuarantines(state.quarantinedNodes);
   const externalSelectionAdmission = state.externalSelectionPendingAdmission
     ? {
@@ -401,6 +415,7 @@ export async function buildStatusSnapshot({ stateFile, logFile, controller, targ
     },
     lastDecision: state.lastDecision ?? null,
     candidateScan: state.candidateScan ?? null,
+    candidateSnapshot,
     lastCandidateScan: state.lastCandidateScan ?? null,
     provisionalFallback: state.provisionalFallback ?? null,
     lastSwitch: state.lastSwitch ? { at: state.lastSwitchAt ?? null, ...state.lastSwitch } : null,
@@ -455,6 +470,9 @@ export function formatStatus(snapshot) {
   const activeScanText = snapshot.candidateScan
     ? `${display(snapshot.candidateScan.status)}，开始 ${display(snapshot.candidateScan.startedAt)}，原因 ${display(snapshot.candidateScan.reason)}`
     : '无';
+  const candidateSnapshotText = snapshot.candidateSnapshot
+    ? `${snapshot.candidateSnapshot.fresh ? '新鲜' : '过期'}，年龄 ${Math.round((snapshot.candidateSnapshot.ageMs ?? 0) / 1000)} 秒，候选 ${snapshot.candidateSnapshot.candidateCount}，生成 ${display(snapshot.candidateSnapshot.at)}`
+    : '无';
   const provisionalText = snapshot.provisionalFallback
     ? `${display(snapshot.provisionalFallback.selection)}（${display(snapshot.provisionalFallback.profile)}，等待严格准入）`
     : '无';
@@ -470,6 +488,7 @@ export function formatStatus(snapshot) {
     `滚动延迟退化   : ${snapshot.degradationWindow.failures}/${snapshot.degradationWindow.cycles}（触发 ${display(snapshot.degradationWindow.required)}/${display(snapshot.degradationWindow.size)}）`,
     `最近决策       : ${decisionText}`,
     `后台候选扫描   : ${activeScanText}`,
+    `候选快照       : ${candidateSnapshotText}`,
     `最近候选扫描   : ${scanText}`,
     `临时候选状态   : ${provisionalText}`,
     `最近切换       : ${switchText}`,

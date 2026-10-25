@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 
-export const CURRENT_CONFIG_VERSION = 6;
+export const CURRENT_CONFIG_VERSION = 7;
 
 export const defaults = Object.freeze({
   configVersion: CURRENT_CONFIG_VERSION,
@@ -23,6 +23,7 @@ export const defaults = Object.freeze({
     timeoutMs: 5000,
     discoveryTimeoutMs: 1200,
     scanDeadlineMs: 3000,
+    preSwitchValidationDeadlineMs: 3000,
     currentRounds: 2,
     currentMinSuccessRate: 1,
     currentMaxAverageMs: 800,
@@ -62,6 +63,9 @@ export const defaults = Object.freeze({
     switchBudgetCount: 3,
     switchBudgetWindowSeconds: 600,
     upstreamFailureMinCandidates: 3,
+    candidateSnapshotRefreshSeconds: 30,
+    candidateSnapshotMaxAgeSeconds: 60,
+    emergencySwitchDeadlineMs: 1000,
   },
   logging: {
     maxBytes: 5242880,
@@ -243,6 +247,7 @@ function validate(config) {
     timeoutMs: 100,
     discoveryTimeoutMs: 100,
     scanDeadlineMs: 500,
+    preSwitchValidationDeadlineMs: 500,
     currentRounds: 1,
     scanRounds: 1,
     scanUrlCount: 1,
@@ -256,6 +261,9 @@ function validate(config) {
   }
   if (config.probes.scanDeadlineMs > 3000) {
     throw new Error('probes.scanDeadlineMs 不得超过 3000 ms');
+  }
+  if (config.probes.preSwitchValidationDeadlineMs > 3000) {
+    throw new Error('probes.preSwitchValidationDeadlineMs 不得超过 3000 ms');
   }
   requireRate(config.probes.currentMinSuccessRate, 'probes.currentMinSuccessRate');
   requireRate(config.probes.candidateMinSuccessRate, 'probes.candidateMinSuccessRate');
@@ -299,6 +307,9 @@ function validate(config) {
     switchBudgetCount: 1,
     switchBudgetWindowSeconds: 1,
     upstreamFailureMinCandidates: 1,
+    candidateSnapshotRefreshSeconds: 5,
+    candidateSnapshotMaxAgeSeconds: 5,
+    emergencySwitchDeadlineMs: 300,
   })) requireInteger(config.policy[name], `policy.${name}`, minimum);
   requireRate(config.policy.minimumImprovementRatio, 'policy.minimumImprovementRatio');
   requireRate(config.policy.emergencySuccessRate, 'policy.emergencySuccessRate');
@@ -320,6 +331,12 @@ function validate(config) {
   }
   if (config.policy.degradationWindowFailures > config.policy.degradationWindowCycles) {
     throw new Error('policy.degradationWindowFailures 不能大于 policy.degradationWindowCycles');
+  }
+  if (config.policy.candidateSnapshotMaxAgeSeconds < config.policy.candidateSnapshotRefreshSeconds) {
+    throw new Error('policy.candidateSnapshotMaxAgeSeconds 不能小于 candidateSnapshotRefreshSeconds');
+  }
+  if (config.policy.emergencySwitchDeadlineMs > 1000) {
+    throw new Error('policy.emergencySwitchDeadlineMs 不得超过 1000 ms');
   }
   requireInteger(config.logging.maxBytes, 'logging.maxBytes', 1024);
   requireInteger(config.logging.retainedFiles, 'logging.retainedFiles', 1);
