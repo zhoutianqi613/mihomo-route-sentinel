@@ -2,6 +2,8 @@
 
 面向 Mihomo / Clash Verge Rev 的 AI 业务链路质量守卫与自动故障转移工具。它使用真实业务目标评估整条代理路由，在当前路径连续退化后扫描候选节点、复测、切换并验证；候选验证失败时会隔离该节点并继续尝试，不会直接回到未经复测的故障路径。
 
+本文是安装配置与日常操作的唯一正文来源。项目背景见 [项目说明](PRODUCT.md)，流程和关键取舍见 [工作原理与业务流程](docs/design.md)，已知遗留与下一轮目标见 [迭代计划与遗留问题](docs/iterations.md)。飞书内容由这些文件生成，本轮先作为 Mihomo 样例试行。
+
 ## 特性
 
 - Node.js 20+，零第三方依赖。
@@ -20,8 +22,20 @@
 
 ## 快速开始
 
+前提：已安装Node.js 20+，Mihomo正在运行，并且你有Controller管理权限。Windows可使用Clash Verge的Named Pipe；其他环境先配置受保护的HTTP Controller。项目没有第三方运行依赖，不需要执行 `npm install`。
+
+首次获取源码，在你希望存放项目的目录执行（已有仓库则进入现有目录，不重复克隆）：
+
+```sh
+git clone https://github.com/zhoutianqi613/mihomo-route-sentinel.git
+cd mihomo-route-sentinel
+node --version
+```
+
+下面是Windows PowerShell示例。在Linux/macOS中，用 `cp -n config.example.json config.json` 创建配置，命令路径改用正斜杠；首次也不要传入 `--apply`。
+
 ```powershell
-Copy-Item .\config.example.json .\config.json
+if (-not (Test-Path .\config.json)) { Copy-Item .\config.example.json .\config.json }
 # 先把 groups.target 和 groups.candidates 两个 CHANGE_ME_* 占位值
 # 改为当前 Mihomo 中实际存在的策略组名。
 node .\src\cli.mjs --config .\config.json
@@ -53,6 +67,10 @@ node .\src\cli.mjs --config .\config.json --status-json
 ```
 
 `--status` 只读 Controller、状态和日志，不获取守护进程锁，不发起探测或切换。
+
+首次成功判据：组名校验通过、Controller可连接，输出本轮真实业务探测结果。`healthy`仅说明当时满足健康门槛，不保证未来网络稳定；`upstream-outage`是启发式判断，不是上游官方故障公告。尚无合格候选时保持/退避可能是正确行为，应结合状态中的原因阅读。
+
+部署注意：`--apply`允许改节点；已启用的运行模式、DNS或进程守卫还可能修正Clash Verge配置、重启或恢复客户端。默认Dry Run只报告预计动作。人工接管前先停止或禁用守护，避免手动选择与后台控制相互覆盖。已有实例运行时，不要再启动第二个守护实例。
 
 ## 完整配置参考
 
@@ -86,7 +104,7 @@ node .\src\cli.mjs --config .\config.json --status-json
 | `probes.timeoutMs` | `5000` | 单次 URL 探测超时。 |
 | `probes.discoveryTimeoutMs` | `1200` | 全候选快速发现的单目标超时。本机 58 节点实测约 1.2 秒可返回约 42 个结果；发现阶段优先使用 Mihomo 组级 delay API。 |
 | `probes.scanDeadlineMs` | `3000` | 一次候选发现与准入扫描的硬截止，最大允许值为 3000 ms；截止后忽略尚未完成的探测，避免扫描占住健康主循环。 |
-| `probes.preSwitchValidationDeadlineMs` | `3000` | 常规切换前对候选池并行复测的总截止时间，最大 3000 ms；不会再按候选数量串行累加。紧急降级使用更短的 `emergencySwitchDeadlineMs`。 |
+| `probes.preSwitchValidationDeadlineMs` | `3000` | 常规切换前对候选池并行复测的总截止时间，最大 3000 ms；不会再按候选数量串行累加。紧急快速复核无可用结果时，也使用此独立窗口再做一轮业务目标复核。 |
 | `probes.currentRounds` | `2` | 每周期对当前节点执行的探测轮数。 |
 | `probes.currentMinSuccessRate` | `1` | 当前节点健康所需成功率；`1` 表示 100%。 |
 | `probes.currentMaxAverageMs` | `800` | 当前节点可接受的平均延迟上限。 |
@@ -131,11 +149,13 @@ node .\src\cli.mjs --config .\config.json --status-json
 | `policy.upstreamFailureMinCandidates` | `3` | 至少多少个候选呈现同类业务失败时，可结合对照 URL 判定上游故障并抑制切换。 |
 | `policy.candidateSnapshotRefreshSeconds` | `60` | 持续运行时后台刷新候选快照的间隔；刷新使用异步扫描，不阻塞主健康循环，即使切换预算暂时耗尽也可预热后续恢复数据。 |
 | `policy.candidateSnapshotMaxAgeSeconds` | `120` | 故障恢复允许复用候选快照的最大年龄；不得小于刷新间隔。默认保留一次刷新失败的容错窗口，过期或选择不匹配时重新扫描。 |
-| `policy.emergencySwitchDeadlineMs` | `1000` | 新鲜快照可用时，紧急候选快速复核、决策、配置守卫和 Controller 切换的总 SLO，最大 1000 ms；系统会保留一部分预算给实际切换。 |
+| `policy.emergencySwitchDeadlineMs` | `1000` | 新鲜快照可用时，紧急候选快速复核、决策、配置守卫和 Controller 切换的总 SLO，最大 1000 ms；系统会保留一部分预算给实际切换。快速路径失败后继续有界恢复，超出目标时如实记录 `deadlineMet=false`。 |
 
 延迟等级同时看平均值与单次最大值：优秀为平均不超过 500 ms 且最大不超过 1000 ms；可接受为平均不超过 800 ms 且最大不超过 1500 ms；退化为平均 800–1200 ms 或最大 1500–2500 ms；不可接受为平均超过 1200 ms 或最大超过 2500 ms；硬故障为成功率不超过 50% 或平均超过 3000 ms。平均值不会覆盖尖峰，决策还同时使用成功率、最大值、滚动退化次数、连续周期以及 HTTPS/WebSocket 的 TLS、TTFB 真实链路指标。
 
-周期择优、滚动退化和纯延迟切换优先使用通过严格准入、且相对当前节点至少改善 200 ms 或 20%（满足任一条件）的候选。当前节点已不健康时，若某个复测候选每轮仍满足当前健康线，可作为“临时候选”。当前成功率低于 100% 或进入硬故障且新鲜候选快照可用时，系统不重新全局扫描，而是按快照排名在 1 秒预算内并行快速复核前列节点：有 100% 成功节点时优先选延迟更低者；没有 100% 节点时按本次复核成功率降序、平均/最大延迟升序选择优于当前节点的最佳节点。快照只负责提供候选顺序，不能代替本次可达性证据；快速复核全部超时、全部为 0% 或没有相对改善时不盲切。紧急接管标记为 `emergency-best-effort`，下一周期必须重新严格准入。周期择优不会为了普通性能优化而使用降级候选。
+周期择优、滚动退化和纯延迟切换优先使用通过严格准入、且相对当前节点至少改善 200 ms 或 20%（满足任一条件）的候选。当前节点已不健康时，若某个复测候选每轮仍满足当前健康线，可作为“临时候选”。当前成功率低于 100% 或进入硬故障且新鲜候选快照可用时，系统不重新全局扫描，而是按快照排名在 1 秒预算内并行快速复核前列节点：有 100% 成功节点时优先选延迟更低者；没有 100% 节点时按本次复核成功率降序、平均/最大延迟升序选择优于当前节点的最佳节点。快照只负责提供候选顺序，不能代替本次可达性证据。快速复核没有相对可用候选时，追加一个 `preSwitchValidationDeadlineMs` 窗口，重新采集一轮全部业务目标样本；单请求超时按目标数分配，给后续目标保留机会。两个窗口的样本不混算，扩大窗口后仍全部为 0% 或没有相对改善才放弃本轮切换。此路径记录 `verificationSource=live-recovery-validation` 和实际一秒目标达成情况，不保证总恢复一秒。紧急接管标记为 `emergency-best-effort`，下一周期必须重新严格准入。周期择优不会为了普通性能优化而使用降级候选。
+
+紧急快速复核只采一轮业务目标；即使已有部分成功，只要最佳候选未覆盖全部目标，也会进入扩大的恢复窗口再比较，避免仅凭短窗口中的局部成功过早消耗切换预算。
 
 ### 日志与真实链路遥测
 
@@ -212,7 +232,7 @@ Windows 可自动完成上述 DNS 修复闭环。Linux 和 macOS 只有显式配
 | 不可接受尖峰 | 任一真实探测超过 `immediateMaxSingleMs`（默认 2500 ms），但尚未达到硬故障 | 5 秒后确认；仍为尖峰则立即扫描，不受普通连续周期与最短驻留限制 |
 | 硬故障 | 成功率不超过 50% 或平均延迟超过 3000 ms | 5 秒后确认；仍失败则立即扫描，不受普通连续周期与最短驻留限制 |
 
-候选必须 100% 成功、平均延迟不超过 600 ms、单次不超过 1200 ms，并连续两轮验证合格。常规切换前会在统一 3 秒截止内并行复测整个候选池，不再逐节点串行等待；门禁失败的节点不消耗切换预算或 `maxSwitchAttempts`。紧急降级使用新鲜快照和不超过 1 秒的独立预算，先恢复相对可用性，切换后标记为待严格准入而不会伪装成已验证节点。普通切换仍会切后验证两轮；失败候选隔离 15 分钟并继续尝试下一个。找不到有收益的候选后退避 120 秒；10 分钟最多切换 3 次。业务目标整体失败但对照 URL 正常时，按上游故障处理并抑制切换风暴。
+候选必须 100% 成功、平均延迟不超过 600 ms、单次不超过 1200 ms，并连续两轮验证合格。常规切换前会在统一 3 秒截止内并行复测整个候选池，不再逐节点串行等待；门禁失败的节点不消耗切换预算或 `maxSwitchAttempts`。紧急降级先尝试一秒快速路径，失败后继续最多 3 秒的恢复复核，切换后标记为待严格准入而不会伪装成已验证节点。普通切换仍会切后验证两轮；失败候选隔离 15 分钟并继续尝试下一个。找不到有收益的候选后退避 120 秒；10 分钟最多切换 3 次。业务目标整体失败但对照 URL 正常时，按上游故障处理并抑制切换风暴。
 
 快速路径使用 Mihomo 组级 delay API：默认初筛为 `1 轮 × 2 URL`，严格复测独立执行 `2 轮 × 2 URL`，保持两阶段准入的独立性。实机验证表明，在初筛后的剩余约 1.8 秒内批量 per-node 复测无法可靠得到严格候选，因此它只用于故障切前的小候选池快速复核和组级 API 不可用时的受控降级，不用于生成后台严格快照。全流程共享 `scanDeadlineMs=3000` 硬截止，Controller 请求支持取消；快照刷新由 30 秒降至 60 秒，使健康期全组探测量约降低一半。状态输出会显示初筛与复测的 Controller 请求数、估算节点测试数和峰值并发。健康期结果被压缩为不含地址和凭据的候选快照；快照与当前 Selector/叶子不匹配或超过最大年龄即失效。
 
@@ -347,4 +367,4 @@ Windows 的 `service-windows.bat status` 以及 Unix 的 `service-unix.sh status
 ## 产品审查 Agent
 
 - `agents/product-manager.md`：可复用的产品经理 Agent 角色、检查维度和输出契约。
-- `docs/product-review-2026-10-23.md`：本轮独立审查结论、已修复项和后续路线图。
+- `docs/product-review-2026-10-23.md`：历史独立审查结论；其中参数和建议只代表当时版本，当前策略见本手册，当前遗留与计划见 [迭代记录](docs/iterations.md)。

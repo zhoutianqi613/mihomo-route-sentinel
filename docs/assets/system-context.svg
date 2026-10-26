@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="720" viewBox="0 0 1120 720" role="img" aria-labelledby="title desc">
+  <title id="title">Mihomo Route Sentinel 在业务链路中的位置</title>
+  <desc id="desc">AI客户端通过Mihomo访问上游服务，业务流量不经过Sentinel。Sentinel通过Controller观察链路质量，显式授权后受约束地控制路由，不读取聊天正文，也不替代代理内核。</desc>
+  <defs>
+    <marker id="blue-arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#2563eb"/></marker>
+    <marker id="teal-arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#0f8a80"/></marker>
+    <style>text{font-family:'Microsoft YaHei','Noto Sans CJK SC',sans-serif;fill:#172b4d}.title{font-size:34px;font-weight:700}.heading{font-size:28px;font-weight:700}.body{font-size:23px}.small{font-size:22px;fill:#52637b}.blue{fill:#2563eb}.teal{fill:#087e74}</style>
+  </defs>
+  <rect width="1120" height="720" rx="24" fill="#f8fafc"/>
+  <text x="48" y="62" class="title">一个旁路守护程序，不是新的代理</text>
+  <text x="48" y="103" class="body">先看流量走向，再看谁有权观察与控制。</text>
+  <rect x="48" y="153" width="1024" height="210" rx="20" fill="#eff5ff"/>
+  <text x="72" y="191" class="small blue">业务路径 · 实线</text>
+  <rect x="74" y="220" width="248" height="104" rx="14" fill="#fff" stroke="#bfd3f8" stroke-width="2"/>
+  <text x="198" y="261" text-anchor="middle" class="heading">AI 客户端</text>
+  <text x="198" y="299" text-anchor="middle" class="small">Codex / ChatGPT</text>
+  <path d="M330 272H419" fill="none" stroke="#2563eb" stroke-width="3" marker-end="url(#blue-arrow)"/>
+  <rect x="434" y="220" width="252" height="104" rx="14" fill="#fff" stroke="#82aaf0" stroke-width="2"/>
+  <text x="560" y="261" text-anchor="middle" class="heading">Mihomo 内核</text>
+  <text x="560" y="299" text-anchor="middle" class="small">选定出口并转发流量</text>
+  <path d="M694 272H783" fill="none" stroke="#2563eb" stroke-width="3" marker-end="url(#blue-arrow)"/>
+  <rect x="798" y="220" width="248" height="104" rx="14" fill="#fff" stroke="#bfd3f8" stroke-width="2"/>
+  <text x="922" y="261" text-anchor="middle" class="heading">上游服务</text>
+  <text x="922" y="299" text-anchor="middle" class="small">OpenAI API 等</text>
+  <path d="M560 452V337" fill="none" stroke="#0f8a80" stroke-width="3" stroke-dasharray="8 7" marker-end="url(#teal-arrow)"/>
+  <rect x="419" y="387" width="282" height="65" rx="13" fill="#eaf8f5" stroke="#91d5c7" stroke-width="2"/>
+  <text x="560" y="428" text-anchor="middle" class="heading teal">Controller 接口</text>
+  <path d="M560 527V467" fill="none" stroke="#0f8a80" stroke-width="3" stroke-dasharray="8 7" marker-end="url(#teal-arrow)"/>
+  <text x="735" y="410" class="small teal">控制路径 · 虚线</text>
+  <text x="735" y="447" class="body">探测、读取状态</text>
+  <text x="735" y="482" class="body">授权后修改目标组</text>
+  <rect x="299" y="537" width="522" height="108" rx="17" fill="#fff" stroke="#0f8a80" stroke-width="2"/>
+  <text x="560" y="580" text-anchor="middle" class="heading teal">Mihomo Route Sentinel</text>
+  <text x="560" y="618" text-anchor="middle" class="body">质量判断 → 候选复核 → 有据恢复</text>
+  <text x="560" y="690" text-anchor="middle" class="body">边界：不读聊天正文 · 不提供节点 · 不替代 Mihomo 内核</text>
+</svg>

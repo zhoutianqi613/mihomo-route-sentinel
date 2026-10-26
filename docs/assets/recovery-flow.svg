@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="1010" viewBox="0 0 1120 1010" role="img" aria-labelledby="title desc">
+  <title id="title">从链路异常到受约束恢复的六个环节</title>
+  <desc id="desc">探测、确认、候选证据、切前复核、受约束选择、恢复验证。守卫阻断、没有有效候选或没有相对改善时不切换。常规切后验证，应急接管标记verified=false并在后续周期严格准入。图示控制逻辑，健康检查与后台扫描实际异步。</desc>
+  <defs>
+    <marker id="blue-arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0L9 4.5L0 9Z" fill="#2563eb"/></marker>
+    <marker id="teal-arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0L9 4.5L0 9Z" fill="#0f8a80"/></marker>
+    <marker id="orange-arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0L9 4.5L0 9Z" fill="#b46913"/></marker>
+    <style>text{font-family:'Microsoft YaHei','Noto Sans CJK SC',sans-serif;fill:#172b4d}.title{font-size:34px;font-weight:700}.heading{font-size:27px;font-weight:700}.body{font-size:23px}.small{font-size:22px;fill:#52637b}.teal{fill:#087e74}.orange{fill:#9a570c}.number{font-size:23px;font-weight:700;fill:#2563eb}</style>
+  </defs>
+  <rect width="1120" height="1010" rx="24" fill="#f8fafc"/>
+  <text x="48" y="62" class="title">不是“发现慢 → 立即换节点”</text>
+  <text x="48" y="103" class="body">先取得证据，再做有边界、可解释的恢复。</text>
+  <rect x="48" y="143" width="1024" height="62" rx="12" fill="#fff5e9"/>
+  <text x="560" y="182" text-anchor="middle" class="body orange">每次实际选择前：守卫通过、身份有效，并符合切换预算与恢复规则</text>
+  <rect x="48" y="250" width="292" height="140" rx="16" fill="#fff" stroke="#bfd3f8" stroke-width="2"/>
+  <text x="69" y="285" class="number">01</text><text x="69" y="323" class="heading">探测当前链路</text><text x="69" y="360" class="body">真实业务目标与遥测</text>
+  <rect x="414" y="250" width="292" height="140" rx="16" fill="#fff" stroke="#bfd3f8" stroke-width="2"/>
+  <text x="435" y="285" class="number">02</text><text x="435" y="323" class="heading">分类与确认</text><text x="435" y="360" class="body">短暂抖动继续观察</text>
+  <rect x="780" y="250" width="292" height="140" rx="16" fill="#fff" stroke="#bfd3f8" stroke-width="2"/>
+  <text x="801" y="285" class="number">03</text><text x="801" y="323" class="heading">取得候选证据</text><text x="801" y="360" class="body">新鲜快照或有界扫描</text>
+  <path d="M348 320H401M714 320H767" fill="none" stroke="#2563eb" stroke-width="3" marker-end="url(#blue-arrow)"/>
+  <path d="M926 398V460" fill="none" stroke="#2563eb" stroke-width="3" marker-end="url(#blue-arrow)"/>
+  <rect x="780" y="473" width="292" height="140" rx="16" fill="#fff" stroke="#bfd3f8" stroke-width="2"/>
+  <text x="801" y="508" class="number">04</text><text x="801" y="546" class="heading">切前复核</text><text x="801" y="583" class="body">确认候选当下可达</text>
+  <rect x="414" y="473" width="292" height="140" rx="16" fill="#fff" stroke="#bfd3f8" stroke-width="2"/>
+  <text x="435" y="508" class="number">05</text><text x="435" y="546" class="heading">受约束选择</text><text x="435" y="583" class="body">串行控制并留下审计</text>
+  <rect x="48" y="473" width="292" height="140" rx="16" fill="#eaf8f5" stroke="#91d5c7" stroke-width="2"/>
+  <text x="69" y="508" class="number">06</text><text x="69" y="546" class="heading teal">恢复验证</text><text x="69" y="583" class="body">记录身份并持续观察</text>
+  <path d="M772 543H719" fill="none" stroke="#2563eb" stroke-width="3" marker-end="url(#blue-arrow)"/>
+  <path d="M406 543H353" fill="none" stroke="#0f8a80" stroke-width="3" marker-end="url(#teal-arrow)"/>
+  <text x="376" y="520" text-anchor="middle" class="small teal">常规</text>
+  <path d="M560 621V703" fill="none" stroke="#b46913" stroke-width="3" marker-end="url(#orange-arrow)"/>
+  <text x="582" y="667" class="small orange">应急接管</text>
+  <rect x="330" y="716" width="440" height="135" rx="16" fill="#fff5e9" stroke="#ecc28e" stroke-width="2"/>
+  <text x="550" y="756" text-anchor="middle" class="heading orange">相对可用 ≠ 严格合格</text>
+  <text x="550" y="795" text-anchor="middle" class="body orange">verified=false</text>
+  <text x="550" y="830" text-anchor="middle" class="body">后续周期重新严格准入</text>
+  <path d="M322 784H194V626" fill="none" stroke="#0f8a80" stroke-width="3" stroke-dasharray="8 7" marker-end="url(#teal-arrow)"/>
+  <rect x="798" y="716" width="274" height="135" rx="16" fill="#fff5e9"/>
+  <text x="820" y="755" class="heading orange">不盲切的出口</text><text x="820" y="794" class="body">守卫阻断 / 无有效候选</text><text x="820" y="830" class="body">无相对改善 → 等待退避</text>
+  <path d="M1009 621V703" fill="none" stroke="#b46913" stroke-width="3" stroke-dasharray="8 7" marker-end="url(#orange-arrow)"/>
+  <text x="48" y="913" class="small">图示为控制逻辑；健康检查与后台扫描实际异步，不代表串行耗时。</text>
+  <text x="48" y="953" class="small">验证失败会隔离并按策略尝试后续候选；回退同样需要证据，不盲回原节点。</text>
+</svg>
