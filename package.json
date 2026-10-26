@@ -1,6 +1,6 @@
 {
   "name": "mihomo-route-sentinel",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "private": true,
   "type": "module",
   "description": "AI service route quality monitoring and automatic failover for Mihomo",
@@ -14,6 +14,8 @@
   },
   "scripts": {
     "check": "node --check src/cli.mjs && node --check src/config.mjs && node --check src/controller.mjs && node --check src/guardrails.mjs && node --check src/link-probe.mjs && node --check src/observability.mjs && node --check src/watchdog.mjs",
-    "test": "node --test"
+    "test": "node --test",
+    "docs:check": "node scripts/docs-publish.mjs --check",
+    "docs:publish": "node scripts/docs-publish.mjs"
   }
 }

@@ -1421,20 +1421,45 @@ export class Watchdog {
         : this.config.probes.preSwitchValidationDeadlineMs;
       const switchReserveMs = emergencyRecovery ? Math.min(250, Math.floor(decisionDeadlineMs / 3)) : 0;
       const validationDeadlineAt = decisionStartedAt + decisionDeadlineMs - switchReserveMs;
-      const preSwitchResults = await this.probeCandidatesInParallel(
+      let preSwitchResults = await this.probeCandidatesInParallel(
         candidates.map((entry) => entry.node),
-        this.config.probes.validationRounds,
+        emergencyRecovery ? 1 : this.config.probes.validationRounds,
         this.config.probes.urls,
         validationDeadlineAt,
       );
       const resultByNode = new Map(preSwitchResults.map((entry) => [entry.node, entry]));
 
       if (emergencyRecovery) {
-        const ranked = preSwitchResults
+        let ranked = preSwitchResults
           .filter((entry) => isAvailabilityImprovement(entry, current, this.config.policy))
           .sort(compareAvailability);
+        let verificationSource = 'live-fast-validation';
+        if (ranked.length === 0 || ranked[0].successRate < 1) {
+          // 快速窗口是恢复目标，不能成为拒绝较慢但可用出口的永久门槛。
+          // 重新采集完整一轮业务样本，不将不同截止窗口的样本混合计算成功率。
+          const recoveryDeadlineMs = this.config.probes.preSwitchValidationDeadlineMs;
+          setDecision('validate', 'emergency-recovery-validation', { deadlineMs: recoveryDeadlineMs });
+          await persistState();
+          await this.log('warn', 'emergency-fast-path-exhausted', {
+            checkedCandidates: preSwitchResults.length,
+            successfulCandidates: preSwitchResults.filter((entry) => entry.successes > 0).length,
+            decisionDurationMs: Date.now() - decisionStartedAt,
+            recoveryDeadlineMs,
+          });
+          preSwitchResults = await this.probeCandidatesInParallel(
+            candidates.map((entry) => entry.node),
+            1,
+            this.config.probes.urls,
+            Date.now() + recoveryDeadlineMs,
+            { timeoutMs: Math.min(this.config.probes.timeoutMs,
+              Math.floor(recoveryDeadlineMs / this.config.probes.urls.length)) },
+          );
+          ranked = preSwitchResults
+            .filter((entry) => isAvailabilityImprovement(entry, current, this.config.policy))
+            .sort(compareAvailability);
+          verificationSource = 'live-recovery-validation';
+        }
         const emergencyCandidate = ranked[0];
-        const verificationSource = 'live-fast-validation';
         for (const result of preSwitchResults) {
           if (isAvailabilityImprovement(result, current, this.config.policy)
               || result.node === emergencyCandidate?.node) continue;
@@ -1488,7 +1513,9 @@ export class Watchdog {
             trigger: scanReason,
             verified: false,
             source: 'sentinel',
+            verificationSource,
             decisionDurationMs,
+            deadlineMet: decisionDurationMs <= decisionDeadlineMs,
           };
           state.provisionalFallback = {
             at: switchedAt,

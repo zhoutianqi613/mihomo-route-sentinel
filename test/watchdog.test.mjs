@@ -19,7 +19,7 @@ function startMockController({
   const switches = [];
   let flakyProbeCount = 0;
   const probeCounts = new Map();
-  const server = http.createServer((request, response) => {
+  const server = http.createServer(async (request, response) => {
     const url = new URL(request.url, 'http://localhost');
     const parts = url.pathname.split('/').filter(Boolean);
     const name = parts[1] ? decodeURIComponent(parts[1]) : '';
@@ -53,7 +53,7 @@ function startMockController({
       const countKey = `${name}\u0000${targetUrl}`;
       const probeCount = (probeCounts.get(countKey) ?? 0) + 1;
       probeCounts.set(countKey, probeCount);
-      const resolvedDelay = delayResolver?.({ name, targetUrl, probeCount });
+      const resolvedDelay = await delayResolver?.({ name, targetUrl, probeCount });
       if (resolvedDelay === null || (resolvedDelay === undefined && name === 'bad-node')
         || (resolvedDelay === undefined && name === 'flaky-node' && ++flakyProbeCount > 3)) {
         response.statusCode = 504;
@@ -1901,6 +1901,103 @@ test('基线待准入不能掩盖硬故障或阻止紧急快照切换', async (t
   assert.equal(mock.getSelected(), 'partial-best');
   assert.equal(events.some((entry) => entry.event === 'candidate-scan-backoff-active'), false);
   assert.equal(events.some((entry) => entry.event === 'candidate-snapshot-used'), true);
+});
+
+for (const scenario of [
+  { name: '较慢但两个目标均可达', successRate: 1 },
+  { name: '首目标失败但第二目标可达', successRate: 0.5 },
+  { name: '扩大窗口后仍全部超时', successRate: 0 },
+]) {
+  test(`快速窗口失败后执行有界恢复：${scenario.name}`, async (t) => {
+    const urls = ['https://service-a.example/', 'https://service-b.example/'];
+    const mock = await startMockController({
+      candidates: ['bad-node', 'slower-node'],
+      delayResolver: async ({ name, targetUrl }) => {
+        if (name === 'bad-node') return null;
+        if (scenario.successRate === 0.5 && targetUrl === urls[0]) return null;
+        await new Promise((resolve) => setTimeout(resolve, scenario.successRate === 0 ? 700 : 120));
+        return 120;
+      },
+    });
+    t.after(() => mock.server.close());
+    const config = await makeConfig(mock.url);
+    config.probes.urls = urls;
+    config.probes.preSwitchValidationDeadlineMs = 500;
+    config.policy.emergencySwitchDeadlineMs = 100;
+    await writeFile(config.files.state, JSON.stringify({
+      currentSelection: 'bad-node', currentLeaf: 'bad-node', selectionAdmissionVersion: 1,
+      candidateSnapshot: {
+        at: new Date().toISOString(), selection: 'bad-node', leaf: 'bad-node',
+        candidates: [{
+          node: 'slower-node', attempts: 4, successes: 4, successRate: 1,
+          averageMs: 120, maxMs: 120, jitterMs: 0, score: 150, profile: 'strict',
+        }],
+        sampled: [],
+      },
+    }));
+    const events = [];
+    const watchdog = new Watchdog({
+      controller: new MihomoController(config.controller, {}), config,
+      logger: async (level, event, details) => events.push({ event, details }),
+    });
+    const startedAt = performance.now();
+    const result = await watchdog.runOnce({ dryRun: false, backgroundScan: true });
+    assert.ok(performance.now() - startedAt < 1000, '快速与恢复复核必须有界');
+    assert.ok(events.some((entry) => entry.event === 'emergency-fast-path-exhausted'));
+    const state = JSON.parse(await readFile(config.files.state, 'utf8'));
+    if (scenario.successRate > 0) {
+      assert.equal(result.status, 'emergency-fallback');
+      assert.equal(result.verificationSource, 'live-recovery-validation');
+      assert.equal(result.verification.successRate, scenario.successRate);
+      assert.deepEqual(mock.switches, ['slower-node']);
+      assert.equal(state.lastSwitch.verified, false);
+      assert.equal(state.lastSwitch.deadlineMet, false);
+      assert.equal(state.switchHistory.length, 1);
+      assert.equal(state.provisionalFallback.requiresStrictAdmission, true);
+    } else {
+      assert.equal(result.status, 'no-pre-switch-candidate');
+      assert.deepEqual(mock.switches, []);
+      assert.equal(state.switchHistory.length, 0);
+    }
+  });
+}
+
+test('快速窗口只有部分成功时继续恢复复核，优先完整可达节点以减少无效切换', async (t) => {
+  const urls = ['https://service-a.example/', 'https://service-b.example/'];
+  const mock = await startMockController({
+    candidates: ['bad-node', 'fast-partial', 'slower-complete'],
+    delayResolver: async ({ name, targetUrl }) => {
+      if (name === 'bad-node') return null;
+      if (name === 'fast-partial') return targetUrl === urls[0] ? 20 : null;
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      return 120;
+    },
+  });
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  config.probes.urls = urls;
+  config.probes.preSwitchValidationDeadlineMs = 500;
+  config.policy.emergencySwitchDeadlineMs = 100;
+  await writeFile(config.files.state, JSON.stringify({
+    currentSelection: 'bad-node', currentLeaf: 'bad-node', selectionAdmissionVersion: 1,
+    candidateSnapshot: {
+      at: new Date().toISOString(), selection: 'bad-node', leaf: 'bad-node',
+      candidates: ['fast-partial', 'slower-complete'].map((node, index) => ({
+        node, attempts: 4, successes: 4, successRate: 1, averageMs: 20 + index * 100,
+        maxMs: 120, jitterMs: 0, score: 20 + index * 100, profile: 'strict',
+      })), sampled: [],
+    },
+  }));
+  const watchdog = new Watchdog({
+    controller: new MihomoController(config.controller, {}), config, logger: async () => {},
+  });
+  const result = await watchdog.runOnce({ dryRun: false, backgroundScan: true });
+  assert.equal(result.status, 'emergency-fallback');
+  assert.equal(result.verificationSource, 'live-recovery-validation');
+  assert.equal(result.verification.successRate, 1);
+  assert.deepEqual(mock.switches, ['slower-complete']);
+  const state = JSON.parse(await readFile(config.files.state, 'utf8'));
+  assert.equal(state.switchHistory.length, 1);
 });
 
 test('紧急实时复核全部超时时不盲切新鲜快照节点', async (t) => {
