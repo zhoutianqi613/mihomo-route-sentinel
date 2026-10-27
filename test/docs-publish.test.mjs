@@ -41,7 +41,7 @@ test('更新历史在现有迭代页保留版本与阶段三列简表', async ()
   assert.doesNotMatch(body, /阶段 \/ 版本/);
   assert.ok(body.indexOf('1.8.0') < body.indexOf('1.7.1'));
   for (const label of ['原问题', '主要变化', '本地证据', '投用证据', '后台观察', '限制']) assert.ok(body.includes(`**${label}：**`), label);
-  assert.match(body, /<h3>1\.2 v1\.8\.0<\/h3>/);
+  assert.match(body, /<h3>1\.2 v1\.8 系列<\/h3>/);
   assert.match(body, /<h3>1\.3 v1\.7 及更早<\/h3>/);
   assert.equal(pages.length, 4);
 });

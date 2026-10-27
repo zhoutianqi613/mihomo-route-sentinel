@@ -80,6 +80,44 @@ test('P0：择优预算耗尽后仍可使用独立恢复预算', async (t) => {
   assert.equal(state.decisionState.budget.rescue.used, 0);
 });
 
+function unresponsiveSnapshot() {
+  return { at: new Date().toISOString(), selection: 'current', leaf: 'current', candidates: [],
+    sampled: [{ node: 'candidate', attempts: 2, successes: 0, successRate: 0,
+      averageMs: null, maxMs: null, jitterMs: null, score: null }] };
+}
+
+test('硬故障遇到零响应快照时重新实时复核，不能永久拒绝恢复', async (t) => {
+  const f = await fixture(t, { state: { candidateSnapshot: unresponsiveSnapshot(),
+    candidateScanBackoffUntil: new Date(Date.now() + 60_000).toISOString(),
+    lastCandidateScanOutcome: 'no-stable-candidate' } });
+
+  const result = await f.create().runOnce({ dryRun: false, backgroundScan: true });
+
+  assert.equal(result.status, 'emergency-fallback');
+  assert.deepEqual(f.switches, ['candidate']);
+  const state = await f.readState();
+  assert.equal(state.decisionState.budget.recovery.used, 1);
+  assert.notEqual(state.decisionState.admission.profile, 'strict');
+  assert.equal(f.events.some(({ event }) => event === 'emergency-discovery-retry'), true);
+});
+
+test('零响应快照复核仍全部失败时不切换、不消耗预算', async (t) => {
+  const f = await fixture(t, { probe: () => null,
+    state: { candidateSnapshot: unresponsiveSnapshot(), candidateScan: { status: 'running' } } });
+  const watchdog = f.create();
+  let cancelled = false;
+  watchdog.activeCandidateScan = { selection: 'current', leaf: 'current', completed: false,
+    promise: new Promise(() => {}), cancel: () => { cancelled = true; } };
+
+  await watchdog.runOnce({ dryRun: false, backgroundScan: true });
+
+  assert.deepEqual(f.switches, []);
+  assert.equal((await f.readState()).decisionState.budget.recovery.used, 0);
+  assert.equal(f.events.some(({ event }) => event === 'emergency-fallback-unavailable'), true);
+  assert.equal(cancelled, false, '零响应快照不能反复取消仍在刷新的后台发现');
+  assert.equal((await f.readState()).candidateScan.status, 'running');
+});
+
 test('P0：硬故障最后一次 rescue 在选择抛错前落盘，重建实例不能重复使用', async (t) => {
   let reserved;
   const f = await fixture(t, { state: { switchHistory: history('recovery') },

@@ -1774,7 +1774,7 @@ test('紧急降级在所有候选成功率为零时不制造无收益切换', as
   await started.backgroundWake;
   const decided = await watchdog.runOnce({ dryRun: false, backgroundScan: true });
 
-  assert.equal(decided.status, 'no-candidate');
+  assert.equal(decided.status, 'no-pre-switch-candidate');
   assert.deepEqual(mock.switches, []);
 });
 

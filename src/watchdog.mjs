@@ -588,11 +588,19 @@ export class Watchdog {
       candidates, rounds, scanUrls, deadlineAt, { timeoutMs, background, signal },
     );
     const probeStats = results.probeStats;
+    const failureReasons = {};
+    for (const sample of results.flatMap((result) => result.samples)) {
+      if (sample.ok) continue;
+      const reason = Number.isInteger(sample.error) ? `HTTP_${sample.error}`
+        : (/^[A-Z][A-Z0-9_]{0,63}$/.test(sample.error) ? sample.error : 'OTHER');
+      failureReasons[reason] = (failureReasons[reason] ?? 0) + 1;
+    }
     await this.log('info', event, {
       method: probeStats.method,
       durationMs: Date.now() - startedAt,
       candidateCount: candidates.length,
       responsiveCount: results.filter((result) => result.successes > 0).length,
+      failureReasons,
       probeStats,
     });
     return results;
@@ -624,11 +632,15 @@ export class Watchdog {
     }
     const candidates = this.filterCandidates(source.all, currentLeaf, excludedNodes);
     const scanUrls = this.config.probes.urls.slice(0, this.config.probes.scanUrlCount);
+    // 后台发现须能保留慢速可达出口；快速初筛超时不能成为救援资格门槛。
+    const discoveryTimeoutMs = background
+      ? Math.max(this.config.probes.discoveryTimeoutMs, this.config.probes.timeoutMs)
+      : this.config.probes.discoveryTimeoutMs;
     if (background) {
       // 后台允许完成现有配置要求的全部样本；紧急发现仍由原 scanDeadlineMs 约束。
       const batches = (count) => Math.ceil(count / this.config.probes.parallelism);
       deadlineMs += batches(candidates.length) * this.config.probes.scanRounds
-        * scanUrls.length * this.config.probes.discoveryTimeoutMs;
+        * scanUrls.length * discoveryTimeoutMs;
       deadlineMs += batches(Math.min(candidates.length, this.config.probes.maxValidationCandidates))
         * Math.max(2, this.config.probes.validationRounds)
         * this.config.probes.urls.length * this.config.probes.timeoutMs;
@@ -638,7 +650,7 @@ export class Watchdog {
       count: candidates.length, background, deadlineMs,
     });
     const quickResults = await this.discoverCandidates(candidates, scanUrls, deadlineAt, {
-      background, signal,
+      background, signal, timeoutMs: discoveryTimeoutMs,
     });
     const ranked = quickResults
       .filter((result) => result.successes > 0)
@@ -1307,7 +1319,9 @@ export class Watchdog {
       );
       if (cachedSearch) {
         search = cachedSearch;
-        if (active) {
+        const hasResponsiveCandidate = [...cachedSearch.sampled, ...cachedSearch.validated]
+          .some((entry) => entry.successes > 0);
+        if (active && (hasResponsiveCandidate || !availabilityRecoveryRequired)) {
           active.invalidated = true;
           active.invalidatedReason = 'fresh-candidate-snapshot-used';
           active.cancel?.();
@@ -1382,7 +1396,8 @@ export class Watchdog {
     if (search.source !== 'candidate-snapshot') {
       state.candidateSnapshot = this.createCandidateSnapshot(search, previousSelection, currentLeaf);
     }
-    delete state.candidateScan;
+    if (!this.activeCandidateScan || this.activeCandidateScan.completed
+        || this.activeCandidateScan.invalidated) delete state.candidateScan;
     state.lastCandidateScan = {
       at: search.completedAt ?? new Date().toISOString(),
       reason: scanReason,
@@ -1453,6 +1468,16 @@ export class Watchdog {
       const byNode = new Map();
       for (const entry of [...candidates, ...(search.sampled ?? []), ...(search.validated ?? [])]) {
         if (entry.successes > 0 && entry.node !== currentLeaf) byNode.set(entry.node, entry);
+      }
+      if (backgroundScan && byNode.size === 0) {
+        // 零响应快照仅代表上次初筛失败；节点名可用于重试，选择仍须本次成功证据。
+        for (const entry of search.sampled ?? []) {
+          if (entry.node !== currentLeaf) byNode.set(entry.node, entry);
+        }
+        await this.log('warn', 'emergency-discovery-retry', {
+          source: search.source ?? 'live-scan',
+          candidateCount: Math.min(byNode.size, this.config.probes.topCandidates),
+        });
       }
       candidates = [...byNode.values()]
         .filter((entry) => backgroundScan || isAvailabilityImprovement(entry, current, this.config.policy))

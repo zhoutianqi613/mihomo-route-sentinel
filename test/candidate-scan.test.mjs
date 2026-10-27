@@ -96,6 +96,37 @@ test('后台完整验证使用现配置推导的有限截止，独立于快速�
   assert.equal(result.stable[0].attempts, 4);
 });
 
+test('后台发现保留超过快速初筛超时的可达节点，不能冒充严格合格', async () => {
+  const watchdog = makeWatchdog({
+    async getProxy() { return { all: ['current', 'slow'] }; },
+    async getDelay(node, url, timeoutMs, { signal }) {
+      return abortableDelay(signal, 60, 1300);
+    },
+  }, { discoveryTimeoutMs: 20, timeoutMs: 150 });
+
+  const result = await watchdog.findCandidates('current', new Set(), { background: true });
+
+  assert.equal(result.sampled[0].successRate, 1);
+  assert.equal(result.sampled[0].averageMs, 1300);
+  assert.equal(result.deadlineMs, 40 + (2 * 150) + (4 * 150));
+  assert.deepEqual(result.stable, []);
+  assert.deepEqual(result.provisional, []);
+});
+
+test('候选发现记录失败类别，区分接口超时与没有候选', async () => {
+  const events = [];
+  const watchdog = makeWatchdog({
+    async getProxy() { return { all: ['current', 'unreachable'] }; },
+    async getDelay() { throw Object.assign(new Error('模拟超时'), { status: 504 }); },
+  });
+  watchdog.log = async (level, event, details) => events.push({ event, details });
+
+  await watchdog.findCandidates('current');
+
+  const discovery = events.find(({ event }) => event === 'candidate-discovery-completed');
+  assert.deepEqual(discovery.details.failureReasons, { HTTP_504: 2 });
+});
+
 test('前台仍受原绝对截止约束，缺少严格样本只保留实时初筛证据', async () => {
   const watchdog = makeWatchdog({
     async getProxy() { return { all: ['current', 'a'] }; },
