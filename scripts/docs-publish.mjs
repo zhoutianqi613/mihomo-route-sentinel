@@ -5,6 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { defaults, CURRENT_CONFIG_VERSION } from '../src/config.mjs';
 import { applyLayout, layoutMetrics } from './docs-layout.mjs';
+import { checkOutline, checkReadability } from './docs-readability.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const output = path.join(root, 'var', 'docs-publish');
@@ -12,14 +13,23 @@ const base = 'FUeHbS3Oma51SyswC0OchmDcnxg';
 const projectRecord = 'reczz28RgLQygfek';
 const wikiHost = 'https://vcnx8wvfgn4h.feishu.cn/wiki/';
 export const pages = Object.freeze([
-  { source: 'PRODUCT.md', title: '002 Mihomo Route Sentinel', doc: 'B5YSdbF1oobdPsxGjJZcpAbNnBg', node: 'NC0qwAr3Jibgw8kmeJRc2rAzn5e', initialRevision: 4, required: ['01 背景与价值', '02 系统与边界', '05 维护方式'] },
-  { source: 'README.md', title: '安装配置与使用手册', doc: 'YVRKdVUYqoov0xxPjvgcwFuxnxh', node: 'MntSwAfYOiJ4Yxka76jc1e6Mnjd', initialRevision: 9, required: ['快速开始', '完整配置参考', 'Windows 后台运行', '运行文件'], onlineRequired: ['01 首次跑通', '02 日常操作与人工接管', '03 后台部署', '04 配置与策略参考', '05 运行文件与维护'] },
-  { source: 'docs/design.md', title: '工作原理与业务流程', doc: 'FOGCdWedDowSolx2R0FcGzLXndb', node: 'FbndwuzAJiUPlnkRm2DclPLunJF', initialRevision: 2, required: ['01 三个关键角色', '02 恢复流程', '05 设计取舍与代码定位'] },
-  { source: 'docs/iterations.md', title: '迭代计划与遗留问题', doc: 'Dlqhd8Le1oNK97xCIGlcYQnynKb', node: 'OFJBwMZYjijcXVkB1ezcSUPknPb', initialRevision: 2, required: ['01 演进履历', '02 当前遗留', '03 下一轮建议', '04 文档维护闭环'] },
+  { source: 'PRODUCT.md', title: '002 Mihomo Route Sentinel', doc: 'B5YSdbF1oobdPsxGjJZcpAbNnBg', node: 'NC0qwAr3Jibgw8kmeJRc2rAzn5e', initialRevision: 4, required: ['01 背景与价值', '02 系统与边界', '03 当前交付', '04 阅读导航', '05 维护方式', '06 参考资料'] },
+  { source: 'README.md', title: '安装配置与使用手册', doc: 'YVRKdVUYqoov0xxPjvgcwFuxnxh', node: 'MntSwAfYOiJ4Yxka76jc1e6Mnjd', initialRevision: 9, required: ['01 首次运行', '02 日常操作与人工接管', '03 后台部署', '04 配置字段参考', '05 状态判读与运行维护'], onlineRequired: ['01 首次运行', '02 日常操作与人工接管', '03 后台部署', '04 配置字段参考', '05 状态判读与运行维护'] },
+  { source: 'docs/design.md', title: '工作原理与业务流程', doc: 'FOGCdWedDowSolx2R0FcGzLXndb', node: 'FbndwuzAJiUPlnkRm2DclPLunJF', initialRevision: 2, required: ['01 系统模型', '02 恢复流程', '03 典型场景', '04 规则与状态', '05 设计取舍'] },
+  { source: 'docs/iterations.md', title: '迭代计划与遗留问题', doc: 'Dlqhd8Le1oNK97xCIGlcYQnynKb', node: 'OFJBwMZYjijcXVkB1ezcSUPknPb', initialRevision: 2, required: ['01 更新历史', '02 遗留与验收', '03 交付与计划', '04 文档维护'] },
 ]);
 
 export const hash = (value) => createHash('sha256').update(value).digest('hex');
+export const approvedAssets = Object.freeze(['docs/assets/system-context.png', 'docs/assets/recovery-flow.png', 'docs/assets/delivery-roadmap.png']);
 const cell = (value) => String(value ?? '未填写').replace(/\r?\n/g, '；').replace(/[\\`*_[\]|<>]/g, (item) => `\\${item}`);
+
+export function assertPublishedContent(content, { inputHash, headings, subheadings }, nativeContent = content) {
+  const decode = (value) => value.replace(/&quot;/g, '"').replace(/&gt;/g, '>').replace(/&lt;/g, '<').replace(/&amp;/g, '&');
+  const text = decode(content);
+  if (!content.includes(inputHash) || headings.some((heading) => !text.includes(heading))) throw new Error('读回缺少生成Hash或主章；停止，不宣称完成');
+  const nativeHeadings = [...nativeContent.matchAll(/<h3\b[^>]*>([\s\S]*?)<\/h3>/g)].map((match) => decode(match[1]));
+  if (!nativeContent.includes(inputHash) || nativeHeadings.length !== subheadings.length || subheadings.some((heading, index) => nativeHeadings[index] !== decode(heading))) throw new Error('读回缺少飞书原生二级目录；停止，不宣称完成');
+}
 
 export function policyTable(config = defaults) {
   const p = config.policy;
@@ -32,9 +42,10 @@ export function policyTable(config = defaults) {
     `| 部分失败 / 纯延迟确认 | ${p.partialFailureCycles} / ${p.latencyFailureCycles}个连续周期 | 根据异常类型处理 |`,
     `| 硬故障确认 | ${p.hardFailureConfirmSeconds}秒 | 不等于总恢复时间 |`,
     `| 快照刷新 / 最大年龄 | ${p.candidateSnapshotRefreshSeconds} / ${p.candidateSnapshotMaxAgeSeconds}秒 | 还须匹配Selector与叶子 |`,
-    `| 扫描 / 常规切前复核截止 | ${q.scanDeadlineMs} / ${q.preSwitchValidationDeadlineMs}ms | 两个独立时间窗口 |`,
+    `| 前台扫描 / 常规切前复核截止 | ${q.scanDeadlineMs} / ${q.preSwitchValidationDeadlineMs}ms | 后台完整验证使用独立推导时限 |`,
     `| 紧急决策与选择目标 | ${p.emergencySwitchDeadlineMs}ms | 有新鲜快照等前提，不是硬实时保证 |`,
-    `| 实际选择预算 | ${p.switchBudgetWindowSeconds}秒内${p.switchBudgetCount}次 | 切前拒绝不占选择次数 |`,
+    `| 日常择优 / 故障恢复预算 | 各${p.switchBudgetWindowSeconds}秒内${p.switchBudgetCount}次 | 两池独立，切前拒绝不占选择次数 |`,
+    `| 额外安全恢复预算 | ${p.switchBudgetWindowSeconds}秒内1次 | 仅当前仍为硬故障且恢复池已满时可用，选择前持久化 |`,
     `| 失败候选隔离 / 无候选退避 | ${p.failedNodeQuarantineSeconds} / ${p.candidateScanBackoffSeconds}秒 | 降低重复试错和抖动 |`,
   ].join('\n');
 }
@@ -57,11 +68,13 @@ export function transformSource(source, sourcePath, records = []) {
   const mapped = source.replace(/^# .+\r?\n/, '').trim()
     .replace('<!-- sentinel:policy-table -->', policyTable())
     .replace('<!-- sentinel:backlog -->', backlogTable(records));
-  return mapped.replace(/(!?)\[([^\]]+)\]\(([^)]+)\)/g, (match, image, label, target) => {
+  if (/<(?:img|image)\b/i.test(mapped)) throw new Error('图示只能使用已批准的本地PNG资产');
+  return mapped.replace(/(!?)\[([^\]]*)\]\(([^)]+)\)/g, (match, image, label, target) => {
+    if (image && /^(?:[a-z][a-z\d+.-]*:|\/\/|#)/i.test(target)) throw new Error('图示只能使用已批准的本地PNG资产');
     if (/^(https?:|#)/.test(target)) return match;
     const relative = path.posix.normalize(path.posix.join(path.posix.dirname(sourcePath), target.split('#')[0]));
     if (image) {
-      if (!/^docs\/assets\/[a-z-]+\.png$/.test(relative)) throw new Error('图示只能使用项目docs/assets下的PNG');
+      if (!approvedAssets.includes(relative)) throw new Error('图示只能使用已批准的本地PNG资产');
       return `![${label}](@./${relative})`;
     }
     const page = pages.find((candidate) => candidate.source === relative);
@@ -79,6 +92,10 @@ export async function checkSources() {
       if (!content.includes(`## ${heading}`)) throw new Error(`缺少必要问题：${page.source} / ${heading}`);
     }
     if ((content.match(/^```/gm)?.length ?? 0) % 2) throw new Error(`代码围栏不成对：${page.source}`);
+    const readability = checkReadability(content, page.source);
+    if (readability.length) throw new Error(readability.join('\n'));
+    const outline = checkOutline(content, page.source);
+    if (outline.length) throw new Error(outline.join('\n'));
     for (const [, , link] of content.matchAll(/\[([^\]]+)\]\(([^)]+)\)/g)) {
       if (/^(https?:|#)/.test(link)) continue;
       const resolved = path.resolve(root, path.dirname(page.source), link.split('#')[0]);
@@ -87,7 +104,7 @@ export async function checkSources() {
     }
     sources[page.source] = content;
     const metrics = layoutMetrics(applyLayout(transformSource(content, page.source), page.source));
-    if (metrics.headings < 4 || metrics.headings > 5 || metrics.subheadings) throw new Error(`阅读目录层级异常：${page.source}`);
+    if (page.source === 'PRODUCT.md' ? metrics.headings !== 6 : metrics.headings < 4 || metrics.headings > 5) throw new Error(`阅读目录层级异常：${page.source}`);
   }
   for (const [source, marker] of [['docs/design.md', 'policy-table'], ['docs/iterations.md', 'backlog']]) {
     if (sources[source].split(`<!-- sentinel:${marker} -->`).length !== 2) throw new Error(`动态标记必须恰好一个：${source}`);
@@ -138,7 +155,7 @@ export function assertRemoteUnchanged(page, current, prior) {
 export async function main(argv) {
   if (argv.some((arg) => !['--check', '--apply'].includes(arg)) || (argv.includes('--check') && argv.includes('--apply'))) throw new Error('只支持 --check 或 --apply；默认预览。');
   const sources = await checkSources();
-  if (argv.includes('--check')) { console.log('四页正文、必要章节、相对链接、动态标记与CLI帮助检查通过。'); return; }
+  if (argv.includes('--check')) { console.log('四页正文、段落可读性、连续编号两级目录、相对链接、动态标记与CLI帮助检查通过。'); return; }
   await mkdir(output, { recursive: true });
   const metadata = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
   const git = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' });
@@ -158,6 +175,8 @@ export async function main(argv) {
     const prior = state.pages[page.doc];
     assertRemoteUnchanged(page, current, prior);
     const body = applyLayout(transformSource(sources[page.source], page.source, rows), page.source);
+    const headings = [...body.matchAll(/^## (.+)$/gm)].map((match) => match[1]);
+    const subheadings = [...body.matchAll(/^<h3>(.+)<\/h3>$/gm)].map((match) => match[1]);
     const sourceHash = hash(sources[page.source]);
     const assets = [...body.matchAll(/!\[[^\]]*\]\(@\.\/([^\)]+)\)/g)].map((match) => match[1]);
     const assetHashes = {};
@@ -168,7 +187,7 @@ export async function main(argv) {
     const content = `<title>${page.title}</title>\n\n${body}\n\n---\n\n<callout emoji="📄" background-color="light-gray" border-color="gray"><p>发布快照 · 来源：${page.source} · 源码版本${metadata.version} / 配置格式${CURRENT_CONFIG_VERSION}</p><p>发布/任务读取：${stamp}。不是新的产品验收；可能包含未提交文档，GitHub版本以仓库为准。</p></callout>\n\n**发布溯源（用于同步核对）**\n\n\`\`\`text\n源码HEAD=${codeHead}\n源文件SHA256=${sourceHash}\n生成Hash=${inputHash}\n\`\`\``;
     const draftPath = `./var/docs-publish/${page.node}.md`;
     await writeFile(path.join(root, draftPath), content, 'utf8');
-    queue.push({ page, current, inputHash, sourceHash, assetHashes, draftPath, changed });
+    queue.push({ page, current, inputHash, sourceHash, assetHashes, headings, subheadings, draftPath, changed });
     console.log(`${changed ? '待发布' : '无变化'}：${page.title} ← ${page.source}`);
   }
   if (!argv.includes('--apply')) { console.log('预览完成；飞书未修改。执行 npm run docs:publish -- --apply 才发布。'); return; }
@@ -184,7 +203,11 @@ export async function main(argv) {
     if (updated.result !== 'success' || updated.warnings?.length) throw new Error(`正文发布不完整：${page.title}。已停止后续写入，线上可能已部分改变；上一版备份位于var/docs-publish，请先核对再决定恢复。`);
     lark(['drive', '+update-title', '--url', `${wikiHost}${page.node}`, '--title', page.title]);
     const verified = lark(['docs', '+fetch', '--doc', page.doc, '--doc-format', 'markdown', '--detail', 'full']).document;
-    if (!verified.content.includes(entry.inputHash) || (page.onlineRequired ?? page.required).some((heading) => !verified.content.includes(heading))) throw new Error(`读回缺少源Hash或必要章节：${page.title}`);
+    // Markdown读回用于既有防漂移身份，原生目录必须从XML独立核实。
+    const native = lark(['docs', '+fetch', '--doc', page.doc, '--doc-format', 'xml', '--detail', 'full']).document;
+    if (native.revision_id !== verified.revision_id) throw new Error('两种格式读回期间版本变化，停止');
+    assertPublishedContent(verified.content, entry, native.content);
+    if ((page.onlineRequired ?? page.required).some((heading) => !verified.content.includes(heading))) throw new Error(`读回缺少必要章节：${page.title}`);
     state.pages[page.doc] = { inputHash: entry.inputHash, sourceHash: entry.sourceHash, assetHashes: entry.assetHashes, resourceHash: hash(JSON.stringify(verified.reference_map ?? {})), remoteHash: hash(verified.content), revision: verified.revision_id, source: page.source, node: page.node, publishedAt: new Date().toISOString() };
     state.pendingLedger = true;
     await saveJson('receipt.json', state);

@@ -1,34 +1,66 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="800" viewBox="0 0 1120 800" role="img" aria-labelledby="title desc">
-  <title id="title">Mihomo Route Sentinel 已交付演进与建议迭代</title>
-  <desc id="desc">上方为已交付的v1.3选择质量、v1.4恢复时效、v1.5出口一致、v1.6快速恢复、v1.7负载可观测。下方为待Bear裁定的建议：A可靠性证据、B目标平台、C版本发布；不承诺顺序、版本号或日期。</desc>
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="720" viewBox="0 0 1120 720" role="img" aria-labelledby="title desc">
+  <title id="title">Mihomo Route Sentinel 当前交付与后续顺序</title>
+  <desc id="desc">截至2026-10-26，v1.8.0本地算法与文档已验证；真实故障恢复和长期观察待验收；日常证据、目标平台与正式发布尚未实施。后续顺序为受控验收、日常证据、跨平台与正式发布。</desc>
   <defs>
-    <marker id="blue-arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0L9 4.5L0 9Z" fill="#2563eb"/></marker>
-    <style>text{font-family:'Microsoft YaHei','Noto Sans CJK SC',sans-serif;fill:#172b4d}.title{font-size:34px;font-weight:700}.heading{font-size:27px;font-weight:700}.body{font-size:23px}.small{font-size:22px;fill:#52637b}.blue{fill:#2563eb}.teal{fill:#087e74}.orange{fill:#9a570c}</style>
+    <style>
+      text{font-family:'Microsoft YaHei','Noto Sans CJK SC',sans-serif;fill:#172b4d}
+      .title{font-size:34px;font-weight:700}.subtitle{font-size:21px;fill:#52637b}
+      .heading{font-size:25px;font-weight:700}.body{font-size:21px}.small{font-size:18px;fill:#52637b}
+      .green{fill:#087e74}.blue{fill:#2563eb}.orange{fill:#9a570c}
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0 0L10 5L0 10Z" fill="#7c8ca1"/>
+    </marker>
   </defs>
-  <rect width="1120" height="800" rx="24" fill="#f8fafc"/>
-  <text x="48" y="62" class="title">先解决“选得对”，再回答“恢复得怎样”</text>
-  <text x="48" y="104" class="body">已实现的能力，与尚未批准的计划分开阅读。</text>
-  <rect x="48" y="145" width="139" height="42" rx="21" fill="#eaf8f5"/>
-  <text x="117" y="174" text-anchor="middle" class="body teal">已交付</text>
-  <path d="M126 242H987" fill="none" stroke="#2563eb" stroke-width="3" marker-end="url(#blue-arrow)"/>
-  <g fill="#2563eb"><circle cx="146" cy="242" r="9"/><circle cx="353" cy="242" r="9"/><circle cx="560" cy="242" r="9"/><circle cx="767" cy="242" r="9"/><circle cx="974" cy="242" r="9"/></g>
-  <g text-anchor="middle">
-    <text x="146" y="220" class="heading blue">v1.3</text><text x="353" y="220" class="heading blue">v1.4</text><text x="560" y="220" class="heading blue">v1.5</text><text x="767" y="220" class="heading blue">v1.6</text><text x="974" y="220" class="heading blue">v1.7</text>
-    <text x="146" y="291" class="heading">选择质量</text><text x="353" y="291" class="heading">恢复时效</text><text x="560" y="291" class="heading">出口一致</text><text x="767" y="291" class="heading">快速恢复</text><text x="974" y="291" class="heading">负载可观测</text>
-    <text x="146" y="332" class="small">滚动退化</text><text x="146" y="364" class="small">严格与临时候选</text>
-    <text x="353" y="332" class="small">后台有界扫描</text><text x="353" y="364" class="small">正确计算选择次数</text>
-    <text x="560" y="332" class="small">固定可选叶子</text><text x="560" y="364" class="small">重新严格准入</text>
-    <text x="767" y="332" class="small">快照与并行复核</text><text x="767" y="364" class="small">标记应急身份</text>
-    <text x="974" y="332" class="small">控制探测负载</text><text x="974" y="364" class="small">请求量可解释</text>
+  <rect width="1120" height="720" rx="24" fill="#f8fafc"/>
+  <text x="48" y="60" class="title">当前交付与后续顺序</text>
+  <text x="48" y="94" class="subtitle">状态截至 2026-10-26 · 本地投用不等于正式 Release</text>
+
+  <g>
+    <rect x="48" y="126" width="312" height="42" rx="21" fill="#eaf8f5"/>
+    <text x="204" y="155" text-anchor="middle" class="body green">已验证</text>
+    <rect x="404" y="126" width="312" height="42" rx="21" fill="#edf4ff"/>
+    <text x="560" y="155" text-anchor="middle" class="body blue">待验收</text>
+    <rect x="760" y="126" width="312" height="42" rx="21" fill="#fff1df"/>
+    <text x="916" y="155" text-anchor="middle" class="body orange">未实施</text>
   </g>
-  <path d="M48 408H1072" stroke="#dce3ec" stroke-width="2"/>
-  <rect x="48" y="440" width="260" height="42" rx="21" fill="#fff1df"/>
-  <text x="178" y="469" text-anchor="middle" class="body orange">建议 · 待 Bear 裁定</text>
-  <rect x="48" y="515" width="320" height="188" rx="17" fill="#fff" stroke="#dce3ec" stroke-width="2"/>
-  <rect x="400" y="515" width="320" height="188" rx="17" fill="#fff" stroke="#dce3ec" stroke-width="2"/>
-  <rect x="752" y="515" width="320" height="188" rx="17" fill="#fff" stroke="#dce3ec" stroke-width="2"/>
-  <text x="72" y="556" class="heading blue">A · 可靠性证据</text><text x="72" y="599" class="body">先定义恢复事件口径</text><text x="72" y="636" class="body">再汇总真实故障样本</text><text x="72" y="677" class="small">结果：可评审的分布与失败</text>
-  <text x="424" y="556" class="heading blue">B · 目标平台</text><text x="424" y="599" class="body">选定 Linux 或 macOS</text><text x="424" y="636" class="body">完成生命周期实机验证</text><text x="424" y="677" class="small">结果：安装启停可重复</text>
-  <text x="776" y="556" class="heading blue">C · 版本发布</text><text x="776" y="599" class="body">明确已验证的发布范围</text><text x="776" y="636" class="body">补齐说明与回滚入口</text><text x="776" y="677" class="small">结果：新用户有可信入口</text>
-  <text x="560" y="755" text-anchor="middle" class="body orange">字母不是优先级：未承诺顺序、下一版本号或交付日期。</text>
+
+  <rect x="48" y="192" width="312" height="300" rx="18" fill="#ffffff" stroke="#b9ded8" stroke-width="2"/>
+  <rect x="404" y="192" width="312" height="300" rx="18" fill="#ffffff" stroke="#b8cdf2" stroke-width="2"/>
+  <rect x="760" y="192" width="312" height="300" rx="18" fill="#ffffff" stroke="#f0d5ad" stroke-width="2"/>
+
+  <text x="72" y="234" class="heading green">v1.8.0 本地投用</text>
+  <text x="72" y="276" class="body">四维状态契约</text>
+  <text x="72" y="312" class="body">逐节点扫描与预算分池</text>
+  <text x="72" y="348" class="body">文档结构与配置参考</text>
+  <text x="72" y="384" class="body">自动化与只读 Dry Run</text>
+  <text x="72" y="438" class="small">Git 尚无正式 Release</text>
+
+  <text x="428" y="234" class="heading blue">受控实机验收</text>
+  <text x="428" y="276" class="body">真实故障注入</text>
+  <text x="428" y="312" class="body">真实切换与恢复</text>
+  <text x="428" y="348" class="body">持续退化与失败观察</text>
+  <text x="428" y="384" class="body">长期稳定性证据</text>
+  <text x="428" y="438" class="small">短时成功不能替代验收</text>
+
+  <text x="784" y="234" class="heading orange">后续交付</text>
+  <text x="784" y="276" class="body">P1 日常可靠性证据</text>
+  <text x="784" y="312" class="body">P2 Linux / macOS 实机</text>
+  <text x="784" y="348" class="body">P2 正式版本与回滚</text>
+  <text x="784" y="384" class="body">长期统计与发布验收</text>
+  <text x="784" y="438" class="small">尚未自动创建或关闭任务</text>
+
+  <text x="48" y="550" class="heading">后续顺序</text>
+  <path d="M48 584H1072" fill="none" stroke="#c9d3df" stroke-width="3" marker-end="url(#arrow)"/>
+  <circle cx="120" cy="584" r="9" fill="#087e74"/>
+  <circle cx="410" cy="584" r="9" fill="#2563eb"/>
+  <circle cx="700" cy="584" r="9" fill="#9a570c"/>
+  <circle cx="990" cy="584" r="9" fill="#9a570c"/>
+  <g text-anchor="middle">
+    <text x="120" y="626" class="body green">算法完成</text>
+    <text x="410" y="626" class="body blue">受控验收</text>
+    <text x="700" y="626" class="body orange">日常证据</text>
+    <text x="990" y="626" class="body orange">平台与发布</text>
+  </g>
+  <text x="560" y="686" text-anchor="middle" class="small">顺序已确认；具体日期、下一版本号和正式发布范围仍待验收后决定。</text>
 </svg>

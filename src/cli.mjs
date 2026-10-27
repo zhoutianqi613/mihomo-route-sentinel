@@ -93,6 +93,7 @@ async function main() {
     }
     const controller = new MihomoController(config.controller);
     const snapshot = await buildStatusSnapshot({
+      probes: config.probes,
       stateFile: config.files.state,
       logFile: config.files.log,
       controller,

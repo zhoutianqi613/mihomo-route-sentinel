@@ -184,10 +184,10 @@ test('pending external admission is explicit in snapshot and formatted status', 
   const snapshot = await buildStatusSnapshot({ stateFile, logFile });
   assert.equal(snapshot.externalSelectionAdmission.to, 'manual-node');
   assert.equal(snapshot.externalSelectionAdmission.leaf, 'manual-leaf');
-  assert.ok(snapshot.warnings.includes('外部节点待准入/已拒绝，正在寻找合格候选'));
+  assert.ok(snapshot.warnings.includes('外部节点等待严格准入；健康结果独立展示'));
   assert.match(
     formatStatus(snapshot),
-    /外部节点准入\s+: 外部节点待准入\/已拒绝，正在寻找合格候选：manual-node/,
+    /外部节点准入\s+: 外部节点等待严格准入：manual-node/,
   );
 });
 
@@ -421,4 +421,77 @@ test('status exposes candidate snapshot freshness and emergency switch duration'
   assert.equal(snapshot.lastSwitch.decisionDurationMs, 420);
   assert.match(output, /候选快照\s+: 新鲜/);
   assert.match(output, /emergency-best-effort/);
+});
+
+test('当前健康与待准入独立展示，较新状态证据优先于历史拒绝日志', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'sentinel-four-state-'));
+  const stateFile = path.join(root, 'state.json');
+  const logFile = path.join(root, 'watchdog.ndjson');
+  await writeFile(stateFile, JSON.stringify({
+    currentSelection: 'node', currentLeaf: 'node', selectionAdmissionVersion: 1,
+    externalSelectionPendingAdmission: { to: 'node', leaf: 'node', source: 'baseline' },
+    lastEvaluation: { timestamp: '2026-10-26T10:00:01.000Z', selected: 'node', leaf: 'node',
+      successRate: 1, averageMs: 611, maxMs: 750, health: 'baseline-revalidation-rejected' },
+    lastDecision: { action: 'hold', reason: 'strict-admission-pending' },
+    switchHistory: [{ timestamp: new Date().toISOString(), budgetClass: 'optimization' }],
+  }));
+  await writeFile(logFile, `${JSON.stringify({
+    event: 'current-node-evaluated', timestamp: '2026-10-26T10:00:00.000Z',
+    selected: 'node', leaf: 'node', successRate: 0, averageMs: null, maxMs: null, health: 'hard-failure',
+  })}\n`);
+  const before = await readFile(stateFile, 'utf8');
+  const snapshot = await buildStatusSnapshot({ stateFile, logFile,
+    policy: { switchBudgetCount: 1, switchBudgetWindowSeconds: 600 } });
+  assert.equal(snapshot.probe.averageMs, 611);
+  assert.equal(snapshot.probe.health, 'healthy');
+  assert.equal(snapshot.decisionState.admission.profile, 'pending');
+  assert.equal(snapshot.decisionState.action.type, 'hold');
+  assert.equal(snapshot.decisionState.budget.optimization.used, 1);
+  assert.equal(snapshot.decisionState.budget.recovery.used, 0);
+  assert.equal(snapshot.decisionState.budget.rescue.used, 0);
+  const output = formatStatus(snapshot);
+  assert.match(output, /健康\/质量\s+: healthy \/ acceptable/);
+  assert.match(output, /当前准入\s+: 等待严格准入（pending），verified=false/);
+  assert.match(output, /优化预算\s+: 1\/1/);
+  assert.match(output, /恢复预算\s+: 0\/1/);
+  assert.match(output, /救援预算\s+: 0\/1/);
+  assert.equal(await readFile(stateFile, 'utf8'), before);
+});
+
+test('实时Controller出口变化时历史成功样本不能显示当前健康', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'sentinel-four-state-mismatch-'));
+  const stateFile = path.join(root, 'state.json');
+  const logFile = path.join(root, 'watchdog.ndjson');
+  await writeFile(stateFile, JSON.stringify({ currentSelection: 'old', currentLeaf: 'old',
+    selectionAdmission: { selection: 'old', leaf: 'old', profile: 'strict', verified: true },
+    lastEvaluation: { timestamp: '2026-10-26T10:00:00.000Z', selected: 'old', leaf: 'old',
+      successRate: 1, averageMs: 400, maxMs: 500, health: 'healthy' },
+  }));
+  await writeFile(logFile, '');
+  const controller = { async getProxy(name) {
+    return name === 'target' ? { now: 'live' } : { type: 'VLESS', name };
+  } };
+  const snapshot = await buildStatusSnapshot({ stateFile, logFile, controller, targetGroup: 'target' });
+  assert.equal(snapshot.current.selected, 'live');
+  assert.equal(snapshot.probe.health, 'unknown');
+  assert.equal(snapshot.probe.matchesCurrent, false);
+  assert.equal(snapshot.decisionState.admission.profile, 'pending');
+  const output = formatStatus(snapshot);
+  assert.match(output, /探测身份\s+: old \/ old（不能证明当前出口健康）/);
+  assert.doesNotMatch(output, /健康\/质量\s+: healthy/);
+});
+
+test('rescue可同时当前健康，但状态明确未验证并等待下一周期', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'sentinel-rescue-state-'));
+  const stateFile = path.join(root, 'state.json');
+  const logFile = path.join(root, 'watchdog.ndjson');
+  await writeFile(stateFile, JSON.stringify({ currentSelection: 'node', currentLeaf: 'node',
+    selectionAdmission: { selection: 'node', leaf: 'node', profile: 'rescue', verified: false },
+    lastEvaluation: { selected: 'node', leaf: 'node', successRate: 1, averageMs: 500, maxMs: 700 },
+  }));
+  await writeFile(logFile, '');
+  const snapshot = await buildStatusSnapshot({ stateFile, logFile });
+  assert.equal(snapshot.probe.health, 'healthy');
+  assert.equal(snapshot.decisionState.admission.profile, 'rescue');
+  assert.match(formatStatus(snapshot), /当前准入\s+: 应急接管（rescue），未严格验证，下一周期复核，verified=false/);
 });

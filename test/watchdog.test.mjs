@@ -472,7 +472,7 @@ test('Dry Run 只报告嵌套自动组纠正而不修改选择', async () => {
   assert.equal(selected, '自动选择');
 });
 
-test('legacy selection state is revalidated once and replaced when candidate admission fails', async (t) => {
+test('旧节点达到健康线但未达严格线时保持可用并等待严格准入', async (t) => {
   const mock = await startMockController({
     initialSelected: 'legacy-node',
     candidates: ['legacy-node', 'good-node'],
@@ -493,15 +493,17 @@ test('legacy selection state is revalidated once and replaced when candidate adm
   });
 
   const result = await watchdog.runOnce({ dryRun: false });
-  assert.equal(result.status, 'switched');
-  assert.deepEqual(mock.switches, ['good-node']);
+  assert.equal(result.status, 'usable-pending-admission');
+  assert.deepEqual(mock.switches, []);
   assert.equal(events.some((entry) => entry.event === 'external-selection-detected'), false);
   assert.equal(events.some((entry) => entry.event === 'baseline-revalidation'
     && entry.details.admitted === false), true);
   const state = JSON.parse(await readFile(config.files.state, 'utf8'));
-  assert.equal(state.currentSelection, 'good-node');
-  assert.equal(state.selectionAdmissionVersion, 1);
-  assert.equal(state.externalSelectionPendingAdmission, undefined);
+  assert.equal(state.currentSelection, 'legacy-node');
+  assert.equal(state.selectionAdmissionVersion, undefined);
+  assert.equal(state.externalSelectionPendingAdmission.to, 'legacy-node');
+  assert.equal(state.decisionState.health.status, 'healthy');
+  assert.equal(state.decisionState.admission.profile, 'usable');
   assert.equal(state.lastBaselineRevalidation.verified, false);
 });
 
@@ -532,7 +534,7 @@ test('legacy selection state records the admission version after strict baseline
   assert.equal(state.lastBaselineRevalidation.verified, true);
 });
 
-test('unadmitted external selection immediately scans and every select still uses beforeSwitch', async (t) => {
+test('外部可用但未严格准入仍遵守择优驻留，显式择优经过守卫', async (t) => {
   const mock = await startMockController({
     initialSelected: 'external-node',
     candidates: ['external-node', 'good-node'],
@@ -560,7 +562,11 @@ test('unadmitted external selection immediately scans and every select still use
     beforeSwitch: async () => { beforeSwitchCalls += 1; },
   });
 
-  const result = await watchdog.runOnce({ dryRun: false });
+  const held = await watchdog.runOnce({ dryRun: false });
+  assert.equal(held.status, 'minimum-dwell');
+  assert.deepEqual(mock.switches, []);
+  assert.equal(beforeSwitchCalls, 0);
+  const result = await watchdog.runOnce({ dryRun: false, forceScan: true });
   assert.equal(result.status, 'switched');
   assert.equal(mock.getSelected(), 'good-node');
   assert.deepEqual(mock.switches, ['good-node']);
@@ -568,7 +574,7 @@ test('unadmitted external selection immediately scans and every select still use
   assert.equal(events.some((entry) => entry.event === 'external-selection-validation-completed'
     && entry.details.admitted === false), true);
   assert.equal(events.some((entry) => entry.event === 'current-node-evaluated'
-    && entry.details.health === 'external-selection-rejected'), true);
+    && entry.details.health === 'healthy'), true);
   assert.equal(events.some((entry) => entry.event === 'node-switched'
     && entry.details.reason === 'external-selection-rejected'), true);
   const state = JSON.parse(await readFile(config.files.state, 'utf8'));
@@ -594,11 +600,11 @@ test('unadmitted external selection remains pending when no replacement is avail
 
   const first = await watchdog.runOnce({ dryRun: false });
   const second = await watchdog.runOnce({ dryRun: false });
-  assert.equal(first.status, 'no-candidate');
-  assert.equal(second.status, 'scan-backoff');
+  assert.equal(first.status, 'usable-pending-admission');
+  assert.equal(second.status, 'usable-pending-admission');
   assert.deepEqual(mock.switches, []);
   const state = JSON.parse(await readFile(config.files.state, 'utf8'));
-  assert.equal(state.currentSelection, 'old-node');
+  assert.equal(state.currentSelection, 'external-node');
   assert.equal(state.externalSelectionPendingAdmission.to, 'external-node');
   assert.equal(state.lastExternalSelection.verified, false);
 });
@@ -688,6 +694,7 @@ test('latency spike confirmation recovery does not switch immediately', async (t
     currentSelection: 'spike-node',
     currentLeaf: 'spike-node',
     selectionAdmissionVersion: 1,
+    selectionAdmission: { selection: 'spike-node', leaf: 'spike-node', profile: 'strict', verified: true },
     lastSwitchAt: new Date().toISOString(),
   }));
   const events = [];
@@ -731,6 +738,7 @@ test('confirmed latency spike bypasses ordinary latency cycles and minimum dwell
     currentSelection: 'spike-node',
     currentLeaf: 'spike-node',
     selectionAdmissionVersion: 1,
+    selectionAdmission: { selection: 'spike-node', leaf: 'spike-node', profile: 'strict', verified: true },
     lastSwitchAt: new Date().toISOString(),
   }));
   const events = [];
@@ -805,6 +813,8 @@ test('unsafe failed candidates are not reselected as fallback', async (t) => {
   assert.equal(state.lastSwitch.to, 'fallback-b');
   assert.equal(state.lastSwitch.reason, 'degraded-fallback');
   assert.equal(state.lastSwitch.verified, false);
+  assert.equal(state.decisionState.health.status, 'hard-failure');
+  assert.equal(state.decisionState.admission.profile, 'pending');
   assert.ok(Number.isFinite(Date.parse(state.lastSwitchAt)));
   assert.equal(state.quarantinedNodes['fallback-a'].reason, 'post-switch-verification-failed');
   assert.equal(state.quarantinedNodes['fallback-b'].reason, 'post-switch-verification-failed');
@@ -927,7 +937,7 @@ test('a provisional candidate does not prevent a later strict candidate from suc
   assert.deepEqual(mock.switches, ['provisional-node', 'strict-node']);
 });
 
-test('best current-stable provisional is restored without consuming switch budget', async (t) => {
+test('实际出口已恢复可用时不能借救援额度仅为换到更快的临时节点', async (t) => {
   const mock = await startMockController({
     candidates: ['bad-node', 'provisional-a', 'provisional-b'],
     delayResolver: ({ name, probeCount }) => {
@@ -950,14 +960,16 @@ test('best current-stable provisional is restored without consuming switch budge
   const result = await watchdog.runOnce({ dryRun: false });
 
   assert.equal(result.status, 'provisional-fallback');
-  assert.equal(mock.getSelected(), 'provisional-a');
-  assert.deepEqual(mock.switches, ['provisional-a', 'provisional-b', 'provisional-a']);
+  assert.equal(mock.getSelected(), 'provisional-b');
+  assert.deepEqual(mock.switches, ['provisional-a', 'provisional-b']);
   const state = JSON.parse(await readFile(config.files.state, 'utf8'));
-  assert.equal(state.switchHistory.at(-1).kind, 'provisional-recovery');
-  assert.equal(state.switchHistory.at(-1).budgetExempt, true);
+  assert.equal(state.switchHistory.at(-1).kind, 'candidate-attempt');
+  assert.equal(state.switchHistory.at(-1).budgetClass, 'recovery');
+  assert.equal(state.decisionState.budget.rescue.used, 0);
+  assert.equal(state.switchHistory.at(-1).budgetExempt, undefined);
 });
 
-test('an unverified degraded selection gets one audited recovery attempt despite exhausted budget', async (t) => {
+test('旧优化预算耗尽时未验证故障节点使用独立恢复预算', async (t) => {
   const mock = await startMockController();
   t.after(() => mock.server.close());
   const config = await makeConfig(mock.url);
@@ -984,10 +996,10 @@ test('an unverified degraded selection gets one audited recovery attempt despite
 
   assert.equal(result.status, 'switched');
   assert.equal(mock.getSelected(), 'good-node');
-  assert.equal(events.some((entry) => entry.event === 'degraded-recovery-budget-exempted'), true);
+  assert.equal(events.some((entry) => entry.event === 'degraded-recovery-budget-exempted'), false);
   const state = JSON.parse(await readFile(config.files.state, 'utf8'));
-  assert.equal(state.switchHistory.some((entry) => entry.kind === 'degraded-recovery'
-    && entry.budgetExempt === true), true);
+  assert.equal(state.switchHistory.some((entry) => entry.kind === 'candidate-attempt'
+    && entry.budgetClass === 'recovery'), true);
 });
 
 test('rolling intermittent latency degradation triggers optimization after healthy recovery', async (t) => {
@@ -1005,6 +1017,7 @@ test('rolling intermittent latency degradation triggers optimization after healt
     currentSelection: 'acceptable-node',
     currentLeaf: 'acceptable-node',
     selectionAdmissionVersion: 1,
+    selectionAdmission: { selection: 'acceptable-node', leaf: 'acceptable-node', profile: 'strict', verified: true },
     degradationWindow: [
       { degraded: true, status: 'latency-degraded' },
       { degraded: false, status: 'healthy' },
@@ -1203,7 +1216,7 @@ test('unhealthy recovery validates the ranked pool concurrently within one deadl
   assert.equal(validation.details.stable.length, 6);
 });
 
-test('strict validation remains independent and exposes full group probe load', async () => {
+test('严格复测仅覆盖候选短名单并记录逐节点探测负载', async () => {
   const config = await makeConfig('http://127.0.0.1:1');
   config.probes.urls = ['https://service-a.example/', 'https://service-b.example/'];
   config.probes.scanUrlCount = 2;
@@ -1222,19 +1235,22 @@ test('strict validation remains independent and exposes full group probe load', 
       groupCalls.push({ group, url });
       return new Map(members.map((node, index) => [node, 100 + index]));
     },
-    async getDelay() { throw new Error('严格快照复测不应调用 per-node delay'); },
+    async getDelay(node) {
+      assert.notEqual(node, 'current-node');
+      return 100 + members.indexOf(node);
+    },
   };
   const watchdog = new Watchdog({ controller, config, logger: async () => {} });
 
   const result = await watchdog.findCandidates('current-node');
 
-  assert.equal(groupCalls.length, 6);
+  assert.equal(groupCalls.length, 0);
   assert.equal(result.validated.length, 4);
   assert.equal(result.validated.every((entry) => entry.attempts === 4 && entry.successRate === 1), true);
-  assert.equal(result.probeStats.discovery.logicalAttempts, members.length * 2);
-  assert.equal(result.probeStats.validation.method, 'group-delay');
-  assert.equal(result.probeStats.validation.controllerRequests, 4);
-  assert.equal(result.probeStats.validation.logicalAttempts, members.length * 4);
+  assert.equal(result.probeStats.discovery.logicalAttempts, (members.length - 1) * 2);
+  assert.equal(result.probeStats.validation.method, 'per-node');
+  assert.equal(result.probeStats.validation.controllerRequests, 16);
+  assert.equal(result.probeStats.validation.logicalAttempts, 16);
 });
 
 test('post-switch verification probes the resolved leaf of a nested selector', async () => {
@@ -1323,7 +1339,7 @@ test('rollback verifies the actual leaf after a dynamic selector is restored', a
     && entry.details.leaf === 'leaf-new'), true);
 });
 
-test('each candidate selection consumes budget and degraded fallback cannot exceed it', async (t) => {
+test('每次故障选择消耗恢复预算且硬故障仅能多用一次安全出口', async (t) => {
   const mock = await startMockController({
     candidates: ['bad-node', 'candidate-a', 'candidate-b', 'candidate-c'],
     delayResolver: ({ name, probeCount }) => {
@@ -1347,20 +1363,22 @@ test('each candidate selection consumes budget and degraded fallback cannot exce
 
   const result = await watchdog.runOnce({ dryRun: false });
   assert.equal(result.status, 'degraded-fallback');
-  assert.deepEqual(mock.switches, ['candidate-a', 'candidate-b']);
-  assert.equal(mock.getSelected(), 'candidate-b');
+  assert.deepEqual(mock.switches, ['candidate-a', 'candidate-b', 'candidate-c']);
+  assert.equal(mock.getSelected(), 'candidate-c');
   const state = JSON.parse(await readFile(config.files.state, 'utf8'));
-  assert.equal(state.switchHistory.length, 2);
+  assert.equal(state.switchHistory.length, 3);
   assert.deepEqual(state.switchHistory.map((entry) => entry.kind), [
     'candidate-attempt',
     'candidate-attempt',
+    'candidate-attempt',
   ]);
-  assert.equal(state.lastSwitch.to, 'candidate-b');
+  assert.deepEqual(state.switchHistory.map((entry) => entry.budgetClass), ['recovery', 'recovery', 'rescue']);
+  assert.equal(state.lastSwitch.to, 'candidate-c');
   assert.equal(state.quarantinedNodes['candidate-b'].reason, 'post-switch-verification-failed');
   assert.equal(state.quarantinedNodes['candidate-a'].reason, 'post-switch-verification-failed');
-  assert.equal(state.quarantinedNodes['candidate-c'], undefined);
+  assert.equal(state.quarantinedNodes['candidate-c'].reason, 'post-switch-verification-failed');
   assert.equal(events.some((entry) => entry.event === 'switch-budget-exhausted'
-    && entry.details.blockedCandidate === 'candidate-c'), true);
+    && entry.details.blockedCandidate === 'candidate-c'), false);
   assert.equal(events.some((entry) => entry.event === 'fallback-selection-budget-exhausted'), false);
 });
 
@@ -1422,7 +1440,7 @@ test('candidate scan backoff suppresses repeated full scans after no candidate',
   assert.deepEqual(mock.switches, []);
 });
 
-test('switch budget blocks even hard-failure recovery before scanning', async (t) => {
+test('优化预算耗尽不能阻止硬故障扫描和恢复', async (t) => {
   const mock = await startMockController();
   t.after(() => mock.server.close());
   const config = await makeConfig(mock.url);
@@ -1439,10 +1457,13 @@ test('switch budget blocks even hard-failure recovery before scanning', async (t
   });
 
   const result = await watchdog.runOnce({ dryRun: false });
-  assert.equal(result.status, 'switch-budget-exhausted');
-  assert.deepEqual(mock.switches, []);
-  assert.equal(events.some((entry) => entry.event === 'candidate-scan-started'), false);
-  assert.equal(events.some((entry) => entry.event === 'switch-budget-exhausted'), true);
+  assert.equal(result.status, 'switched');
+  assert.deepEqual(mock.switches, ['good-node']);
+  assert.equal(events.some((entry) => entry.event === 'candidate-scan-started'), true);
+  assert.equal(events.some((entry) => entry.event === 'switch-budget-exhausted'), false);
+  const state = JSON.parse(await readFile(config.files.state, 'utf8'));
+  assert.equal(state.decisionState.budget.optimization.used, 3);
+  assert.equal(state.decisionState.budget.recovery.used, 1);
 });
 
 test('switch budget counts legacy strings but excludes structured recovery rollbacks', async (t) => {
@@ -1518,7 +1539,8 @@ test('candidate scan has a hard deadline even when every probe hangs', async () 
   const elapsedMs = performance.now() - startedAt;
 
   assert.ok(elapsedMs < 750, `扫描耗时 ${Math.round(elapsedMs)} ms`);
-  assert.equal(result.deadlineReached, true);
+  assert.equal(result.deadlineReached, false);
+  assert.equal(result.sampled.every((entry) => entry.successes === 0), true);
   assert.deepEqual(result.stable, []);
 });
 
@@ -1596,8 +1618,6 @@ test('后台切前门禁拒绝不占用实际切换次数', async (t) => {
     logger: async (level, event, details) => events.push({ level, event, details }),
   });
 
-  const started = await watchdog.runOnce({ dryRun: false, backgroundScan: true });
-  await started.backgroundWake;
   const decided = await watchdog.runOnce({ dryRun: false, backgroundScan: true });
 
   assert.equal(decided.status, 'emergency-fallback');
@@ -1719,8 +1739,6 @@ test('硬故障没有 100% 候选时在一秒内切到成功率最高节点', as
     logger: async (level, event, details) => events.push({ level, event, details }),
   });
 
-  const started = await watchdog.runOnce({ dryRun: false, backgroundScan: true });
-  await started.backgroundWake;
   const decisionStartedAt = performance.now();
   const decided = await watchdog.runOnce({ dryRun: false, backgroundScan: true });
   const decisionMs = performance.now() - decisionStartedAt;

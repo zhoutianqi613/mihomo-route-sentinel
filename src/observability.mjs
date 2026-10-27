@@ -1,5 +1,6 @@
 import { appendFile, mkdir, open, readFile, rename, stat, unlink } from 'node:fs/promises';
 import path from 'node:path';
+import { synchronizeDecisionState } from './decision-state.mjs';
 
 export const DEFAULT_LOGGING = Object.freeze({
   maxBytes: 5 * 1024 * 1024,
@@ -213,31 +214,7 @@ function activeQuarantines(entries) {
   });
 }
 
-function normalizePolicyState(state, policy = {}) {
-  const windowSeconds = policy.switchBudgetWindowSeconds ?? null;
-  const cutoff = windowSeconds === null ? null : Date.now() - (windowSeconds * 1000);
-  const timestampOf = (entry) => typeof entry === 'string' ? entry : entry?.timestamp;
-  const switchHistory = Array.isArray(state.switchHistory)
-    ? state.switchHistory.filter((entry) => {
-        const parsed = Date.parse(timestampOf(entry));
-        return Number.isFinite(parsed) && (cutoff === null || parsed > cutoff);
-      })
-    : [];
-  // 与核心策略一致：恢复性回滚用于审计，但不消耗切换预算；旧版字符串记录仍计入。
-  const budgetHistory = switchHistory.filter((entry) => (
-    typeof entry === 'string' || (entry.kind !== 'recovery-rollback' && entry.budgetExempt !== true)
-  ));
-  const used = state.switchesInWindow ?? budgetHistory.length;
-  const limit = state.switchBudgetLimit ?? policy.switchBudgetCount ?? null;
-  const exhausted = limit !== null && used >= limit;
-  const oldestBudgetTimestamp = budgetHistory
-    .map((entry) => Date.parse(timestampOf(entry)))
-    .filter(Number.isFinite)
-    .sort((left, right) => left - right)[0];
-  const derivedBlockedUntil = exhausted && windowSeconds !== null
-    && Number.isFinite(oldestBudgetTimestamp)
-    ? new Date(oldestBudgetTimestamp + (windowSeconds * 1000)).toISOString()
-    : null;
+function normalizePolicyState(state, budget) {
   const rawScanBackoff = state.scanBackoff ?? {
     until: state.candidateScanBackoffUntil ?? state.scanBackoffUntil ?? state.nextCandidateScanAt ?? null,
     failures: state.consecutiveEmptyScans ?? 0,
@@ -251,12 +228,8 @@ function normalizePolicyState(state, policy = {}) {
         ? rawScanBackoff.until
         : null,
     },
-    switchBudget: state.switchBudget ?? {
-      used,
-      limit,
-      windowSeconds,
-      blockedUntil: state.switchBudgetBlockedUntil ?? derivedBlockedUntil,
-    },
+    // 兼容既有读取者；四维预算是正式契约，此别名只代表优化额度。
+    switchBudget: { ...budget.optimization, limit: budget.optimization.count },
   };
 }
 
@@ -279,13 +252,20 @@ async function getLiveSelection(controller, targetGroup) {
   }
 }
 
-export async function buildStatusSnapshot({ stateFile, logFile, controller, targetGroup, policy, retainedFiles }) {
+export async function buildStatusSnapshot({ stateFile, logFile, controller, targetGroup, policy, probes, retainedFiles }) {
   const [{ state, warnings: stateWarnings }, { records, warnings: logWarnings }, live] = await Promise.all([
     readStateSafely(stateFile),
     readRecentNdjson(logFile, { retainedFiles }),
     getLiveSelection(controller, targetGroup),
   ]);
-  const evaluation = latestByEvent(records, 'current-node-evaluated');
+  const loggedEvaluation = latestByEvent(records, 'current-node-evaluated');
+  const savedEvaluation = state.lastEvaluation;
+  const savedTime = Date.parse(savedEvaluation?.timestamp ?? savedEvaluation?.at ?? '');
+  const loggedTime = Date.parse(loggedEvaluation?.timestamp ?? '');
+  const evaluation = savedEvaluation && (!loggedEvaluation
+    || (Number.isFinite(savedTime) && (!Number.isFinite(loggedTime) || savedTime >= loggedTime)))
+    ? { ...savedEvaluation, timestamp: savedEvaluation.timestamp ?? savedEvaluation.at }
+    : loggedEvaluation;
   const telemetry = telemetryForEvaluation(records, evaluation);
   const guardrail = latestByEvent(records, 'guardrail-evaluated');
   const processGuard = latestByEvent(records, 'clash-verge-process-guard-evaluated');
@@ -299,7 +279,20 @@ export async function buildStatusSnapshot({ stateFile, logFile, controller, targ
       };
   const warnings = [...stateWarnings, ...logWarnings];
   if (live?.error) warnings.push(live.error);
-  const policyState = normalizePolicyState(state, policy);
+  const selectionMismatch = live && !live.error && (
+    (state.currentSelection != null && state.currentSelection !== live.selected)
+    || (state.currentLeaf != null && state.currentLeaf !== live.leaf)
+    || (evaluation?.selected != null && evaluation.selected !== live.selected)
+    || (evaluation?.leaf != null && evaluation.leaf !== live.leaf)
+  );
+  const decisionState = synchronizeDecisionState(state, policy, {
+    selection: current.selected,
+    leaf: current.leaf,
+    evaluation,
+    selectionMismatch,
+    probes,
+  });
+  const policyState = normalizePolicyState(state, decisionState.budget);
   const candidateSnapshotAgeMs = Date.now() - Date.parse(state.candidateSnapshot?.at ?? '');
   const candidateSnapshot = state.candidateSnapshot
     ? {
@@ -326,20 +319,14 @@ export async function buildStatusSnapshot({ stateFile, logFile, controller, targ
         detectedAt: state.externalSelectionPendingAdmission.detectedAt ?? null,
       }
     : null;
-  if (live && !live.error) {
-    const selectionMismatch = state.currentSelection != null
-      && state.currentSelection !== live.selected;
-    const leafMismatch = state.currentLeaf != null
-      && state.currentLeaf !== live.leaf;
-    if (selectionMismatch || leafMismatch) {
-      warnings.push('控制器当前节点与守护程序同步状态不一致；可能存在外部手动切换或尚未完成的新周期');
-    }
+  if (selectionMismatch) {
+    warnings.push('控制器当前节点与守护程序同步状态不一致；历史探测不能证明当前出口健康，等待新周期复核');
   }
   if (current?.leaf && quarantinedNodes.some((entry) => entry.node === current.leaf)) {
     warnings.push('当前叶子节点仍在隔离列表中；后续周期应重新核验并修正状态');
   }
   if (externalSelectionAdmission) {
-    warnings.push('外部节点待准入/已拒绝，正在寻找合格候选');
+    warnings.push('外部节点等待严格准入；健康结果独立展示');
   }
   if (state.provisionalFallback) {
     warnings.push('当前节点尚未通过严格准入；服务会优先执行恢复性复测或切换');
@@ -366,14 +353,18 @@ export async function buildStatusSnapshot({ stateFile, logFile, controller, targ
     generatedAt: new Date().toISOString(),
     runtime: state.runtime ?? null,
     current,
+    decisionState,
     probe: evaluation ? {
       at: evaluation.timestamp ?? null,
+      selected: evaluation.selected ?? evaluation.selection ?? null,
+      leaf: evaluation.leaf ?? null,
+      matchesCurrent: decisionState.health.status !== 'unknown',
       successRate: evaluation.successRate ?? null,
       averageMs: evaluation.averageMs ?? null,
       maxMs: evaluation.maxMs ?? null,
       jitterMs: evaluation.jitterMs ?? null,
-      health: evaluation.health ?? null,
-      quality: evaluation.quality ?? null,
+      health: decisionState.health.status,
+      quality: decisionState.health.quality,
     } : null,
     telemetry: telemetry ? {
       at: telemetry.timestamp ?? null,
@@ -445,9 +436,10 @@ export function formatStatus(snapshot) {
   const backoff = snapshot.scanBackoff?.until
     ? `至 ${snapshot.scanBackoff.until}（原因 ${display(snapshot.scanBackoff.reason)}）`
     : '未启用';
-  const budget = snapshot.switchBudget?.limit !== null && snapshot.switchBudget?.limit !== undefined
-    ? `${display(snapshot.switchBudget.used, '')}/${snapshot.switchBudget.limit}，阻止至 ${display(snapshot.switchBudget.blockedUntil)}`
-    : '未配置或无记录';
+  const budgetText = (name) => {
+    const budget = snapshot.decisionState?.budget?.[name];
+    return budget ? `${budget.used}/${budget.count}，窗口 ${budget.windowSeconds} 秒，阻止至 ${display(budget.blockedUntil)}` : '尚无数据';
+  };
   const httpsTelemetry = snapshot.telemetry?.https;
   const websocketTelemetry = snapshot.telemetry?.websocket;
   const guardrailText = snapshot.guardrails
@@ -457,7 +449,7 @@ export function formatStatus(snapshot) {
     ? `${display(snapshot.processGuard.status)}，问题 ${snapshot.processGuard.issues.length}，修复 ${snapshot.processGuard.repairs.length}`
     : '尚无检查记录';
   const externalAdmissionText = snapshot.externalSelectionAdmission
-    ? `外部节点待准入/已拒绝，正在寻找合格候选：${display(snapshot.externalSelectionAdmission.to)}（叶子 ${display(snapshot.externalSelectionAdmission.leaf)}）`
+    ? `外部节点等待严格准入：${display(snapshot.externalSelectionAdmission.to)}（叶子 ${display(snapshot.externalSelectionAdmission.leaf)}）`
     : '无';
   const runtimeGuardText = snapshot.runtimeModeGuard
     ? `${display(snapshot.runtimeModeGuard.status)}，问题 ${snapshot.runtimeModeGuard.issues.length}，修复 ${snapshot.runtimeModeGuard.repairs.length}`
@@ -482,14 +474,25 @@ export function formatStatus(snapshot) {
   const provisionalText = snapshot.provisionalFallback
     ? `${display(snapshot.provisionalFallback.selection)}（${display(snapshot.provisionalFallback.profile)}，等待严格准入）`
     : '无';
+  const admission = snapshot.decisionState?.admission;
+  const admissionLabels = {
+    strict: '严格准入（strict）', usable: '健康线保活（usable），等待严格准入',
+    rescue: '应急接管（rescue），未严格验证，下一周期复核',
+    pending: '等待严格准入（pending）', unknown: '缺少准入证据（unknown）',
+  };
+  const admissionText = admission
+    ? `${admissionLabels[admission.profile] ?? admission.profile}，verified=${admission.verified}，${display(admission.reason)}`
+    : '尚无数据';
   const lines = [
     'Mihomo Route Sentinel 运行状态',
     `运行版本       : ${display(snapshot.runtime?.version)}（PID ${display(snapshot.runtime?.pid)}，启动 ${display(snapshot.runtime?.startedAt)}）`,
     `当前选择       : ${display(snapshot.current?.selected)}`,
     `当前叶子节点   : ${display(snapshot.current?.leaf)}（来源：${display(snapshot.current?.source)}）`,
     `最近探测       : ${display(snapshot.probe?.at)}`,
+    `探测身份       : ${display(snapshot.probe?.selected)} / ${display(snapshot.probe?.leaf)}${snapshot.probe && !snapshot.probe.matchesCurrent ? '（不能证明当前出口健康）' : ''}`,
     `探测结果       : 成功率 ${snapshot.probe?.successRate == null ? '-' : `${Math.round(snapshot.probe.successRate * 100)}%`}，平均 ${display(snapshot.probe?.averageMs, ' ms')}，最大 ${display(snapshot.probe?.maxMs, ' ms')}`,
     `健康/质量      : ${display(snapshot.probe?.health)} / ${display(snapshot.probe?.quality)}`,
+    `当前准入       : ${admissionText}`,
     `连续失败       : 总计 ${snapshot.consecutiveFailures.overall}，部分失败 ${snapshot.consecutiveFailures.partial}，延迟退化 ${snapshot.consecutiveFailures.latency}`,
     `滚动延迟退化   : ${snapshot.degradationWindow.failures}/${snapshot.degradationWindow.cycles}（触发 ${display(snapshot.degradationWindow.required)}/${display(snapshot.degradationWindow.size)}）`,
     `最近决策       : ${decisionText}`,
@@ -502,7 +505,9 @@ export function formatStatus(snapshot) {
     `最近代理组纠正 : ${normalizationText}`,
     `隔离节点       : ${quarantine}`,
     `扫描退避       : ${backoff}`,
-    `切换预算       : ${budget}`,
+    `优化预算       : ${budgetText('optimization')}`,
+    `恢复预算       : ${budgetText('recovery')}`,
+    `救援预算       : ${budgetText('rescue')}`,
     `HTTPS 真实链路 : ${httpsTelemetry ? `网络 ${httpsTelemetry.networkOk ? '成功' : '失败'}，HTTP ${display(httpsTelemetry.statusCode)}，代理 TCP ${display(httpsTelemetry.connectMs, ' ms')}，CONNECT ${display(httpsTelemetry.tunnelMs, ' ms')}，TLS ${display(httpsTelemetry.tlsMs, ' ms')}，TTFB ${display(httpsTelemetry.ttfbMs, ' ms')}` : '尚无数据'}`,
     `WebSocket 链路 : ${websocketTelemetry ? `网络 ${websocketTelemetry.networkOk ? '成功' : '失败'}，升级 ${websocketTelemetry.websocketOk ? '成功' : '未成功'}，HTTP ${display(websocketTelemetry.statusCode)}，代理 TCP ${display(websocketTelemetry.connectMs, ' ms')}，CONNECT ${display(websocketTelemetry.tunnelMs, ' ms')}，TLS ${display(websocketTelemetry.tlsMs, ' ms')}，TTFB ${display(websocketTelemetry.ttfbMs, ' ms')}` : '尚无数据'}`,
     `配置守卫       : ${guardrailText}`,
