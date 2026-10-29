@@ -50,10 +50,10 @@ async function fixture(t, { probe = (node) => node === 'current' ? null : 300,
       if (name === 'candidates') return { type: 'URLTest', all: ['current', 'candidate'] };
       return { type: 'Shadowsocks' };
     },
-    async getDelay(node, url) {
+    async getDelay(node, url, timeoutMs) {
       const count = (counts.get(node) ?? 0) + 1;
       counts.set(node, count);
-      const value = await probe(node, url, count, switches);
+      const value = await probe(node, url, count, switches, timeoutMs);
       if (value === null) throw new Error('模拟不可达');
       return value;
     },
@@ -78,6 +78,55 @@ test('P0：择优预算耗尽后仍可使用独立恢复预算', async (t) => {
   assert.equal(state.decisionState.budget.optimization.used, 3);
   assert.equal(state.decisionState.budget.recovery.used, 1);
   assert.equal(state.decisionState.budget.rescue.used, 0);
+});
+
+test('扩展恢复使用与当前节点相同的单目标超时，不将慢速可达出口判成零响应', async (t) => {
+  const f = await fixture(t, { probe: (node, url, count, switches, timeoutMs) => {
+    if (node === 'current' || timeoutMs < 95) return null;
+    return 80;
+  } });
+  f.config.probes.preSwitchValidationDeadlineMs = 80;
+  f.config.policy.emergencySwitchDeadlineMs = 20;
+
+  const result = await f.create().runOnce({ dryRun: false, backgroundScan: true });
+
+  assert.equal(result.status, 'emergency-fallback');
+  assert.equal(result.verificationSource, 'live-recovery-validation');
+  assert.deepEqual(f.switches, ['candidate']);
+  assert.equal((await f.readState()).lastSwitch.verified, false);
+});
+
+test('测速成功但实际链路失败时允许完整可达的备选恢复，不套用延迟择优门槛', async (t) => {
+  const f = await fixture(t, { probe: (node) => node === 'current' ? 300 : 700,
+    state: { degradationWindow: Array.from({ length: 3 }, () => ({
+      at: new Date().toISOString(), degraded: true, status: 'latency-degraded',
+    })) } });
+
+  const result = await f.create().runOnce({ dryRun: false, backgroundScan: true,
+    linkTelemetry: { enabled: true, https: { networkOk: false }, websocket: { networkOk: false } } });
+
+  assert.equal(result.status, 'emergency-fallback');
+  assert.deepEqual(f.switches, ['candidate']);
+  const state = await f.readState();
+  assert.equal(state.lastSwitch.verified, false);
+  assert.equal(state.decisionState.budget.recovery.used, 1);
+  assert.equal(state.provisionalFallback.requiresStrictAdmission, true);
+});
+
+test('鉴权拒绝但网络可达时不作为链路故障放宽恢复条件', async (t) => {
+  const f = await fixture(t, { probe: (node) => node === 'current' ? 300 : 700 });
+  await f.create().runOnce({ dryRun: false, backgroundScan: true,
+    linkTelemetry: { enabled: true,
+      https: { networkOk: true, statusCode: 403 }, websocket: { networkOk: true, statusCode: 401 } } });
+  assert.deepEqual(f.switches, []);
+});
+
+test('实际链路失败时也不能接管仅部分目标可达且不优于当前的候选', async (t) => {
+  const f = await fixture(t, { probe: (node, url) => node === 'current' ? 300
+    : (url === urls[1] ? null : 100) });
+  await f.create().runOnce({ dryRun: false, backgroundScan: true,
+    linkTelemetry: { enabled: true, https: { networkOk: false }, websocket: { networkOk: false } } });
+  assert.deepEqual(f.switches, []);
 });
 
 function unresponsiveSnapshot() {

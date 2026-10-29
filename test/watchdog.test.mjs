@@ -1960,7 +1960,10 @@ for (const scenario of [
     });
     const startedAt = performance.now();
     const result = await watchdog.runOnce({ dryRun: false, backgroundScan: true });
-    assert.ok(performance.now() - startedAt < 1000, '快速与恢复复核必须有界');
+    const recoveryBudgetMs = Math.max(config.probes.preSwitchValidationDeadlineMs,
+      config.probes.timeoutMs * urls.length);
+    assert.ok(performance.now() - startedAt < config.policy.emergencySwitchDeadlineMs + recoveryBudgetMs + 500,
+      '快速与完整单目标超时的恢复复核必须有界');
     assert.ok(events.some((entry) => entry.event === 'emergency-fast-path-exhausted'));
     const state = JSON.parse(await readFile(config.files.state, 'utf8'));
     if (scenario.successRate > 0) {

@@ -1443,7 +1443,8 @@ export class Watchdog {
       });
     }
     const provisionalCandidateNames = new Set(provisionalCandidates.map((entry) => entry.node));
-    const meaningfulImprovementRequired = (!selectionAdmissionRejected || health.stable) && candidates.length > 0
+    const meaningfulImprovementRequired = !availabilityRecoveryRequired
+      && (!selectionAdmissionRejected || health.stable) && candidates.length > 0
       && (health.status === 'latency-degraded' || rollingDegradationTriggered
         || optimizationDue || (forceScan && health.stable));
     if (meaningfulImprovementRequired) {
@@ -1515,14 +1516,22 @@ export class Watchdog {
       const resultByNode = new Map(preSwitchResults.map((entry) => [entry.node, entry]));
 
       if (emergencyRecovery) {
+        // 真实链路失败与 URLTest 延迟属于不同证据；完整可达的备选可作有预算的待验证恢复，
+        // 不要求先比网络已失败的旧出口再快 200ms。部分可达仍须满足原有相对改善规则。
+        const isRecoveryImprovement = (entry) => isAvailabilityImprovement(entry, current, this.config.policy)
+          || (linkFailures.length > 0 && entry.successRate === 1
+            && hasCompleteProbeRounds(entry, this.config.probes.urls, 1));
         let ranked = preSwitchResults
-          .filter((entry) => isAvailabilityImprovement(entry, current, this.config.policy))
+          .filter(isRecoveryImprovement)
           .sort(compareAvailability);
         let verificationSource = 'live-fast-validation';
         if (ranked.length === 0 || ranked[0].successRate < 1) {
           // 快速窗口是恢复目标，不能成为拒绝较慢但可用出口的永久门槛。
           // 重新采集完整一轮业务样本，不将不同截止窗口的样本混合计算成功率。
-          const recoveryDeadlineMs = this.config.probes.preSwitchValidationDeadlineMs;
+          // 当前节点每目标可等待 timeoutMs；恢复候选也须获得同等机会，不能把3秒均分为
+          // 两个1.5秒请求，再将截止导致的缺失与当前5秒窗口的成功率直接比较。
+          const recoveryDeadlineMs = Math.max(this.config.probes.preSwitchValidationDeadlineMs,
+            this.config.probes.timeoutMs * this.config.probes.urls.length);
           setDecision('validate', 'emergency-recovery-validation', { deadlineMs: recoveryDeadlineMs });
           await persistState();
           await this.log('warn', 'emergency-fast-path-exhausted', {
@@ -1530,23 +1539,23 @@ export class Watchdog {
             successfulCandidates: preSwitchResults.filter((entry) => entry.successes > 0).length,
             decisionDurationMs: Date.now() - decisionStartedAt,
             recoveryDeadlineMs,
+            perTargetTimeoutMs: this.config.probes.timeoutMs,
           });
           preSwitchResults = await this.probeCandidatesInParallel(
             candidates.map((entry) => entry.node),
             1,
             this.config.probes.urls,
             Date.now() + recoveryDeadlineMs,
-            { timeoutMs: Math.min(this.config.probes.timeoutMs,
-              Math.floor(recoveryDeadlineMs / this.config.probes.urls.length)) },
+            { timeoutMs: this.config.probes.timeoutMs },
           );
           ranked = preSwitchResults
-            .filter((entry) => isAvailabilityImprovement(entry, current, this.config.policy))
+            .filter(isRecoveryImprovement)
             .sort(compareAvailability);
           verificationSource = 'live-recovery-validation';
         }
         const emergencyCandidate = ranked[0];
         for (const result of preSwitchResults) {
-          if (isAvailabilityImprovement(result, current, this.config.policy)
+          if (isRecoveryImprovement(result)
               || result.node === emergencyCandidate?.node) continue;
           await this.log('warn', 'candidate-pre-switch-rejected', {
             node: result.node,
@@ -1561,6 +1570,7 @@ export class Watchdog {
           candidates = [];
           await this.log('error', 'emergency-fallback-unavailable', {
             currentSuccessRate: current.successRate,
+            linkFailures,
             checkedCandidates: preSwitchResults.length,
             decisionDurationMs: Date.now() - decisionStartedAt,
           });
@@ -1605,6 +1615,7 @@ export class Watchdog {
             verified: false,
             source: 'sentinel',
             verificationSource,
+            linkFailures,
             decisionDurationMs,
             deadlineMet: decisionDurationMs <= decisionDeadlineMs,
           };

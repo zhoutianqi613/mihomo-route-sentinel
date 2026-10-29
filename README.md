@@ -322,7 +322,7 @@ HTTP Controller 使用 secret 时，只配置环境变量名称：
 |---|---:|---|
 | `probes.discoveryTimeoutMs` | `1200` | 前台快速发现的单目标超时；后台发现取本值与 `timeoutMs` 的较大值，保留慢速可达出口。 |
 | `probes.scanDeadlineMs` | `3000` | 前台候选扫描硬截止，最大 3000 ms；后台使用独立计算的截止预算。 |
-| `probes.preSwitchValidationDeadlineMs` | `3000` | 常规切前复测总截止，最大 3000 ms；也用于紧急路径的扩展复核窗口。 |
+| `probes.preSwitchValidationDeadlineMs` | `3000` | 常规切前复测总截止，最大3000ms；紧急扩展复核至少保留本值，并为一轮全部目标提供完整单目标超时。 |
 | `probes.scanRounds` | `1` | 初筛每个候选的探测轮数。 |
 | `probes.scanUrlCount` | `2` | 初筛使用 `urls` 前 N 个地址；默认同时覆盖 ChatGPT 与 OpenAI API，降低单目标偶然值误导排序的概率。 |
 | `probes.validationRounds` | `2` | 严格验证轮数；实际至少采两轮，兼容值为1的旧配置也不能降低严格证据要求。 |
