@@ -142,6 +142,17 @@ async function main() {
       throw new Error('--status/--status-json 不能与 --run、--apply 或 --force-scan 同时使用');
     }
     const controller = new MihomoController(config.controller);
+    // 状态页只读取锁文件判断实例存活，绝不能占用锁或清理他实例锁。
+    const lock = await readLock(config.files.lock);
+    const lockPresent = lock !== null
+      || await access(config.files.lock).then(() => true, () => false);
+    const instance = {
+      lockPresent,
+      pid: Number.isInteger(lock?.pid) && lock.pid > 0 ? lock.pid : null,
+      alive: lock !== null && Number.isInteger(lock?.pid) && lock.pid > 0
+        ? await isPidAlive(lock.pid)
+        : false,
+    };
     const snapshot = await buildStatusSnapshot({
       probes: config.probes,
       stateFile: config.files.state,
@@ -150,6 +161,9 @@ async function main() {
       targetGroup: config.groups.target,
       policy: config.policy,
       retainedFiles: config.logging.retainedFiles,
+      instance,
+      programVersion: packageMetadata.version,
+      intervalSeconds: config.policy.intervalSeconds,
     });
     console.log(options.statusJson ? JSON.stringify(snapshot, null, 2) : formatStatus(snapshot));
     return;

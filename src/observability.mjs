@@ -252,13 +252,26 @@ async function getLiveSelection(controller, targetGroup) {
   }
 }
 
-export async function buildStatusSnapshot({ stateFile, logFile, controller, targetGroup, policy, probes, retainedFiles }) {
+export async function buildStatusSnapshot({
+  stateFile,
+  logFile,
+  controller,
+  targetGroup,
+  policy,
+  probes,
+  retainedFiles,
+  instance = null,
+  programVersion = null,
+  intervalSeconds = null,
+}) {
   const [{ state, warnings: stateWarnings }, { records, warnings: logWarnings }, live] = await Promise.all([
     readStateSafely(stateFile),
     readRecentNdjson(logFile, { retainedFiles }),
     getLiveSelection(controller, targetGroup),
   ]);
   const loggedEvaluation = latestByEvent(records, 'current-node-evaluated');
+  // 状态文件缺失 runtime 时回退到最近一次启动日志，避免状态页把旧进程信息显示成未知。
+  const runtime = state.runtime ?? latestByEvent(records, 'watchdog-started')?.runtime ?? null;
   const savedEvaluation = state.lastEvaluation;
   const savedTime = Date.parse(savedEvaluation?.timestamp ?? savedEvaluation?.at ?? '');
   const loggedTime = Date.parse(loggedEvaluation?.timestamp ?? '');
@@ -279,6 +292,21 @@ export async function buildStatusSnapshot({ stateFile, logFile, controller, targ
       };
   const warnings = [...stateWarnings, ...logWarnings];
   if (live?.error) warnings.push(live.error);
+  if (instance && (!instance.lockPresent || !instance.alive)) {
+    warnings.push('无运行实例（以下为上次运行记录）');
+  }
+  if (runtime?.version && programVersion && runtime.version !== programVersion) {
+    warnings.push(`后台运行 ${runtime.version} ≠ 当前程序 ${programVersion}，任务可能仍加载旧代码`);
+  }
+  const evaluationTimestamp = Date.parse(evaluation?.timestamp ?? '');
+  if (!evaluation) {
+    warnings.push('无评估数据：状态与日志均没有最近一次节点评估记录');
+  } else if (!Number.isFinite(evaluationTimestamp)) {
+    warnings.push('数据已过期：最近评估缺少可解析的时间');
+  } else if (Number.isFinite(intervalSeconds) && intervalSeconds > 0
+      && Date.now() - evaluationTimestamp > intervalSeconds * 2 * 1000) {
+    warnings.push(`数据已过期：最近评估已超过 ${intervalSeconds * 2} 秒（2×检查间隔），可能不是当前实例写入`);
+  }
   const selectionMismatch = live && !live.error && (
     (state.currentSelection != null && state.currentSelection !== live.selected)
     || (state.currentLeaf != null && state.currentLeaf !== live.leaf)
@@ -351,7 +379,8 @@ export async function buildStatusSnapshot({ stateFile, logFile, controller, targ
   }
   return {
     generatedAt: new Date().toISOString(),
-    runtime: state.runtime ?? null,
+    instance,
+    runtime,
     current,
     decisionState,
     probe: evaluation ? {
@@ -483,7 +512,11 @@ export function formatStatus(snapshot) {
   const admissionText = admission
     ? `${admissionLabels[admission.profile] ?? admission.profile}，verified=${admission.verified}，${display(admission.reason)}`
     : '尚无数据';
-  const lines = [
+  const lines = [];
+  if (snapshot.instance && (!snapshot.instance.lockPresent || !snapshot.instance.alive)) {
+    lines.push('无运行实例（以下为上次运行记录）');
+  }
+  lines.push(
     'Mihomo Route Sentinel 运行状态',
     `运行版本       : ${display(snapshot.runtime?.version)}（PID ${display(snapshot.runtime?.pid)}，启动 ${display(snapshot.runtime?.startedAt)}）`,
     `当前选择       : ${display(snapshot.current?.selected)}`,
@@ -515,7 +548,7 @@ export function formatStatus(snapshot) {
     `外部节点准入   : ${externalAdmissionText}`,
     `运行模式守卫   : ${runtimeGuardText}`,
     `日志路径       : ${snapshot.files.log}`,
-  ];
+  );
   if (snapshot.warnings.length) lines.push(`警告           : ${snapshot.warnings.join('；')}`);
   return lines.join('\n');
 }
