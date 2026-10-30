@@ -776,7 +776,7 @@ export class Watchdog {
       synchronizeDecisionState(state, this.config.policy, { probes: this.config.probes });
       if (!dryRun) await saveState(this.config.files.state, state);
     };
-    const recordEvaluation = (result, evaluatedHealth, selected, leaf, linkFailures = []) => {
+    const recordEvaluation = (result, evaluatedHealth, selected, leaf, linkFailures = [], linkEvidence = {}) => {
       state.lastEvaluation = {
         timestamp: new Date().toISOString(), selected, leaf,
         successRate: result.successRate,
@@ -785,6 +785,9 @@ export class Watchdog {
         health: evaluatedHealth.status, quality: evaluatedHealth.quality,
         stable: evaluatedHealth.stable,
         linkFailures,
+        linkOutcomes: Array.isArray(linkEvidence.linkOutcomes) ? linkEvidence.linkOutcomes : [],
+        businessAnnotations: Array.isArray(linkEvidence.businessAnnotations)
+          ? linkEvidence.businessAnnotations : [],
       };
     };
     const recordAdmission = (profile, selection, leaf) => {
@@ -1015,9 +1018,29 @@ export class Watchdog {
         }
       }
     }
-    const linkFailures = linkTelemetry?.enabled === true
+    // 证据分层：网络可达性仍决定健康/恢复语义；业务结果（outcome/statusCode）只做记录与解释，
+    // 既不改变健康判定，也不触发切换。无凭据探针无法证明业务可用，不能据此误判为不可用。
+    const linkOutcomes = linkTelemetry?.enabled === true
+      ? ['https', 'websocket'].flatMap((kind) => {
+          const metric = linkTelemetry[kind];
+          if (!metric || typeof metric !== 'object') return [];
+          return [{
+            kind,
+            networkOk: metric.networkOk === true,
+            outcome: typeof metric.outcome === 'string' ? metric.outcome : null,
+            statusCode: Number.isFinite(metric.statusCode) ? metric.statusCode : null,
+          }];
+        })
+      : [];
+    // networkFailures 保持原语义：仅网络不可达（networkOk === false）。
+    const networkFailures = linkTelemetry?.enabled === true
       ? ['https', 'websocket'].filter((kind) => linkTelemetry[kind]?.networkOk === false)
       : [];
+    const linkFailures = networkFailures;
+    // businessAnnotations 只记录“网络可达但业务结果非 accepted/upgraded”的证据，不参与判定。
+    const businessAnnotations = linkOutcomes
+      .filter((entry) => entry.networkOk && !['accepted', 'upgraded'].includes(entry.outcome))
+      .map(({ kind, outcome, statusCode }) => ({ kind, outcome, statusCode }));
     const applyLinkHealth = (probeHealth) => {
       if (linkFailures.length === 0 || requiresImmediateResponse(probeHealth)) return probeHealth;
       return {
@@ -1032,7 +1055,10 @@ export class Watchdog {
     state.currentLeaf = currentLeaf;
     let availabilityRecoveryRequired = current.successRate < 1 || requiresImmediateResponse(health)
       || linkFailures.length > 0;
-    recordEvaluation(current, health, previousSelection, currentLeaf, linkFailures);
+    recordEvaluation(current, health, previousSelection, currentLeaf, linkFailures, {
+      linkOutcomes,
+      businessAnnotations,
+    });
     if (selectionAdmissionRejected && health.stable) {
       state.lastOptimizationScanAt ??= new Date().toISOString();
     }
@@ -1046,6 +1072,7 @@ export class Watchdog {
       averageMs: Number.isFinite(current.averageMs) ? Math.round(current.averageMs) : null,
       maxMs: Number.isFinite(current.maxMs) ? current.maxMs : null,
       linkFailures,
+      linkOutcomes,
       selectionSource: pendingAdmission ? (baselineRevalidation ? 'baseline' : 'external') : 'accepted',
       strictAdmission: Boolean(pendingAdmission),
     });
@@ -1177,7 +1204,10 @@ export class Watchdog {
       health = confirmedHealth;
       availabilityRecoveryRequired = current.successRate < 1 || requiresImmediateResponse(health)
         || linkFailures.length > 0;
-      recordEvaluation(current, health, previousSelection, currentLeaf, linkFailures);
+      recordEvaluation(current, health, previousSelection, currentLeaf, linkFailures, {
+        linkOutcomes,
+        businessAnnotations,
+      });
       await this.log(health.stable ? 'info' : 'warn', 'current-node-evaluated', {
         selected: previousSelection,
         leaf: currentLeaf,
@@ -1188,6 +1218,7 @@ export class Watchdog {
         averageMs: Number.isFinite(current.averageMs) ? Math.round(current.averageMs) : null,
         maxMs: Number.isFinite(current.maxMs) ? current.maxMs : null,
         linkFailures,
+        linkOutcomes,
         selectionSource: 'immediate-confirmation',
         strictAdmission: false,
       });
