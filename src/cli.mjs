@@ -16,6 +16,16 @@ import { Watchdog } from './watchdog.mjs';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
+// 退出码契约：单次运行按结果返回；--run 持续模式不因单轮结果退出。
+const EXIT_CODES = Object.freeze({
+  OK: 0,
+  UNEXPECTED: 1,
+  GUARDRAIL_BLOCKED: 2,
+  CONTROLLER_UNREACHABLE: 3,
+  CONFIG_ERROR: 4,
+});
+const CONTROLLER_UNREACHABLE_CODES = new Set(['ECONNREFUSED', 'ENOENT', 'ETIMEDOUT', 'ENOTFOUND']);
+
 function parseArgs(argv) {
   const options = {
     config: path.join(projectRoot, 'config.json'),
@@ -59,7 +69,13 @@ function printHelp() {
   --quiet       仅写入日志文件
   --status      输出可读运行状态，不启动守护进程
   --status-json 输出 JSON 运行状态，不启动守护进程
-  --stop        向正在运行的实例发送 SIGTERM，并等待锁文件释放（最多 5 秒）`);
+  --stop        向正在运行的实例发送 SIGTERM，并等待锁文件释放（最多 5 秒）
+
+退出码:
+  0  完成真实探测且未被阻断
+  2  配置/守卫阻断（would-repair / blocked）
+  3  Controller 不可达（ECONNREFUSED / ENOENT / ETIMEDOUT / ENOTFOUND）
+  4  配置错误（占位组名、非法 JSON 或字段等）`);
 }
 
 // 守卫原因码的中文提示；只用于 Dry Run 被阻断时给出可执行下一步。
@@ -102,6 +118,21 @@ function printGuardrailGuidance(guardrail, { configPath, dryRun }) {
   console.error('处理方式（二选一）：');
   console.error('  1. 人工修正后重试：按上面的原因修复 Mihomo/Clash Verge（例如把运行模式改为 rule/global、关闭 DNS 覆写或启动客户端），再执行同一命令。');
   console.error(`  2. 临时关闭守卫完成只读验证：在 ${configPath} 中设置 "guardrails": { "enabled": false }，验证后恢复为 true。`);
+  const exitCode = guardrailExitCode(guardrail);
+  console.error(`退出码：${exitCode}（${exitCode === EXIT_CODES.CONTROLLER_UNREACHABLE ? 'Controller 不可达' : '配置/守卫阻断'}）。`);
+}
+
+function guardrailExitCode(guardrail) {
+  return guardrailReasonCodes(guardrail).includes('controller-unreachable')
+    ? EXIT_CODES.CONTROLLER_UNREACHABLE
+    : EXIT_CODES.GUARDRAIL_BLOCKED;
+}
+
+function classifyErrorExitCode(error) {
+  if (Number.isInteger(error?.exitCode)) return error.exitCode;
+  if (CONTROLLER_UNREACHABLE_CODES.has(error?.code)) return EXIT_CODES.CONTROLLER_UNREACHABLE;
+  if (error?.code === 'GUARDRAIL_BLOCKED') return EXIT_CODES.GUARDRAIL_BLOCKED;
+  return EXIT_CODES.UNEXPECTED;
 }
 
 async function isPidAlive(pid) {
@@ -174,7 +205,13 @@ async function main() {
     pid: process.pid,
     startedAt: new Date().toISOString(),
   };
-  const config = await loadConfig(options.config);
+  let config;
+  try {
+    config = await loadConfig(options.config);
+  } catch (error) {
+    if (error && typeof error === 'object') error.exitCode = EXIT_CODES.CONFIG_ERROR;
+    throw error;
+  }
   if (options.stop) {
     await stopRunningInstance(config.files.lock);
     return;
@@ -312,6 +349,8 @@ async function main() {
 
   let currentCycle = null;
   let shuttingDown = false;
+  // 单次运行最终的退出码；--run 持续模式不使用该值。
+  let oneShotExitCode = EXIT_CODES.OK;
   // 生命周期中止信号：先停止启动新周期，再等待当前周期收尾后释放锁。
   const shutdownController = new AbortController();
   let lockReleased = false;
@@ -383,6 +422,7 @@ async function main() {
                 dryRun: !options.apply,
               });
             }
+            if (!options.run) oneShotExitCode = guardrailExitCode(guardrail);
           } else {
             let linkTelemetry = null;
             if (config.telemetry?.enabled) {
@@ -421,7 +461,10 @@ async function main() {
           } else {
             await logger('error', 'watchdog-cycle-failed', { error: error.message });
           }
-          if (!options.run) throw error;
+          if (!options.run) {
+            if (error && typeof error === 'object') error.exitCode ??= classifyErrorExitCode(error);
+            throw error;
+          }
         }
       })();
       try {
@@ -448,9 +491,16 @@ async function main() {
     if (runtimeGuardTimer) clearInterval(runtimeGuardTimer);
     if (!shuttingDown) await releaseLockOnce();
   }
+  return oneShotExitCode;
 }
 
-main().catch((error) => {
-  console.error(error.stack ?? error.message);
-  process.exitCode = 1;
+main().then((code) => {
+  if (Number.isInteger(code)) process.exitCode = code;
+}).catch((error) => {
+  const exitCode = classifyErrorExitCode(error);
+  // 已分类的业务/配置错误只打印一行原因；未知错误保留堆栈便于排查。
+  console.error(exitCode === EXIT_CODES.UNEXPECTED
+    ? (error?.stack ?? error?.message ?? String(error))
+    : (error?.message ?? String(error)));
+  process.exitCode = exitCode;
 });

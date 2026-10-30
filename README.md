@@ -84,6 +84,15 @@ node .\src\cli.mjs --config .\config.json --force-scan
 | `would-repair` / `blocked`（无探测结果） | 配置守卫要求先修复；按 1.3 的两条路径处理，Dry Run 不会自动修复或切换。 |
 | 保持当前节点或退避 | 尚无合格候选时可能是正确行为；结合状态中的原因判断。 |
 
+**退出码：** 单次运行按结果返回退出码；`--run` 持续模式不因单轮结果退出。`--status` 与 `--stop` 正常完成返回 0。
+
+| 退出码 | 含义 |
+|---|---|
+| 0 | 完成真实探测且未被阻断 |
+| 2 | 配置/守卫阻断（would-repair / blocked） |
+| 3 | Controller 不可达（ECONNREFUSED / ENOENT / ETIMEDOUT / ENOTFOUND） |
+| 4 | 配置错误（占位组名、非法 JSON 或字段等） |
+
 ## 02 日常操作与人工接管
 
 ### 2.1 持续观察
