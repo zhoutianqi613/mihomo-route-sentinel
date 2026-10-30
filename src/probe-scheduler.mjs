@@ -18,24 +18,33 @@ export async function mapLimit(items, limit, worker) {
   return results;
 }
 
-export async function waitUntil(promise, deadlineAt, message) {
-  const remainingMs = Math.max(0, deadlineAt - Date.now());
+export async function waitUntil(promise, deadlineAt, message, clock = null) {
+  const now = typeof clock?.now === 'function' ? clock.now : Date.now;
+  const schedule = typeof clock?.setTimeout === 'function' ? clock.setTimeout : setTimeout;
+  const cancelTimer = typeof clock?.clearTimeout === 'function' ? clock.clearTimeout : clearTimeout;
+  const remainingMs = Math.max(0, deadlineAt - now());
   return await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(Object.assign(new Error(message), { code: 'SCAN_DEADLINE' })), remainingMs);
+    const timer = schedule(() => reject(Object.assign(new Error(message), { code: 'SCAN_DEADLINE' })), remainingMs);
     promise.then(
       (value) => {
-        clearTimeout(timer);
+        cancelTimer(timer);
         resolve(value);
       },
       (error) => {
-        clearTimeout(timer);
+        cancelTimer(timer);
         reject(error);
       },
     );
   });
 }
 
-export function createProbeScheduler({ controller, config, logger } = {}) {
+export function createProbeScheduler({ controller, config, logger, clock } = {}) {
+  const probeClock = {
+    now: typeof clock?.now === 'function' ? clock.now : Date.now,
+    setTimeout: typeof clock?.setTimeout === 'function' ? clock.setTimeout : setTimeout,
+    clearTimeout: typeof clock?.clearTimeout === 'function' ? clock.clearTimeout : clearTimeout,
+  };
+  const now = () => probeClock.now();
   const nodeProbeTails = new Map();
   const activeNodeProbes = new Map();
   let activeCandidateRequests = 0;
@@ -71,7 +80,7 @@ export function createProbeScheduler({ controller, config, logger } = {}) {
     let active;
     let releaseCapacity = () => {};
     try {
-      await waitUntil(ready, deadlineAt, '节点探测等待超过截止时间');
+      await waitUntil(ready, deadlineAt, '节点探测等待超过截止时间', probeClock);
       active = { background, cancel };
       activeNodeProbes.set(node, active);
       if (candidate) {
@@ -82,13 +91,13 @@ export function createProbeScheduler({ controller, config, logger } = {}) {
           candidateCapacityWaiters.add(wake);
           try {
             await waitUntil(Promise.race([capacityReady, cancellation]), deadlineAt,
-              '候选探测等待容量超过截止时间');
+              '候选探测等待容量超过截止时间', probeClock);
           } finally {
             candidateCapacityWaiters.delete(wake);
           }
         }
       }
-      if (abortController.signal.aborted || Date.now() >= deadlineAt) {
+      if (abortController.signal.aborted || now() >= deadlineAt) {
         throw Object.assign(new Error('节点探测超过截止时间'), { code: 'SCAN_DEADLINE' });
       }
       if (candidate) {
@@ -100,7 +109,7 @@ export function createProbeScheduler({ controller, config, logger } = {}) {
       }
       onStart();
       request = Promise.resolve().then(() => controller.getDelay(
-        node, url, Math.max(1, Math.min(timeoutMs, deadlineAt - Date.now())),
+        node, url, Math.max(1, Math.min(timeoutMs, deadlineAt - now())),
         { signal: abortController.signal },
       ));
       void request.then(onComplete, onComplete).finally(() => {
@@ -109,7 +118,7 @@ export function createProbeScheduler({ controller, config, logger } = {}) {
         release();
       });
       return await waitUntil(
-        Promise.race([request, cancellation]), deadlineAt, '节点探测超过截止时间',
+        Promise.race([request, cancellation]), deadlineAt, '节点探测超过截止时间', probeClock,
       );
     } finally {
       signal?.removeEventListener('abort', cancel);
@@ -128,7 +137,7 @@ export function createProbeScheduler({ controller, config, logger } = {}) {
       for (const url of urls) {
         try {
           const delay = await scheduler.requestNodeDelay(
-            node, url, timeoutMs, Date.now() + timeoutMs,
+            node, url, timeoutMs, now() + timeoutMs,
           );
           samples.push({ round, url, ok: true, delay });
         } catch (error) {
@@ -156,16 +165,16 @@ export function createProbeScheduler({ controller, config, logger } = {}) {
       const nodeSamples = [];
       for (let round = 1; round <= rounds; round += 1) {
         for (const url of urls) {
-          if (Date.now() >= deadlineAt || signal?.aborted) {
+          if (now() >= deadlineAt || signal?.aborted) {
             nodeSamples.push({ node, round, url, ok: false,
               error: signal?.aborted ? 'PROBE_CANCELLED' : 'SCAN_DEADLINE' });
             continue;
           }
-          const remainingMs = Math.max(1, deadlineAt - Date.now());
+          const remainingMs = Math.max(1, deadlineAt - now());
           const effectiveTimeoutMs = Math.max(1, Math.min(timeoutMs, remainingMs));
           try {
             const delay = await scheduler.requestNodeDelay(
-              node, url, effectiveTimeoutMs, Math.min(deadlineAt, Date.now() + effectiveTimeoutMs),
+              node, url, effectiveTimeoutMs, Math.min(deadlineAt, now() + effectiveTimeoutMs),
               { background, candidate: true, signal,
                 onStart: () => {
                   active += 1;
@@ -177,7 +186,7 @@ export function createProbeScheduler({ controller, config, logger } = {}) {
             );
             nodeSamples.push({ node, round, url, ok: true, delay });
           } catch (error) {
-            const deadlineReached = Date.now() >= deadlineAt;
+            const deadlineReached = now() >= deadlineAt;
             nodeSamples.push({
               node,
               round,

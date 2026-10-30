@@ -137,12 +137,12 @@ export function explainRoundStability(result, thresholds) {
   };
 }
 
-export function recordDegradation(state, health, policy) {
+export function recordDegradation(state, health, policy, now = Date.now()) {
   const windowSize = policy.degradationWindowCycles ?? 10;
   const degraded = health.status === 'latency-degraded' || health.status === 'latency-spike';
   state.degradationWindow = [
     ...(Array.isArray(state.degradationWindow) ? state.degradationWindow : []),
-    { at: new Date().toISOString(), degraded, status: health.status },
+    { at: new Date(now).toISOString(), degraded, status: health.status },
   ].slice(-windowSize);
   const failures = state.degradationWindow.filter((entry) => entry.degraded).length;
   return {
@@ -176,9 +176,8 @@ export function requiresImmediateResponse(health) {
   return health.status === 'hard-failure' || health.status === 'latency-spike';
 }
 
-export function getActiveQuarantines(state) {
+export function getActiveQuarantines(state, now = Date.now()) {
   state.quarantinedNodes ??= {};
-  const now = Date.now();
   for (const [node, entry] of Object.entries(state.quarantinedNodes)) {
     if (!entry?.until || Date.parse(entry.until) <= now) delete state.quarantinedNodes[node];
   }
@@ -187,20 +186,20 @@ export function getActiveQuarantines(state) {
 
 // kind 记录隔离原因分层：quality（切前质量不达标，短冷却）、verify（切后验证失败）、
 // cooldown（成功切换后的旧出口冷却）、network（真实网络失败，默认）。
-export function quarantineNode(state, node, seconds, reason, kind = 'network') {
+export function quarantineNode(state, node, seconds, reason, kind = 'network', now = Date.now()) {
   if (!node || seconds <= 0) return;
   state.quarantinedNodes ??= {};
   state.quarantinedNodes[node] = {
-    until: new Date(Date.now() + (seconds * 1000)).toISOString(),
+    until: new Date(now + (seconds * 1000)).toISOString(),
     reason,
     kind,
   };
 }
 
-export function activateCandidateScanBackoff(state, policy, reason) {
+export function activateCandidateScanBackoff(state, policy, reason, now = Date.now()) {
   const seconds = policy.candidateScanBackoffSeconds ?? 120;
   if (seconds <= 0) return;
-  state.candidateScanBackoffUntil = new Date(Date.now() + (seconds * 1000)).toISOString();
+  state.candidateScanBackoffUntil = new Date(now + (seconds * 1000)).toISOString();
   state.lastCandidateScanOutcome = reason;
 }
 

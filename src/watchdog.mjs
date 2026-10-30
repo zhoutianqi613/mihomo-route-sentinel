@@ -20,12 +20,28 @@ import {
   requiresImmediateResponse,
   summarizeSamples,
 } from './health-policy.mjs';
-import { createProbeScheduler, mapLimit, sleep, waitUntil } from './probe-scheduler.mjs';
+import { createProbeScheduler, mapLimit, waitUntil } from './probe-scheduler.mjs';
 
 const GROUP_TYPES = new Set(['Selector', 'URLTest', 'Fallback', 'LoadBalance']);
 const SELECTION_ADMISSION_VERSION = 1;
 const SWITCH_GUARD_TIMEOUT = Symbol('switch-guard-timeout');
 const DEFAULT_GUARD_TIMEOUT_MS = 3000;
+
+/** 可注入时钟：默认真实墙钟；测试可传入 fake clock 以推进时间而不真实等待。 */
+const DEFAULT_CLOCK = Object.freeze({
+  now: () => Date.now(),
+  nowIso: () => new Date().toISOString(),
+  sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+});
+
+// 健康策略函数本身不持有时钟；watchdog 调用时把同一时钟的 now 作为可选参数传入。
+function quarantineNodeAt(clock, state, node, seconds, reason, kind = 'network') {
+  return quarantineNode(state, node, seconds, reason, kind, clock.now());
+}
+
+function activateCandidateScanBackoffAt(clock, state, policy, reason) {
+  return activateCandidateScanBackoff(state, policy, reason, clock.now());
+}
 
 /**
  * 把一次多轮探测按 samples[].round 还原成逐轮健康结论。
@@ -68,6 +84,7 @@ export class Watchdog {
     onSwitchEnd = () => {},
     guardTimeoutMs = DEFAULT_GUARD_TIMEOUT_MS,
     runtime = null,
+    clock = DEFAULT_CLOCK,
   }) {
     this.controller = controller;
     this.config = config;
@@ -80,8 +97,9 @@ export class Watchdog {
       ? Math.trunc(guardTimeoutMs)
       : DEFAULT_GUARD_TIMEOUT_MS;
     this.runtime = runtime;
+    this.clock = { ...DEFAULT_CLOCK, ...(clock ?? {}) };
     this.activeCandidateScan = null;
-    this.probes = createProbeScheduler({ controller, config, logger: this.log });
+    this.probes = createProbeScheduler({ controller, config, logger: this.log, clock: this.clock });
     // 节点锁与真实在途容量由 probe-scheduler 实例持有；保留原方法名与签名。
     this.requestNodeDelay = (...args) => this.probes.requestNodeDelay(...args);
   }
@@ -177,7 +195,7 @@ export class Watchdog {
       leaf,
       reason,
       recovery,
-      startedAt: new Date().toISOString(),
+      startedAt: this.clock.nowIso(),
       completed: false,
       invalidated: false,
       result: null,
@@ -188,7 +206,7 @@ export class Watchdog {
       allowProvisionalRecovery, background: true, signal: abortController.signal,
     })
       .then((result) => {
-        result.completedAt ??= new Date().toISOString();
+        result.completedAt ??= this.clock.nowIso();
         scan.result = result;
         scan.completedAt = result.completedAt;
         scan.completed = true;
@@ -238,7 +256,7 @@ export class Watchdog {
     const strictNames = new Set(search.stable.map((entry) => entry.node));
     const provisionalNames = new Set((search.provisional ?? []).map((entry) => entry.node));
     return {
-      at: search.completedAt ?? new Date().toISOString(),
+      at: search.completedAt ?? this.clock.nowIso(),
       selection,
       leaf,
       durationMs: search.durationMs,
@@ -257,7 +275,7 @@ export class Watchdog {
 
   searchFromCandidateSnapshot(snapshot, selection, leaf) {
     if (!snapshot || snapshot.selection !== selection || snapshot.leaf !== leaf) return null;
-    const ageMs = Date.now() - Date.parse(snapshot.at ?? '');
+    const ageMs = this.clock.now() - Date.parse(snapshot.at ?? '');
     if (!Number.isFinite(ageMs)
         || ageMs > this.config.policy.candidateSnapshotMaxAgeSeconds * 1000) return null;
     const inflate = (entry) => ({
@@ -318,7 +336,7 @@ export class Watchdog {
     background = false,
     signal,
   } = {}) {
-    const startedAt = Date.now();
+    const startedAt = this.clock.now();
     // 组级 delay 会隐式探测当前节点，无法与健康检查逐节点互斥。
     // 仅探测候选池，确保每个节点的轮次与业务目标始终串行。
     const results = await this.probeCandidatesInParallel(
@@ -334,7 +352,7 @@ export class Watchdog {
     }
     await this.log('info', event, {
       method: probeStats.method,
-      durationMs: Date.now() - startedAt,
+      durationMs: this.clock.now() - startedAt,
       candidateCount: candidates.length,
       responsiveCount: results.filter((result) => result.successes > 0).length,
       failureReasons,
@@ -346,13 +364,14 @@ export class Watchdog {
   async findCandidates(currentLeaf, excludedNodes = new Set(), {
     allowProvisionalRecovery = false, background = false, signal,
   } = {}) {
-    const scanStartedAt = Date.now();
+    const scanStartedAt = this.clock.now();
     let deadlineMs = this.config.probes.scanDeadlineMs;
     let deadlineAt = scanStartedAt + deadlineMs;
     const source = await waitUntil(
       this.controller.getProxy(this.config.groups.candidates),
       deadlineAt,
       '候选组读取超过扫描截止时间',
+      this.clock,
     );
     if (!Array.isArray(source.all) || source.all.length === 0) {
       await this.log('error', 'candidate-source-empty', { group: this.config.groups.candidates });
@@ -362,7 +381,7 @@ export class Watchdog {
         sampled: [],
         validated: [],
         rejected: [],
-        durationMs: Date.now() - scanStartedAt,
+        durationMs: this.clock.now() - scanStartedAt,
         deadlineMs: this.config.probes.scanDeadlineMs,
         deadlineReached: false,
       };
@@ -454,9 +473,9 @@ export class Watchdog {
         discovery: quickResults.probeStats ?? null,
         validation: validationProbeStats,
       },
-      durationMs: Date.now() - scanStartedAt,
+      durationMs: this.clock.now() - scanStartedAt,
       deadlineMs,
-      deadlineReached: Date.now() >= deadlineAt,
+      deadlineReached: this.clock.now() >= deadlineAt,
     });
     return {
       stable,
@@ -468,9 +487,9 @@ export class Watchdog {
         discovery: quickResults.probeStats ?? null,
         validation: validationProbeStats,
       },
-      durationMs: Date.now() - scanStartedAt,
+      durationMs: this.clock.now() - scanStartedAt,
       deadlineMs,
-      deadlineReached: Date.now() >= deadlineAt,
+      deadlineReached: this.clock.now() >= deadlineAt,
     };
   }
 
@@ -495,15 +514,15 @@ export class Watchdog {
     if (!this.activeCandidateScan && state.candidateScan?.status === 'running') delete state.candidateScan;
     if (this.runtime) state.runtime = this.runtime;
     const setDecision = (action, reason, details = {}) => {
-      state.lastDecision = { at: new Date().toISOString(), action, reason, ...details };
+      state.lastDecision = { at: this.clock.nowIso(), action, reason, ...details };
     };
     const persistState = async () => {
-      synchronizeDecisionState(state, this.config.policy, { probes: this.config.probes });
+      synchronizeDecisionState(state, this.config.policy, { probes: this.config.probes, now: this.clock.now() });
       if (!dryRun) await saveState(this.config.files.state, state);
     };
     const recordEvaluation = (result, evaluatedHealth, selected, leaf, linkFailures = [], linkEvidence = {}) => {
       state.lastEvaluation = {
-        timestamp: new Date().toISOString(), selected, leaf,
+        timestamp: this.clock.nowIso(), selected, leaf,
         successRate: result.successRate,
         averageMs: Number.isFinite(result.averageMs) ? result.averageMs : null,
         maxMs: Number.isFinite(result.maxMs) ? result.maxMs : null,
@@ -517,7 +536,7 @@ export class Watchdog {
     };
     const recordAdmission = (profile, selection, leaf) => {
       state.selectionAdmission = {
-        profile, selection, leaf, at: new Date().toISOString(),
+        profile, selection, leaf, at: this.clock.nowIso(),
         verified: profile === 'strict', requiresStrictAdmission: profile !== 'strict',
       };
     };
@@ -527,7 +546,7 @@ export class Watchdog {
     const nestedSelection = previousSelection !== currentLeaf;
     const nestedLeafSelectable = Array.isArray(target.all) && target.all.includes(currentLeaf);
     const nestedNormalizationRequired = nestedSelection && nestedLeafSelectable;
-    getActiveQuarantines(state);
+    getActiveQuarantines(state, this.clock.now());
     const acceptedSelection = state.currentSelection ?? null;
     const acceptedLeaf = state.currentLeaf ?? null;
     const baselineRevalidationRequired = Boolean(acceptedSelection || acceptedLeaf)
@@ -546,7 +565,7 @@ export class Watchdog {
         fromLeaf: acceptedLeaf,
         to: previousSelection,
         leaf: currentLeaf,
-        detectedAt: new Date().toISOString(),
+        detectedAt: this.clock.nowIso(),
         source: 'external',
       };
       await this.log('warn', 'external-selection-detected', {
@@ -585,7 +604,7 @@ export class Watchdog {
         fromLeaf: acceptedLeaf,
         to: previousSelection,
         leaf: currentLeaf,
-        detectedAt: new Date().toISOString(),
+        detectedAt: this.clock.nowIso(),
         source: 'baseline',
       };
     }
@@ -623,7 +642,7 @@ export class Watchdog {
         if (normalizedTarget.now !== currentLeaf || normalizedLeaf !== currentLeaf) {
           throw new Error(`嵌套代理组规范化失败：期望 ${currentLeaf}，实际 ${normalizedTarget.now}`);
         }
-        const normalizedAt = new Date().toISOString();
+        const normalizedAt = this.clock.nowIso();
         state.currentSelection = currentLeaf;
         state.currentLeaf = currentLeaf;
         recordAdmission('pending', currentLeaf, currentLeaf);
@@ -669,7 +688,7 @@ export class Watchdog {
       );
       const admitted = hasStrictAdmissionEvidence(current, this.config.probes, this.candidateThresholds());
       const admissionRecord = {
-        at: new Date().toISOString(),
+        at: this.clock.nowIso(),
         from: pendingAdmission.from,
         fromLeaf: pendingAdmission.fromLeaf,
         to: previousSelection,
@@ -702,7 +721,7 @@ export class Watchdog {
         delete state.externalSelectionPendingAdmission;
         delete state.provisionalFallback;
         state.degradationWindow = [];
-        state.lastOptimizationScanAt = new Date().toISOString();
+        state.lastOptimizationScanAt = this.clock.nowIso();
         if (state.lastSwitch?.to === previousSelection && state.lastSwitch.verified === false) {
           state.lastSwitch = {
             ...state.lastSwitch,
@@ -734,7 +753,7 @@ export class Watchdog {
           provisionalReason: state.lastSwitch.reason,
           reason: 'strict-admission-recovered',
           verified: true,
-          strictlyAdmittedAt: state.lastHealthyAt ?? new Date().toISOString(),
+          strictlyAdmittedAt: state.lastHealthyAt ?? this.clock.nowIso(),
         };
       }
       delete state.quarantinedNodes[currentLeaf];
@@ -750,7 +769,7 @@ export class Watchdog {
             previousSelection, currentLeaf);
           state.externalSelectionPendingAdmission = {
             to: previousSelection, leaf: currentLeaf, source: 'baseline',
-            detectedAt: new Date().toISOString(),
+            detectedAt: this.clock.nowIso(),
           };
         }
       }
@@ -804,7 +823,7 @@ export class Watchdog {
       businessAnnotations,
     });
     if (selectionAdmissionRejected && health.stable) {
-      state.lastOptimizationScanAt ??= new Date().toISOString();
+      state.lastOptimizationScanAt ??= this.clock.nowIso();
     }
     await this.log(health.stable ? 'info' : 'warn', 'current-node-evaluated', {
       selected: previousSelection,
@@ -839,7 +858,7 @@ export class Watchdog {
       delete state.candidateScan;
     }
 
-    const degradation = recordDegradation(state, health, this.config.policy);
+    const degradation = recordDegradation(state, health, this.config.policy, this.clock.now());
     const optimizationIntervalMs = (this.config.policy.optimizationIntervalSeconds ?? 0) * 1000;
     const lastOptimizationScanAt = Date.parse(state.lastOptimizationScanAt ?? '');
     const optimizationDue = health.stable
@@ -847,7 +866,7 @@ export class Watchdog {
       && (!pendingAdmission || state.selectionAdmission?.profile === 'usable')
       && optimizationIntervalMs > 0
       && (!Number.isFinite(lastOptimizationScanAt)
-        || Date.now() - lastOptimizationScanAt >= optimizationIntervalMs);
+        || this.clock.now() - lastOptimizationScanAt >= optimizationIntervalMs);
     const rollingDegradationTriggered = degradation.triggered
       && (health.stable || health.status === 'latency-degraded');
     let scanReason = selectionAdmissionRejected
@@ -879,7 +898,7 @@ export class Watchdog {
         this.activeCandidateScan = null;
         delete state.candidateScan;
       }
-      const snapshotAgeMs = Date.now() - Date.parse(state.candidateSnapshot?.at ?? '');
+      const snapshotAgeMs = this.clock.now() - Date.parse(state.candidateSnapshot?.at ?? '');
       const snapshotMatches = state.candidateSnapshot?.selection === previousSelection
         && state.candidateSnapshot?.leaf === currentLeaf;
       const refreshDue = !snapshotMatches || !Number.isFinite(snapshotAgeMs)
@@ -888,7 +907,7 @@ export class Watchdog {
         const scan = this.startBackgroundCandidateScan({
           selection: previousSelection,
           leaf: currentLeaf,
-          excludedNodes: getActiveQuarantines(state),
+          excludedNodes: getActiveQuarantines(state, this.clock.now()),
           allowProvisionalRecovery: true,
           reason: 'candidate-snapshot-refresh',
           recovery: false,
@@ -914,7 +933,7 @@ export class Watchdog {
       state.consecutiveFailures = 0;
       state.consecutivePartialFailures = 0;
       state.consecutiveLatencyFailures = 0;
-      state.lastHealthyAt = new Date().toISOString();
+      state.lastHealthyAt = this.clock.nowIso();
       clearCandidateScanBackoff(state);
       setDecision('hold', selectionAdmissionRejected ? 'strict-admission-pending' : 'healthy');
       await persistState();
@@ -936,7 +955,7 @@ export class Watchdog {
         this.config.probes.timeoutMs,
         this.config.probes.confirmTimeoutMs,
       );
-      await sleep(this.config.policy.hardFailureConfirmSeconds * 1000);
+      await this.clock.sleep(this.config.policy.hardFailureConfirmSeconds * 1000);
       const confirmation = await this.probeNode(
         currentLeaf, confirmRounds, this.config.probes.urls, { timeoutMs: confirmTimeoutMs },
       );
@@ -1003,7 +1022,7 @@ export class Watchdog {
         state.consecutiveFailures = 0;
         state.consecutivePartialFailures = 0;
         state.consecutiveLatencyFailures = 0;
-        state.lastHealthyAt = new Date().toISOString();
+        state.lastHealthyAt = this.clock.nowIso();
         clearCandidateScanBackoff(state);
         setDecision('hold', selectionAdmissionRejected ? 'strict-admission-pending' : 'transient-recovered');
         await persistState();
@@ -1055,7 +1074,7 @@ export class Watchdog {
       };
     }
 
-    const elapsedSinceSwitch = state.lastSwitchAt ? Date.now() - Date.parse(state.lastSwitchAt) : Infinity;
+    const elapsedSinceSwitch = state.lastSwitchAt ? this.clock.now() - Date.parse(state.lastSwitchAt) : Infinity;
     const minimumDwellMs = this.config.policy.minimumDwellSeconds * 1000;
     const latencyOnlyScan = health.status === 'latency-degraded'
       || rollingDegradationTriggered || optimizationDue;
@@ -1103,13 +1122,13 @@ export class Watchdog {
       && state.lastCandidateScanOutcome !== 'upstream-outage';
     if (!forceScan && !externalChangeDetected && !baselineRevalidationStarted
       && !hardFailureMayBypassBackoff
-      && Number.isFinite(scanBackoffUntil) && scanBackoffUntil > Date.now()) {
+      && Number.isFinite(scanBackoffUntil) && scanBackoffUntil > this.clock.now()) {
       setDecision('hold', 'candidate-scan-backoff-active', {
-        remainingSeconds: Math.ceil((scanBackoffUntil - Date.now()) / 1000),
+        remainingSeconds: Math.ceil((scanBackoffUntil - this.clock.now()) / 1000),
       });
       await persistState();
       await this.log('warn', 'candidate-scan-backoff-active', {
-        remainingSeconds: Math.ceil((scanBackoffUntil - Date.now()) / 1000),
+        remainingSeconds: Math.ceil((scanBackoffUntil - this.clock.now()) / 1000),
         previousOutcome: state.lastCandidateScanOutcome ?? null,
       });
       return {
@@ -1119,9 +1138,9 @@ export class Watchdog {
       };
     }
 
-    if (optimizationDue) state.lastOptimizationScanAt = new Date().toISOString();
+    if (optimizationDue) state.lastOptimizationScanAt = this.clock.nowIso();
     setDecision('scan', scanReason);
-    let quarantined = getActiveQuarantines(state);
+    let quarantined = getActiveQuarantines(state, this.clock.now());
     const allowProvisionalRecovery = !health.stable;
     if (requiresImmediateResponse(health) && quarantined.size > 0) {
       await this.log('warn', 'quarantine-bypassed-for-immediate-failure', {
@@ -1220,7 +1239,7 @@ export class Watchdog {
     if (!this.activeCandidateScan || this.activeCandidateScan.completed
         || this.activeCandidateScan.invalidated) delete state.candidateScan;
     state.lastCandidateScan = {
-      at: search.completedAt ?? new Date().toISOString(),
+      at: search.completedAt ?? this.clock.nowIso(),
       reason: scanReason,
       source: search.source ?? 'live-scan',
       ageMs: search.ageMs ?? 0,
@@ -1239,7 +1258,7 @@ export class Watchdog {
 
     const upstreamOutage = await this.detectUpstreamOutage(currentLeaf, current, search.sampled);
     if (upstreamOutage) {
-      activateCandidateScanBackoff(state, this.config.policy, 'upstream-outage');
+      activateCandidateScanBackoffAt(this.clock, state, this.config.policy, 'upstream-outage');
       setDecision('hold', 'upstream-outage');
       await persistState();
       await this.log('error', 'upstream-outage-detected', {
@@ -1275,7 +1294,7 @@ export class Watchdog {
       );
       candidates = candidates.filter((candidate) => candidate.averageMs <= current.averageMs - improvement);
       if (candidates.length === 0) {
-        activateCandidateScanBackoff(state, this.config.policy, 'no-meaningful-improvement');
+        activateCandidateScanBackoffAt(this.clock, state, this.config.policy, 'no-meaningful-improvement');
         setDecision('hold', 'no-meaningful-improvement', {
           requiredImprovementMs: Math.round(improvement),
         });
@@ -1309,7 +1328,7 @@ export class Watchdog {
 
     let candidate = candidates[0];
     if (!candidate) {
-      activateCandidateScanBackoff(state, this.config.policy, 'no-stable-candidate');
+      activateCandidateScanBackoffAt(this.clock, state, this.config.policy, 'no-stable-candidate');
       setDecision('hold', 'no-stable-candidate');
       await persistState();
       await this.log(health.stable ? 'info' : 'warn', 'no-stable-candidate', {});
@@ -1323,7 +1342,7 @@ export class Watchdog {
 
     let preSwitchValidationIncomplete = false;
     if (backgroundScan && candidates.length > 0) {
-      const decisionStartedAt = Date.now();
+      const decisionStartedAt = this.clock.now();
       const preSwitchRounds = emergencyRecovery ? 1 : Math.max(2, this.config.probes.validationRounds);
       // 普通复核也要容纳逐节点串行样本及并发批次，不能把未采完当作节点失败。
       const normalValidationDeadlineMs = Math.max(this.config.probes.preSwitchValidationDeadlineMs,
@@ -1373,7 +1392,7 @@ export class Watchdog {
           await this.log('warn', 'emergency-fast-path-exhausted', {
             checkedCandidates: preSwitchResults.length,
             successfulCandidates: preSwitchResults.filter((entry) => entry.successes > 0).length,
-            decisionDurationMs: Date.now() - decisionStartedAt,
+            decisionDurationMs: this.clock.now() - decisionStartedAt,
             recoveryDeadlineMs,
             perTargetTimeoutMs: this.config.probes.timeoutMs,
           });
@@ -1381,7 +1400,7 @@ export class Watchdog {
             candidates.map((entry) => entry.node),
             1,
             this.config.probes.urls,
-            Date.now() + recoveryDeadlineMs,
+            this.clock.now() + recoveryDeadlineMs,
             { timeoutMs: this.config.probes.timeoutMs },
           );
           ranked = preSwitchResults
@@ -1408,13 +1427,13 @@ export class Watchdog {
             currentSuccessRate: current.successRate,
             linkFailures,
             checkedCandidates: preSwitchResults.length,
-            decisionDurationMs: Date.now() - decisionStartedAt,
+            decisionDurationMs: this.clock.now() - decisionStartedAt,
           });
         } else {
           this.beginSwitchAttempt();
           try {
             // emergency 决策窗口紧张：守卫最多只能吃掉决策剩余时间，且不低于 250ms。
-            const remainingDecisionMs = Math.max(0, (decisionStartedAt + decisionDeadlineMs) - Date.now());
+            const remainingDecisionMs = Math.max(0, (decisionStartedAt + decisionDeadlineMs) - this.clock.now());
             const emergencySwitch = await this.guardedSelect(
               this.config.groups.target,
               emergencyCandidate.node,
@@ -1459,9 +1478,9 @@ export class Watchdog {
               classifyHealth(emergencyCandidate, this.currentThresholds(), this.config.policy),
               emergencyCandidate.node, state.currentLeaf);
             recordAdmission('rescue', emergencyCandidate.node, state.currentLeaf);
-            const switchedAt = new Date().toISOString();
-            const decisionDurationMs = Date.now() - decisionStartedAt;
-            quarantineNode(
+            const switchedAt = this.clock.nowIso();
+            const decisionDurationMs = this.clock.now() - decisionStartedAt;
+            quarantineNodeAt(this.clock, 
               state,
               currentLeaf,
               this.config.policy.failedNodeQuarantineSeconds,
@@ -1541,7 +1560,7 @@ export class Watchdog {
           if (!admittedEvidence) {
             // 质量不达标只说明“本次没到严格线”，不是网络失败：用短冷却而非 900s 隔离，
             // 否则一次复核就会把候选池整体清空。
-            quarantineNode(
+            quarantineNodeAt(this.clock, 
               state,
               nextCandidate.node,
               this.config.policy.qualityQuarantineSeconds,
@@ -1580,7 +1599,7 @@ export class Watchdog {
         await this.log('warn', 'pre-switch-validation-incomplete', {});
         return { status: 'pre-switch-validation-incomplete', current };
       }
-      activateCandidateScanBackoff(state, this.config.policy, 'pre-switch-validation-failed');
+      activateCandidateScanBackoffAt(this.clock, state, this.config.policy, 'pre-switch-validation-failed');
       setDecision('hold', 'no-pre-switch-candidate');
       await persistState();
       await this.log('warn', 'no-pre-switch-candidate', {});
@@ -1656,7 +1675,7 @@ export class Watchdog {
           to: nextCandidate.node,
           reason: switchReason,
         });
-        await sleep(this.config.policy.postSwitchDelaySeconds * 1000);
+        await this.clock.sleep(this.config.policy.postSwitchDelaySeconds * 1000);
         const verification = await this.probeNode(
           state.currentLeaf,
           this.config.policy.postSwitchRounds,
@@ -1677,7 +1696,7 @@ export class Watchdog {
           && isStableAcrossRounds(verification, this.candidateThresholds()));
         if (strictAfterSwitch) {
           // 旧出口可能只是相对变慢，不是坏节点：成功切换后只做短冷处理，避免它被永久排除。
-          quarantineNode(
+          quarantineNodeAt(this.clock, 
             state,
             currentLeaf,
             this.config.policy.oldNodeCooldownSeconds,
@@ -1688,7 +1707,7 @@ export class Watchdog {
           state.consecutivePartialFailures = 0;
           state.consecutiveLatencyFailures = 0;
           state.degradationWindow = [];
-          state.lastSwitchAt = new Date().toISOString();
+          state.lastSwitchAt = this.clock.nowIso();
           state.lastSwitch = {
             from: previousSelection,
             to: nextCandidate.node,
@@ -1718,7 +1737,7 @@ export class Watchdog {
         }
         attempted.push({ candidate: nextCandidate, verification });
         // 切后复核失败属于真实验证失败，仍按网络隔离时长处理，但单独标注 kind 便于审计。
-        quarantineNode(
+        quarantineNodeAt(this.clock, 
           state,
           nextCandidate.node,
           this.config.policy.failedNodeQuarantineSeconds,
@@ -1745,7 +1764,7 @@ export class Watchdog {
     }
 
     if (!candidateSelectionAttempted) {
-      activateCandidateScanBackoff(
+      activateCandidateScanBackoffAt(this.clock, 
         state,
         this.config.policy,
         candidateBudgetExhausted ? 'switch-budget-exhausted' : 'pre-switch-validation-failed',
@@ -1803,7 +1822,7 @@ export class Watchdog {
               actualPreviousVerification, this.config.probes, this.candidateThresholds(),
             );
             recordRecoveryRollback(state, this.config.policy, rollbackFrom, previousSelection);
-            const recoveredAt = new Date().toISOString();
+            const recoveredAt = this.clock.nowIso();
             state.consecutiveFailures = 0;
             state.consecutivePartialFailures = 0;
             state.consecutiveLatencyFailures = 0;
@@ -1843,14 +1862,14 @@ export class Watchdog {
             return { status: 'rollback-recovered', current, candidate, verification: actualPreviousVerification };
           }
           state.switchHistory.push({
-            timestamp: new Date().toISOString(),
+            timestamp: this.clock.nowIso(),
             from: rollbackFrom,
             to: previousSelection,
             kind: 'recovery-rollback-failed',
             budgetExempt: true,
           });
           attempted.push({ candidate: { node: previousSelection }, verification: actualPreviousVerification });
-          quarantineNode(
+          quarantineNodeAt(this.clock, 
             state,
             state.currentLeaf,
             this.config.policy.failedNodeQuarantineSeconds,
@@ -1941,7 +1960,7 @@ export class Watchdog {
               delete state.externalSelectionPendingAdmission;
               const restoredUsable = isStableAcrossRounds(actualRestorationVerification, this.currentThresholds());
               if (!restoredUsable) {
-                quarantineNode(state, state.currentLeaf, this.config.policy.failedNodeQuarantineSeconds,
+                quarantineNodeAt(this.clock, state, state.currentLeaf, this.config.policy.failedNodeQuarantineSeconds,
                   'provisional-restoration-verification-failed');
               }
               await persistState();
@@ -1973,13 +1992,13 @@ export class Watchdog {
         delete state.quarantinedNodes[activeSelection];
         delete state.quarantinedNodes[state.currentLeaf];
       }
-      quarantineNode(
+      quarantineNodeAt(this.clock, 
         state,
         currentLeaf,
         this.config.policy.failedNodeQuarantineSeconds,
         switchReason,
       );
-      const retainedAt = new Date().toISOString();
+      const retainedAt = this.clock.nowIso();
       state.lastSwitchAt = retainedAt;
       state.lastSwitch = {
         from: previousSelection,
