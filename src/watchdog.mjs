@@ -1,7 +1,8 @@
-import { appendFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { consumeSwitchBudget, getSwitchBudget, recordRecoveryRollback } from './switch-budget.mjs';
 import { synchronizeDecisionState } from './decision-state.mjs';
+import { loadState, saveState } from './state-store.mjs';
 
 const GROUP_TYPES = new Set(['Selector', 'URLTest', 'Fallback', 'LoadBalance']);
 const SELECTION_ADMISSION_VERSION = 1;
@@ -230,22 +231,6 @@ export function createLogger(logFile, { quiet = false } = {}) {
       console.log(`[${record.timestamp}] ${level.toUpperCase()} ${event}${suffix}`);
     }
   };
-}
-
-async function readState(stateFile) {
-  try {
-    return JSON.parse(await readFile(stateFile, 'utf8'));
-  } catch (error) {
-    if (error.code === 'ENOENT') return { consecutiveFailures: 0, lastSwitchAt: null };
-    throw error;
-  }
-}
-
-async function writeState(stateFile, state) {
-  await mkdir(path.dirname(stateFile), { recursive: true });
-  const temporary = `${stateFile}.${process.pid}.tmp`;
-  await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
-  await rename(temporary, stateFile);
 }
 
 export class Watchdog {
@@ -753,7 +738,8 @@ export class Watchdog {
   }
 
   async runOnce({ dryRun = true, forceScan = false, linkTelemetry, backgroundScan = false } = {}) {
-    const state = await readState(this.config.files.state);
+    const { state, recovery } = await loadState(this.config.files.state);
+    if (recovery) await this.log('warn', 'state-file-recovered', recovery);
     if (!this.activeCandidateScan && state.candidateScan?.status === 'running') delete state.candidateScan;
     if (this.runtime) state.runtime = this.runtime;
     const setDecision = (action, reason, details = {}) => {
@@ -761,7 +747,7 @@ export class Watchdog {
     };
     const persistState = async () => {
       synchronizeDecisionState(state, this.config.policy, { probes: this.config.probes });
-      if (!dryRun) await writeState(this.config.files.state, state);
+      if (!dryRun) await saveState(this.config.files.state, state);
     };
     const recordEvaluation = (result, evaluatedHealth, selected, leaf, linkFailures = []) => {
       state.lastEvaluation = {
