@@ -52,6 +52,8 @@
     "minimumImprovementMs": 200,
     "minimumImprovementRatio": 0.2,
     "failedNodeQuarantineSeconds": 900,
+    "qualityQuarantineSeconds": 180,
+    "oldNodeCooldownSeconds": 120,
     "maxSwitchAttempts": 3,
     "postSwitchDelaySeconds": 2,
     "postSwitchRounds": 2,

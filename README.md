@@ -356,6 +356,8 @@ HTTP Controller 使用 secret 时，只配置环境变量名称：
 | `policy.minimumImprovementMs` | `200` | 延迟型切换要求候选至少改善的绝对延迟。 |
 | `policy.minimumImprovementRatio` | `0.2` | 延迟型切换要求候选至少改善的比例；默认 20%。绝对值与比例满足其一即可。 |
 | `policy.failedNodeQuarantineSeconds` | `900` | 真实验证失败的节点隔离时间；普通切前采样因截止或取消而不完整时不隔离。 |
+| `policy.qualityQuarantineSeconds` | `180` | 切前质量复核不达标（未过严格线）的短隔离时间；质量不足不等于网络失败，避免一次复核清空候选池。 |
+| `policy.oldNodeCooldownSeconds` | `120` | 成功切换后旧出口的冷却时间，避免它立刻被重新当成优化候选。 |
 | `policy.maxSwitchAttempts` | `3` | 单次恢复流程最多执行的实际节点切换次数；切前门禁拒绝不会占用次数，服务会继续检查候选池中的后续节点。 |
 | `policy.postSwitchDelaySeconds` | `2` | 切换后开始复核前的等待时间。 |
 | `policy.postSwitchRounds` | `2` | 切换后新节点必须通过的验证轮数。 |

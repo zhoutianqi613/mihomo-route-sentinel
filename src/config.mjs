@@ -52,6 +52,10 @@ export const defaults = Object.freeze({
     minimumImprovementMs: 200,
     minimumImprovementRatio: 0.2,
     failedNodeQuarantineSeconds: 900,
+    // 质量不达标只是“这次不够好”，不等于网络坏；用短隔离避免一次复核把节点池清空。
+    qualityQuarantineSeconds: 180,
+    // 成功切换到新出口后，旧出口进入冷却，避免立刻被当成候选切回。
+    oldNodeCooldownSeconds: 120,
     maxSwitchAttempts: 3,
     postSwitchDelaySeconds: 2,
     postSwitchRounds: 2,
@@ -298,6 +302,8 @@ function validate(config) {
     minimumDwellSeconds: 0,
     minimumImprovementMs: 0,
     failedNodeQuarantineSeconds: 0,
+    qualityQuarantineSeconds: 0,
+    oldNodeCooldownSeconds: 0,
     maxSwitchAttempts: 1,
     postSwitchDelaySeconds: 0,
     postSwitchRounds: 1,

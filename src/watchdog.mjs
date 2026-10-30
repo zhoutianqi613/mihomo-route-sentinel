@@ -224,12 +224,15 @@ function getActiveQuarantines(state) {
   return new Set(Object.keys(state.quarantinedNodes));
 }
 
-function quarantineNode(state, node, seconds, reason) {
+// kind 记录隔离原因分层：quality（切前质量不达标，短冷却）、verify（切后验证失败）、
+// cooldown（成功切换后的旧出口冷却）、network（真实网络失败，默认）。
+function quarantineNode(state, node, seconds, reason, kind = 'network') {
   if (!node || seconds <= 0) return;
   state.quarantinedNodes ??= {};
   state.quarantinedNodes[node] = {
     until: new Date(Date.now() + (seconds * 1000)).toISOString(),
     reason,
+    kind,
   };
 }
 
@@ -1699,15 +1702,19 @@ export class Watchdog {
               && isStableAcrossRounds(verification, admissionThresholds)
             : hasStrictAdmissionEvidence(verification, this.config.probes, admissionThresholds));
           if (!admittedEvidence) {
+            // 质量不达标只说明“本次没到严格线”，不是网络失败：用短冷却而非 900s 隔离，
+            // 否则一次复核就会把候选池整体清空。
             quarantineNode(
               state,
               nextCandidate.node,
-              this.config.policy.failedNodeQuarantineSeconds,
+              this.config.policy.qualityQuarantineSeconds,
               'pre-switch-validation-failed',
+              'quality',
             );
             await this.log('warn', 'candidate-pre-switch-rejected', {
               node: nextCandidate.node,
               profile: provisionalCandidateNames.has(nextCandidate.node) ? 'current-health' : 'strict',
+              kind: 'quality',
               successRate: verification?.successRate ?? 0,
               averageMs: Number.isFinite(verification?.averageMs) ? Math.round(verification.averageMs) : null,
               maxMs: Number.isFinite(verification?.maxMs) ? verification.maxMs : null,
@@ -1810,11 +1817,13 @@ export class Watchdog {
         && hasCompleteProbeRounds(verification, this.config.probes.urls, 1)
         && isStableAcrossRounds(verification, this.candidateThresholds()));
       if (strictAfterSwitch) {
+        // 旧出口可能只是相对变慢，不是坏节点：成功切换后只做短冷处理，避免它被永久排除。
         quarantineNode(
           state,
           currentLeaf,
-          this.config.policy.failedNodeQuarantineSeconds,
+          this.config.policy.oldNodeCooldownSeconds,
           switchReason,
+          'cooldown',
         );
         state.consecutiveFailures = 0;
         state.consecutivePartialFailures = 0;
@@ -1841,6 +1850,7 @@ export class Watchdog {
           node: nextCandidate.node,
           leaf: state.currentLeaf,
           reason: switchReason,
+          kind: 'cooldown',
           successRate: verification.successRate,
           averageMs: Math.round(verification.averageMs),
           maxMs: verification.maxMs,
@@ -1848,14 +1858,17 @@ export class Watchdog {
         return { status: 'switched', current, candidate: nextCandidate, verification };
       }
       attempted.push({ candidate: nextCandidate, verification });
+      // 切后复核失败属于真实验证失败，仍按网络隔离时长处理，但单独标注 kind 便于审计。
       quarantineNode(
         state,
         nextCandidate.node,
         this.config.policy.failedNodeQuarantineSeconds,
         'post-switch-verification-failed',
+        'verify',
       );
       await this.log('error', 'switch-verification-failed', {
         node: nextCandidate.node,
+        kind: 'verify',
         successRate: verification.successRate,
         averageMs: Number.isFinite(verification.averageMs) ? Math.round(verification.averageMs) : null,
         maxMs: Number.isFinite(verification.maxMs) ? verification.maxMs : null,
