@@ -7,6 +7,8 @@ import { latencyUpperBound, quantile, wilsonLowerBound } from './estimator.mjs';
 
 const GROUP_TYPES = new Set(['Selector', 'URLTest', 'Fallback', 'LoadBalance']);
 const SELECTION_ADMISSION_VERSION = 1;
+const SWITCH_GUARD_TIMEOUT = Symbol('switch-guard-timeout');
+const DEFAULT_GUARD_TIMEOUT_MS = 3000;
 
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
@@ -280,11 +282,26 @@ export function createLogger(logFile, { quiet = false } = {}) {
 }
 
 export class Watchdog {
-  constructor({ controller, config, logger, beforeSwitch = async () => {}, runtime = null }) {
+  constructor({
+    controller,
+    config,
+    logger,
+    beforeSwitch = async () => {},
+    onSwitchStart = () => {},
+    onSwitchEnd = () => {},
+    guardTimeoutMs = DEFAULT_GUARD_TIMEOUT_MS,
+    runtime = null,
+  }) {
     this.controller = controller;
     this.config = config;
     this.log = logger;
     this.beforeSwitch = beforeSwitch;
+    this.onSwitchStart = onSwitchStart;
+    this.onSwitchEnd = onSwitchEnd;
+    this.switchAttemptDepth = 0;
+    this.guardTimeoutMs = Number.isFinite(guardTimeoutMs) && guardTimeoutMs > 0
+      ? Math.trunc(guardTimeoutMs)
+      : DEFAULT_GUARD_TIMEOUT_MS;
     this.runtime = runtime;
     this.activeCandidateScan = null;
     this.nodeProbeTails = new Map();
@@ -371,6 +388,71 @@ export class Watchdog {
         }
       }
     };
+  }
+
+  /**
+   * 切换尝试临界区：一次切换尝试从 beforeSwitch 开始，覆盖 select、切后
+   * resolveLeaf/落盘/postSwitchDelay/验证与失败隔离、回滚决策，期间 5s 定时守卫不得运行。
+   * 深度计数保证嵌套尝试只在最外层触发 onSwitchStart/onSwitchEnd。
+   */
+  beginSwitchAttempt() {
+    if (this.switchAttemptDepth === 0) this.onSwitchStart();
+    this.switchAttemptDepth += 1;
+  }
+
+  endSwitchAttempt() {
+    if (this.switchAttemptDepth === 0) return;
+    this.switchAttemptDepth -= 1;
+    if (this.switchAttemptDepth === 0) this.onSwitchEnd();
+  }
+
+  async runSwitchAttempt(execute) {
+    this.beginSwitchAttempt();
+    try {
+      return await execute();
+    } finally {
+      this.endSwitchAttempt();
+    }
+  }
+
+  /**
+   * 切换选路：守卫评估与 Controller select 互斥，且守卫最多占用有限时间。
+   * 超时直接返回 blocked，绝不调用 select，也不执行 budget 等副作用的 beforeSelect。
+   * onSwitchStart/onSwitchEnd 由外层 runSwitchAttempt/beginSwitchAttempt 负责。
+   */
+  async guardedSelect(group, name, {
+    timeoutMs = this.guardTimeoutMs,
+    beforeSelect = null,
+  } = {}) {
+    const requestedTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? timeoutMs
+      : this.guardTimeoutMs;
+    const effectiveTimeoutMs = Math.max(1, Math.min(this.guardTimeoutMs, requestedTimeoutMs));
+    let guardTimer = null;
+    try {
+      // 守卫在独立 promise 上执行；超时只停止等待，不能中断已经发出的守卫副作用。
+      const guardPromise = Promise.resolve().then(() => this.beforeSwitch());
+      const timeoutPromise = new Promise((resolve) => {
+        guardTimer = setTimeout(() => resolve(SWITCH_GUARD_TIMEOUT), effectiveTimeoutMs);
+      });
+      let guardResult;
+      try {
+        guardResult = await Promise.race([guardPromise, timeoutPromise]);
+      } finally {
+        if (guardTimer) clearTimeout(guardTimer);
+        guardTimer = null;
+      }
+      if (guardResult === SWITCH_GUARD_TIMEOUT) {
+        return { blocked: true, reason: 'guardrail-timeout', timeoutMs: effectiveTimeoutMs };
+      }
+      // 预算记账等选路前逻辑必须落在临界区内，但只能在守卫通过后执行。
+      const prepared = beforeSelect ? await beforeSelect() : null;
+      if (prepared?.blocked) return prepared;
+      await this.controller.select(group, name);
+      return { blocked: false, ...(prepared ?? {}) };
+    } finally {
+      if (guardTimer) clearTimeout(guardTimer);
+    }
   }
 
   candidateScanMatches(scan, selection, leaf) {
@@ -901,45 +983,57 @@ export class Watchdog {
         });
         return { status: 'would-normalize-nested-selection', from: previousSelection, to: currentLeaf };
       }
-      await this.beforeSwitch();
-      await this.controller.select(this.config.groups.target, currentLeaf);
-      const normalizedTarget = await this.controller.getProxy(this.config.groups.target);
-      const normalizedLeaf = await this.resolveLeaf(normalizedTarget.now);
-      if (normalizedTarget.now !== currentLeaf || normalizedLeaf !== currentLeaf) {
-        throw new Error(`嵌套代理组规范化失败：期望 ${currentLeaf}，实际 ${normalizedTarget.now}`);
+      this.beginSwitchAttempt();
+      try {
+        const normalizationSwitch = await this.guardedSelect(this.config.groups.target, currentLeaf);
+        if (normalizationSwitch.blocked) {
+          await this.log('warn', 'switch-guardrail-timeout', {
+            node: currentLeaf,
+            phase: 'nested-selection-normalization',
+            timeoutMs: normalizationSwitch.timeoutMs,
+          });
+          return { status: 'guardrail-timeout', from: previousSelection, to: currentLeaf };
+        }
+        const normalizedTarget = await this.controller.getProxy(this.config.groups.target);
+        const normalizedLeaf = await this.resolveLeaf(normalizedTarget.now);
+        if (normalizedTarget.now !== currentLeaf || normalizedLeaf !== currentLeaf) {
+          throw new Error(`嵌套代理组规范化失败：期望 ${currentLeaf}，实际 ${normalizedTarget.now}`);
+        }
+        const normalizedAt = new Date().toISOString();
+        state.currentSelection = currentLeaf;
+        state.currentLeaf = currentLeaf;
+        recordAdmission('pending', currentLeaf, currentLeaf);
+        delete state.selectionAdmissionVersion;
+        state.externalSelectionPendingAdmission = {
+          from: acceptedSelection,
+          fromLeaf: acceptedLeaf,
+          to: currentLeaf,
+          leaf: currentLeaf,
+          detectedAt: normalizedAt,
+          source: 'external',
+        };
+        state.lastSelectionNormalization = {
+          at: normalizedAt,
+          from: previousSelection,
+          to: currentLeaf,
+          reason: 'nested-selection',
+          requiresStrictAdmission: true,
+        };
+        setDecision('repair', 'nested-selection-normalized-pending-admission', {
+          from: previousSelection,
+          to: currentLeaf,
+        });
+        await persistState();
+        await this.log('warn', 'nested-selection-normalized', {
+          from: previousSelection,
+          to: currentLeaf,
+          leaf: currentLeaf,
+          requiresStrictAdmission: true,
+        });
+        return { status: 'nested-selection-normalized-pending-admission', from: previousSelection, to: currentLeaf };
+      } finally {
+        this.endSwitchAttempt();
       }
-      const normalizedAt = new Date().toISOString();
-      state.currentSelection = currentLeaf;
-      state.currentLeaf = currentLeaf;
-      recordAdmission('pending', currentLeaf, currentLeaf);
-      delete state.selectionAdmissionVersion;
-      state.externalSelectionPendingAdmission = {
-        from: acceptedSelection,
-        fromLeaf: acceptedLeaf,
-        to: currentLeaf,
-        leaf: currentLeaf,
-        detectedAt: normalizedAt,
-        source: 'external',
-      };
-      state.lastSelectionNormalization = {
-        at: normalizedAt,
-        from: previousSelection,
-        to: currentLeaf,
-        reason: 'nested-selection',
-        requiresStrictAdmission: true,
-      };
-      setDecision('repair', 'nested-selection-normalized-pending-admission', {
-        from: previousSelection,
-        to: currentLeaf,
-      });
-      await persistState();
-      await this.log('warn', 'nested-selection-normalized', {
-        from: previousSelection,
-        to: currentLeaf,
-        leaf: currentLeaf,
-        requiresStrictAdmission: true,
-      });
-      return { status: 'nested-selection-normalized-pending-admission', from: previousSelection, to: currentLeaf };
     }
     let selectionAdmissionRejected = false;
     let current;
@@ -1693,83 +1787,112 @@ export class Watchdog {
             decisionDurationMs: Date.now() - decisionStartedAt,
           });
         } else {
-          await this.beforeSwitch();
-          const budget = consumeSwitchBudget(state, this.config.policy, {
-            from: previousSelection,
-            to: emergencyCandidate.node,
-            kind: 'emergency-candidate-attempt',
-          }, { budgetClass, allowRescue });
-          if (!budget.allowed) {
-            setDecision('blocked', 'switch-budget-exhausted', { used: budget.used, limit: budget.count });
+          this.beginSwitchAttempt();
+          try {
+            // emergency 决策窗口紧张：守卫最多只能吃掉决策剩余时间，且不低于 250ms。
+            const remainingDecisionMs = Math.max(0, (decisionStartedAt + decisionDeadlineMs) - Date.now());
+            const emergencySwitch = await this.guardedSelect(
+              this.config.groups.target,
+              emergencyCandidate.node,
+              {
+                timeoutMs: Math.max(250, remainingDecisionMs),
+                beforeSelect: async () => {
+                  const budget = consumeSwitchBudget(state, this.config.policy, {
+                    from: previousSelection,
+                    to: emergencyCandidate.node,
+                    kind: 'emergency-candidate-attempt',
+                  }, { budgetClass, allowRescue });
+                  if (!budget.allowed) {
+                    setDecision('blocked', 'switch-budget-exhausted', { used: budget.used, limit: budget.count });
+                    await persistState();
+                    return { blocked: true, reason: 'switch-budget-exhausted' };
+                  }
+                  clearCandidateScanBackoff(state);
+                  delete state.selectionAdmissionVersion;
+                  setDecision('switch', 'emergency-selection-reserved', { to: emergencyCandidate.node, budgetClass: budget.budgetClass });
+                  await persistState();
+                  return {};
+                },
+              },
+            );
+            if (emergencySwitch.blocked) {
+              if (emergencySwitch.reason === 'guardrail-timeout') {
+                setDecision('hold', 'guardrail-timeout');
+                await persistState();
+                await this.log('warn', 'switch-guardrail-timeout', {
+                  node: emergencyCandidate.node,
+                  phase: 'emergency',
+                  timeoutMs: emergencySwitch.timeoutMs,
+                  remainingDecisionMs,
+                });
+                return { status: 'guardrail-timeout', current };
+              }
+              return { status: 'switch-budget-exhausted', current };
+            }
+            state.currentSelection = emergencyCandidate.node;
+            state.currentLeaf = await this.resolveLeaf(emergencyCandidate.node);
+            recordEvaluation(emergencyCandidate,
+              classifyHealth(emergencyCandidate, this.currentThresholds(), this.config.policy),
+              emergencyCandidate.node, state.currentLeaf);
+            recordAdmission('rescue', emergencyCandidate.node, state.currentLeaf);
+            const switchedAt = new Date().toISOString();
+            const decisionDurationMs = Date.now() - decisionStartedAt;
+            quarantineNode(
+              state,
+              currentLeaf,
+              this.config.policy.failedNodeQuarantineSeconds,
+              'emergency-best-effort',
+            );
+            state.lastSwitchAt = switchedAt;
+            state.lastSwitch = {
+              at: switchedAt,
+              from: previousSelection,
+              to: emergencyCandidate.node,
+              reason: 'emergency-best-effort',
+              trigger: scanReason,
+              verified: false,
+              source: 'sentinel',
+              verificationSource,
+              linkFailures,
+              decisionDurationMs,
+              deadlineMet: decisionDurationMs <= decisionDeadlineMs,
+            };
+            state.provisionalFallback = {
+              at: switchedAt,
+              selection: emergencyCandidate.node,
+              leaf: state.currentLeaf,
+              profile: 'emergency-best-effort',
+              requiresStrictAdmission: true,
+            };
+            delete state.externalSelectionPendingAdmission;
+            setDecision('switch', 'emergency-best-effort', {
+              from: previousSelection,
+              to: emergencyCandidate.node,
+              decisionDurationMs,
+            });
             await persistState();
-            return { status: 'switch-budget-exhausted', current };
+            await this.log('warn', 'emergency-fallback-switched', {
+              from: previousSelection,
+              to: emergencyCandidate.node,
+              successRate: emergencyCandidate.successRate,
+              averageMs: Number.isFinite(emergencyCandidate.averageMs)
+                ? Math.round(emergencyCandidate.averageMs) : null,
+              maxMs: Number.isFinite(emergencyCandidate.maxMs) ? emergencyCandidate.maxMs : null,
+              verificationSource,
+              decisionDurationMs,
+              deadlineMs: decisionDeadlineMs,
+              deadlineMet: decisionDurationMs <= decisionDeadlineMs,
+            });
+            return {
+              status: 'emergency-fallback',
+              current,
+              candidate: emergencyCandidate,
+              verification: emergencyCandidate,
+              verificationSource,
+            };
+          } finally {
+            this.endSwitchAttempt();
           }
-          clearCandidateScanBackoff(state);
-          delete state.selectionAdmissionVersion;
-          setDecision('switch', 'emergency-selection-reserved', { to: emergencyCandidate.node, budgetClass: budget.budgetClass });
-          await persistState();
-          await this.controller.select(this.config.groups.target, emergencyCandidate.node);
-          state.currentSelection = emergencyCandidate.node;
-          state.currentLeaf = await this.resolveLeaf(emergencyCandidate.node);
-          recordEvaluation(emergencyCandidate,
-            classifyHealth(emergencyCandidate, this.currentThresholds(), this.config.policy),
-            emergencyCandidate.node, state.currentLeaf);
-          recordAdmission('rescue', emergencyCandidate.node, state.currentLeaf);
-          const switchedAt = new Date().toISOString();
-          const decisionDurationMs = Date.now() - decisionStartedAt;
-          quarantineNode(
-            state,
-            currentLeaf,
-            this.config.policy.failedNodeQuarantineSeconds,
-            'emergency-best-effort',
-          );
-          state.lastSwitchAt = switchedAt;
-          state.lastSwitch = {
-            at: switchedAt,
-            from: previousSelection,
-            to: emergencyCandidate.node,
-            reason: 'emergency-best-effort',
-            trigger: scanReason,
-            verified: false,
-            source: 'sentinel',
-            verificationSource,
-            linkFailures,
-            decisionDurationMs,
-            deadlineMet: decisionDurationMs <= decisionDeadlineMs,
-          };
-          state.provisionalFallback = {
-            at: switchedAt,
-            selection: emergencyCandidate.node,
-            leaf: state.currentLeaf,
-            profile: 'emergency-best-effort',
-            requiresStrictAdmission: true,
-          };
-          delete state.externalSelectionPendingAdmission;
-          setDecision('switch', 'emergency-best-effort', {
-            from: previousSelection,
-            to: emergencyCandidate.node,
-            decisionDurationMs,
-          });
-          await persistState();
-          await this.log('warn', 'emergency-fallback-switched', {
-            from: previousSelection,
-            to: emergencyCandidate.node,
-            successRate: emergencyCandidate.successRate,
-            averageMs: Number.isFinite(emergencyCandidate.averageMs)
-              ? Math.round(emergencyCandidate.averageMs) : null,
-            maxMs: Number.isFinite(emergencyCandidate.maxMs) ? emergencyCandidate.maxMs : null,
-            verificationSource,
-            decisionDurationMs,
-            deadlineMs: decisionDeadlineMs,
-            deadlineMet: decisionDurationMs <= decisionDeadlineMs,
-          });
-          return {
-            status: 'emergency-fallback',
-            current,
-            candidate: emergencyCandidate,
-            verification: emergencyCandidate,
-            verificationSource,
-          };
         }
       } else {
         const admitted = [];
@@ -1850,125 +1973,150 @@ export class Watchdog {
     const switchReason = forceScan && scanReason === 'healthy' ? 'forced-optimization' : scanReason;
     for (const nextCandidate of candidates) {
       if (candidateSelectionAttempts >= this.config.policy.maxSwitchAttempts) break;
-      const fromSelection = activeSelection;
-      await this.beforeSwitch();
-      const budget = consumeSwitchBudget(state, this.config.policy, {
-        from: fromSelection,
-        to: nextCandidate.node,
-        kind: 'candidate-attempt',
-      }, { budgetClass, allowRescue: activeSelectionHealth.emergency === true });
-      if (!budget.allowed) {
-        candidateBudgetExhausted = true;
-        await persistState();
-        await this.log('error', 'switch-budget-exhausted', {
-          used: budget.used,
-          limit: budget.count,
-          windowSeconds: budget.windowSeconds,
-          health: switchReason,
-          from: activeSelection,
-          blockedCandidate: nextCandidate.node,
-          kind: 'candidate-attempt',
-        });
-        break;
-      }
-      clearCandidateScanBackoff(state);
-      delete state.selectionAdmissionVersion;
-      await persistState();
-      await this.controller.select(this.config.groups.target, nextCandidate.node);
-      candidateSelectionAttempted = true;
-      candidateSelectionAttempts += 1;
-      activeSelection = nextCandidate.node;
-      state.currentSelection = activeSelection;
-      state.currentLeaf = await this.resolveLeaf(activeSelection);
-      recordAdmission('pending', activeSelection, state.currentLeaf);
-      await persistState();
-      await this.log('warn', 'node-switched', {
-        from: fromSelection,
-        to: nextCandidate.node,
-        reason: switchReason,
-      });
-      await sleep(this.config.policy.postSwitchDelaySeconds * 1000);
-      const verification = await this.probeNode(
-        state.currentLeaf,
-        this.config.policy.postSwitchRounds,
-        this.config.probes.urls,
-      );
-      activeSelectionHealth = classifyHealth(verification, this.currentThresholds(), this.config.policy);
-      recordEvaluation(verification, activeSelectionHealth,
-        activeSelection, state.currentLeaf);
-      // 切后一轮只能确认本轮同叶子的完整严格扫描证据仍有效；旧快照不能补齐轮次。
-      const liveStrictEvidence = [nextCandidate.preSwitchVerification,
-        ...(search.source === 'candidate-snapshot' ? [] : (search.validated ?? []))]
-        .some((entry) => entry?.node === state.currentLeaf
-          && hasStrictAdmissionEvidence(entry, this.config.probes, this.candidateThresholds()));
-      const strictAfterSwitch = hasStrictAdmissionEvidence(
-        verification, this.config.probes, this.candidateThresholds(),
-      ) || (liveStrictEvidence
-        && hasCompleteProbeRounds(verification, this.config.probes.urls, 1)
-        && isStableAcrossRounds(verification, this.candidateThresholds()));
-      if (strictAfterSwitch) {
-        // 旧出口可能只是相对变慢，不是坏节点：成功切换后只做短冷处理，避免它被永久排除。
-        quarantineNode(
-          state,
-          currentLeaf,
-          this.config.policy.oldNodeCooldownSeconds,
-          switchReason,
-          'cooldown',
+      this.beginSwitchAttempt();
+      try {
+        const fromSelection = activeSelection;
+        const switchAttempt = await this.guardedSelect(
+          this.config.groups.target,
+          nextCandidate.node,
+          {
+            beforeSelect: async () => {
+              const budget = consumeSwitchBudget(state, this.config.policy, {
+                from: fromSelection,
+                to: nextCandidate.node,
+                kind: 'candidate-attempt',
+              }, { budgetClass, allowRescue: activeSelectionHealth.emergency === true });
+              if (!budget.allowed) {
+                candidateBudgetExhausted = true;
+                await persistState();
+                await this.log('error', 'switch-budget-exhausted', {
+                  used: budget.used,
+                  limit: budget.count,
+                  windowSeconds: budget.windowSeconds,
+                  health: switchReason,
+                  from: activeSelection,
+                  blockedCandidate: nextCandidate.node,
+                  kind: 'candidate-attempt',
+                });
+                return { blocked: true, reason: 'switch-budget-exhausted' };
+              }
+              clearCandidateScanBackoff(state);
+              delete state.selectionAdmissionVersion;
+              await persistState();
+              return {};
+            },
+          },
         );
-        state.consecutiveFailures = 0;
-        state.consecutivePartialFailures = 0;
-        state.consecutiveLatencyFailures = 0;
-        state.degradationWindow = [];
-        state.lastSwitchAt = new Date().toISOString();
-        state.lastSwitch = {
-          from: previousSelection,
+        if (switchAttempt.blocked) {
+          if (switchAttempt.reason === 'guardrail-timeout') {
+            setDecision('hold', 'guardrail-timeout');
+            await persistState();
+            await this.log('warn', 'switch-guardrail-timeout', {
+              node: nextCandidate.node,
+              phase: 'candidate-selection',
+              timeoutMs: switchAttempt.timeoutMs,
+            });
+            return { status: 'guardrail-timeout', current };
+          }
+          break;
+        }
+        candidateSelectionAttempted = true;
+        candidateSelectionAttempts += 1;
+        activeSelection = nextCandidate.node;
+        state.currentSelection = activeSelection;
+        state.currentLeaf = await this.resolveLeaf(activeSelection);
+        recordAdmission('pending', activeSelection, state.currentLeaf);
+        await persistState();
+        await this.log('warn', 'node-switched', {
+          from: fromSelection,
           to: nextCandidate.node,
           reason: switchReason,
-          trigger: switchReason,
-          verified: true,
-          source: 'sentinel',
-        };
-        state.selectionAdmissionVersion = SELECTION_ADMISSION_VERSION;
-        recordAdmission('strict', activeSelection, state.currentLeaf);
-        delete state.provisionalFallback;
-        delete state.externalSelectionPendingAdmission;
-        state.lastHealthyAt = state.lastSwitchAt;
-        state.lastOptimizationScanAt = state.lastSwitchAt;
-        setDecision('switch', 'verified-candidate', { from: previousSelection, to: nextCandidate.node });
-        await persistState();
-        await this.log('info', 'switch-verified', {
+        });
+        await sleep(this.config.policy.postSwitchDelaySeconds * 1000);
+        const verification = await this.probeNode(
+          state.currentLeaf,
+          this.config.policy.postSwitchRounds,
+          this.config.probes.urls,
+        );
+        activeSelectionHealth = classifyHealth(verification, this.currentThresholds(), this.config.policy);
+        recordEvaluation(verification, activeSelectionHealth,
+          activeSelection, state.currentLeaf);
+        // 切后一轮只能确认本轮同叶子的完整严格扫描证据仍有效；旧快照不能补齐轮次。
+        const liveStrictEvidence = [nextCandidate.preSwitchVerification,
+          ...(search.source === 'candidate-snapshot' ? [] : (search.validated ?? []))]
+          .some((entry) => entry?.node === state.currentLeaf
+            && hasStrictAdmissionEvidence(entry, this.config.probes, this.candidateThresholds()));
+        const strictAfterSwitch = hasStrictAdmissionEvidence(
+          verification, this.config.probes, this.candidateThresholds(),
+        ) || (liveStrictEvidence
+          && hasCompleteProbeRounds(verification, this.config.probes.urls, 1)
+          && isStableAcrossRounds(verification, this.candidateThresholds()));
+        if (strictAfterSwitch) {
+          // 旧出口可能只是相对变慢，不是坏节点：成功切换后只做短冷处理，避免它被永久排除。
+          quarantineNode(
+            state,
+            currentLeaf,
+            this.config.policy.oldNodeCooldownSeconds,
+            switchReason,
+            'cooldown',
+          );
+          state.consecutiveFailures = 0;
+          state.consecutivePartialFailures = 0;
+          state.consecutiveLatencyFailures = 0;
+          state.degradationWindow = [];
+          state.lastSwitchAt = new Date().toISOString();
+          state.lastSwitch = {
+            from: previousSelection,
+            to: nextCandidate.node,
+            reason: switchReason,
+            trigger: switchReason,
+            verified: true,
+            source: 'sentinel',
+          };
+          state.selectionAdmissionVersion = SELECTION_ADMISSION_VERSION;
+          recordAdmission('strict', activeSelection, state.currentLeaf);
+          delete state.provisionalFallback;
+          delete state.externalSelectionPendingAdmission;
+          state.lastHealthyAt = state.lastSwitchAt;
+          state.lastOptimizationScanAt = state.lastSwitchAt;
+          setDecision('switch', 'verified-candidate', { from: previousSelection, to: nextCandidate.node });
+          await persistState();
+          await this.log('info', 'switch-verified', {
+            node: nextCandidate.node,
+            leaf: state.currentLeaf,
+            reason: switchReason,
+            kind: 'cooldown',
+            successRate: verification.successRate,
+            averageMs: Math.round(verification.averageMs),
+            maxMs: verification.maxMs,
+          });
+          return { status: 'switched', current, candidate: nextCandidate, verification };
+        }
+        attempted.push({ candidate: nextCandidate, verification });
+        // 切后复核失败属于真实验证失败，仍按网络隔离时长处理，但单独标注 kind 便于审计。
+        quarantineNode(
+          state,
+          nextCandidate.node,
+          this.config.policy.failedNodeQuarantineSeconds,
+          'post-switch-verification-failed',
+          'verify',
+        );
+        await this.log('error', 'switch-verification-failed', {
           node: nextCandidate.node,
-          leaf: state.currentLeaf,
-          reason: switchReason,
-          kind: 'cooldown',
+          kind: 'verify',
           successRate: verification.successRate,
-          averageMs: Math.round(verification.averageMs),
-          maxMs: verification.maxMs,
+          averageMs: Number.isFinite(verification.averageMs) ? Math.round(verification.averageMs) : null,
+          maxMs: Number.isFinite(verification.maxMs) ? verification.maxMs : null,
         });
-        return { status: 'switched', current, candidate: nextCandidate, verification };
-      }
-      attempted.push({ candidate: nextCandidate, verification });
-      // 切后复核失败属于真实验证失败，仍按网络隔离时长处理，但单独标注 kind 便于审计。
-      quarantineNode(
-        state,
-        nextCandidate.node,
-        this.config.policy.failedNodeQuarantineSeconds,
-        'post-switch-verification-failed',
-        'verify',
-      );
-      await this.log('error', 'switch-verification-failed', {
-        node: nextCandidate.node,
-        kind: 'verify',
-        successRate: verification.successRate,
-        averageMs: Number.isFinite(verification.averageMs) ? Math.round(verification.averageMs) : null,
-        maxMs: Number.isFinite(verification.maxMs) ? verification.maxMs : null,
-      });
-      if (isStableAcrossRounds(verification, this.currentThresholds())) {
-        await this.log('warn', 'provisional-fallback-available', {
-          node: nextCandidate.node,
-          leaf: state.currentLeaf,
-          reason: 'strict-admission-failed-current-threshold-passed',
-        });
+        if (isStableAcrossRounds(verification, this.currentThresholds())) {
+          await this.log('warn', 'provisional-fallback-available', {
+            node: nextCandidate.node,
+            leaf: state.currentLeaf,
+            reason: 'strict-admission-failed-current-threshold-passed',
+          });
+        }
+      } finally {
+        this.endSwitchAttempt();
       }
     }
 
@@ -1997,93 +2145,106 @@ export class Watchdog {
       this.config.policy.postSwitchRounds,
       this.config.probes.urls,
     );
-    if (!selectionAdmissionRejected && this.config.policy.rollbackOnFailure
-      && isStableAcrossRounds(previousVerification, this.currentThresholds())) {
-      await this.beforeSwitch();
-      await this.controller.select(this.config.groups.target, previousSelection);
-      const rollbackFrom = activeSelection;
-      activeSelection = previousSelection;
-      state.currentSelection = previousSelection;
-      state.currentLeaf = await this.resolveLeaf(previousSelection);
-      const actualPreviousVerification = state.currentLeaf === currentLeaf
-        ? previousVerification
-        : await this.probeNode(
-            state.currentLeaf,
-            this.config.policy.postSwitchRounds,
-            this.config.probes.urls,
-          );
-      activeSelectionHealth = classifyHealth(
-        actualPreviousVerification, this.currentThresholds(), this.config.policy,
-      );
-      recordEvaluation(actualPreviousVerification, activeSelectionHealth,
-        previousSelection, state.currentLeaf);
-      if (isStableAcrossRounds(actualPreviousVerification, this.currentThresholds())) {
-        const rollbackStrict = hasStrictAdmissionEvidence(
-          actualPreviousVerification, this.config.probes, this.candidateThresholds(),
-        );
-        recordRecoveryRollback(state, this.config.policy, rollbackFrom, previousSelection);
-        const recoveredAt = new Date().toISOString();
-        state.consecutiveFailures = 0;
-        state.consecutivePartialFailures = 0;
-        state.consecutiveLatencyFailures = 0;
-        state.degradationWindow = [];
-        state.lastSwitchAt = recoveredAt;
-        state.lastSwitch = {
-          from: rollbackFrom,
-          to: previousSelection,
-          reason: 'rollback-recovered',
-          trigger: health.status,
-          verified: rollbackStrict,
-          source: 'sentinel',
-        };
-        if (rollbackStrict) {
-          state.selectionAdmissionVersion = SELECTION_ADMISSION_VERSION;
-          delete state.provisionalFallback;
+    const rollbackEligible = !selectionAdmissionRejected && this.config.policy.rollbackOnFailure
+      && isStableAcrossRounds(previousVerification, this.currentThresholds());
+    if (rollbackEligible) {
+      this.beginSwitchAttempt();
+      try {
+        const rollbackSwitch = await this.guardedSelect(this.config.groups.target, previousSelection);
+        if (rollbackSwitch.blocked) {
+          await this.log('warn', 'switch-guardrail-timeout', {
+            node: previousSelection,
+            phase: 'recovery-rollback',
+            timeoutMs: rollbackSwitch.timeoutMs,
+          });
         } else {
-          delete state.selectionAdmissionVersion;
-          state.provisionalFallback = {
-            at: recoveredAt, selection: previousSelection, leaf: state.currentLeaf,
-            profile: 'current-threshold', requiresStrictAdmission: true,
-          };
+          const rollbackFrom = activeSelection;
+          activeSelection = previousSelection;
+          state.currentSelection = previousSelection;
+          state.currentLeaf = await this.resolveLeaf(previousSelection);
+          const actualPreviousVerification = state.currentLeaf === currentLeaf
+            ? previousVerification
+            : await this.probeNode(
+                state.currentLeaf,
+                this.config.policy.postSwitchRounds,
+                this.config.probes.urls,
+              );
+          activeSelectionHealth = classifyHealth(
+            actualPreviousVerification, this.currentThresholds(), this.config.policy,
+          );
+          recordEvaluation(actualPreviousVerification, activeSelectionHealth,
+            previousSelection, state.currentLeaf);
+          if (isStableAcrossRounds(actualPreviousVerification, this.currentThresholds())) {
+            const rollbackStrict = hasStrictAdmissionEvidence(
+              actualPreviousVerification, this.config.probes, this.candidateThresholds(),
+            );
+            recordRecoveryRollback(state, this.config.policy, rollbackFrom, previousSelection);
+            const recoveredAt = new Date().toISOString();
+            state.consecutiveFailures = 0;
+            state.consecutivePartialFailures = 0;
+            state.consecutiveLatencyFailures = 0;
+            state.degradationWindow = [];
+            state.lastSwitchAt = recoveredAt;
+            state.lastSwitch = {
+              from: rollbackFrom,
+              to: previousSelection,
+              reason: 'rollback-recovered',
+              trigger: health.status,
+              verified: rollbackStrict,
+              source: 'sentinel',
+            };
+            if (rollbackStrict) {
+              state.selectionAdmissionVersion = SELECTION_ADMISSION_VERSION;
+              delete state.provisionalFallback;
+            } else {
+              delete state.selectionAdmissionVersion;
+              state.provisionalFallback = {
+                at: recoveredAt, selection: previousSelection, leaf: state.currentLeaf,
+                profile: 'current-threshold', requiresStrictAdmission: true,
+              };
+            }
+            recordAdmission(rollbackStrict ? 'strict' : 'usable', previousSelection, state.currentLeaf);
+            state.lastHealthyAt = recoveredAt;
+            state.lastOptimizationScanAt = recoveredAt;
+            setDecision('rollback', 'rollback-recovered', { from: rollbackFrom, to: previousSelection });
+            await this.log('warn', 'switch-recovery-rollback', {
+              from: rollbackFrom,
+              restored: previousSelection,
+              leaf: state.currentLeaf,
+              budgetExempt: true,
+              verificationProfile: 'recovery-current',
+              verificationRounds: this.config.policy.postSwitchRounds,
+            });
+            await persistState();
+            return { status: 'rollback-recovered', current, candidate, verification: actualPreviousVerification };
+          }
+          state.switchHistory.push({
+            timestamp: new Date().toISOString(),
+            from: rollbackFrom,
+            to: previousSelection,
+            kind: 'recovery-rollback-failed',
+            budgetExempt: true,
+          });
+          attempted.push({ candidate: { node: previousSelection }, verification: actualPreviousVerification });
+          quarantineNode(
+            state,
+            state.currentLeaf,
+            this.config.policy.failedNodeQuarantineSeconds,
+            'rollback-verification-failed',
+          );
+          await this.log('error', 'switch-recovery-rollback-failed', {
+            from: rollbackFrom,
+            restored: previousSelection,
+            leaf: state.currentLeaf,
+            successRate: actualPreviousVerification.successRate,
+            averageMs: Number.isFinite(actualPreviousVerification.averageMs)
+              ? Math.round(actualPreviousVerification.averageMs) : null,
+            maxMs: Number.isFinite(actualPreviousVerification.maxMs) ? actualPreviousVerification.maxMs : null,
+          });
         }
-        recordAdmission(rollbackStrict ? 'strict' : 'usable', previousSelection, state.currentLeaf);
-        state.lastHealthyAt = recoveredAt;
-        state.lastOptimizationScanAt = recoveredAt;
-        setDecision('rollback', 'rollback-recovered', { from: rollbackFrom, to: previousSelection });
-        await this.log('warn', 'switch-recovery-rollback', {
-          from: rollbackFrom,
-          restored: previousSelection,
-          leaf: state.currentLeaf,
-          budgetExempt: true,
-          verificationProfile: 'recovery-current',
-          verificationRounds: this.config.policy.postSwitchRounds,
-        });
-        await persistState();
-        return { status: 'rollback-recovered', current, candidate, verification: actualPreviousVerification };
+      } finally {
+        this.endSwitchAttempt();
       }
-      state.switchHistory.push({
-        timestamp: new Date().toISOString(),
-        from: rollbackFrom,
-        to: previousSelection,
-        kind: 'recovery-rollback-failed',
-        budgetExempt: true,
-      });
-      attempted.push({ candidate: { node: previousSelection }, verification: actualPreviousVerification });
-      quarantineNode(
-        state,
-        state.currentLeaf,
-        this.config.policy.failedNodeQuarantineSeconds,
-        'rollback-verification-failed',
-      );
-      await this.log('error', 'switch-recovery-rollback-failed', {
-        from: rollbackFrom,
-        restored: previousSelection,
-        leaf: state.currentLeaf,
-        successRate: actualPreviousVerification.successRate,
-        averageMs: Number.isFinite(actualPreviousVerification.averageMs)
-          ? Math.round(actualPreviousVerification.averageMs) : null,
-        maxMs: Number.isFinite(actualPreviousVerification.maxMs) ? actualPreviousVerification.maxMs : null,
-      });
     }
 
     const attemptedProvisionalCandidates = attempted
@@ -2106,48 +2267,71 @@ export class Watchdog {
           restorationLeaf, this.config.policy.postSwitchRounds, this.config.probes.urls,
         );
         if (isStableAcrossRounds(restorationVerification, this.currentThresholds())) {
-          await this.beforeSwitch();
-          const restoreBudget = consumeSwitchBudget(state, this.config.policy, {
-            from: activeSelection,
-            to: fallback.candidate.node,
-            kind: 'provisional-recovery',
-          }, { budgetClass: 'recovery', allowRescue: allowCurrentRescue });
-          if (restoreBudget.allowed) {
-            delete state.selectionAdmissionVersion;
-            await persistState();
-            await this.controller.select(this.config.groups.target, fallback.candidate.node);
-            activeSelection = fallback.candidate.node;
-            state.currentSelection = activeSelection;
-            state.currentLeaf = await this.resolveLeaf(activeSelection);
-            recordAdmission('pending', activeSelection, state.currentLeaf);
-            const actualRestorationVerification = state.currentLeaf === restorationLeaf
-              ? restorationVerification
-              : await this.probeNode(
-                  state.currentLeaf, this.config.policy.postSwitchRounds, this.config.probes.urls,
-                );
-            activeSelectionHealth = classifyHealth(
-              actualRestorationVerification, this.currentThresholds(), this.config.policy,
+          this.beginSwitchAttempt();
+          try {
+            const restorationSwitch = await this.guardedSelect(
+              this.config.groups.target,
+              fallback.candidate.node,
+              {
+                beforeSelect: async () => {
+                  const restoreBudget = consumeSwitchBudget(state, this.config.policy, {
+                    from: activeSelection,
+                    to: fallback.candidate.node,
+                    kind: 'provisional-recovery',
+                  }, { budgetClass: 'recovery', allowRescue: allowCurrentRescue });
+                  if (!restoreBudget.allowed) {
+                    await this.log('warn', 'provisional-restoration-budget-exhausted', { used: restoreBudget.used });
+                    return { blocked: true, reason: 'switch-budget-exhausted' };
+                  }
+                  delete state.selectionAdmissionVersion;
+                  await persistState();
+                  return { restoreBudget };
+                },
+              },
             );
-            fallback.verification = actualRestorationVerification;
-            recordEvaluation(actualRestorationVerification, activeSelectionHealth,
-              activeSelection, state.currentLeaf);
-            delete state.externalSelectionPendingAdmission;
-            const restoredUsable = isStableAcrossRounds(actualRestorationVerification, this.currentThresholds());
-            if (!restoredUsable) {
-              quarantineNode(state, state.currentLeaf, this.config.policy.failedNodeQuarantineSeconds,
-                'provisional-restoration-verification-failed');
+            if (restorationSwitch.blocked) {
+              if (restorationSwitch.reason === 'guardrail-timeout') {
+                await this.log('warn', 'switch-guardrail-timeout', {
+                  node: fallback.candidate.node,
+                  phase: 'provisional-restoration',
+                  timeoutMs: restorationSwitch.timeoutMs,
+                });
+              }
+            } else {
+              const restoreBudget = restorationSwitch.restoreBudget;
+              activeSelection = fallback.candidate.node;
+              state.currentSelection = activeSelection;
+              state.currentLeaf = await this.resolveLeaf(activeSelection);
+              recordAdmission('pending', activeSelection, state.currentLeaf);
+              const actualRestorationVerification = state.currentLeaf === restorationLeaf
+                ? restorationVerification
+                : await this.probeNode(
+                    state.currentLeaf, this.config.policy.postSwitchRounds, this.config.probes.urls,
+                  );
+              activeSelectionHealth = classifyHealth(
+                actualRestorationVerification, this.currentThresholds(), this.config.policy,
+              );
+              fallback.verification = actualRestorationVerification;
+              recordEvaluation(actualRestorationVerification, activeSelectionHealth,
+                activeSelection, state.currentLeaf);
+              delete state.externalSelectionPendingAdmission;
+              const restoredUsable = isStableAcrossRounds(actualRestorationVerification, this.currentThresholds());
+              if (!restoredUsable) {
+                quarantineNode(state, state.currentLeaf, this.config.policy.failedNodeQuarantineSeconds,
+                  'provisional-restoration-verification-failed');
+              }
+              await persistState();
+              retained = fallback;
+              await this.log(restoredUsable ? 'warn' : 'error', restoredUsable
+                ? 'provisional-fallback-restored' : 'provisional-restoration-verification-failed', {
+                node: activeSelection,
+                leaf: state.currentLeaf,
+                budgetClass: restoreBudget.budgetClass,
+                successRate: actualRestorationVerification.successRate,
+              });
             }
-            await persistState();
-            retained = fallback;
-            await this.log(restoredUsable ? 'warn' : 'error', restoredUsable
-              ? 'provisional-fallback-restored' : 'provisional-restoration-verification-failed', {
-              node: activeSelection,
-              leaf: state.currentLeaf,
-              budgetClass: restoreBudget.budgetClass,
-              successRate: actualRestorationVerification.successRate,
-            });
-          } else {
-            await this.log('warn', 'provisional-restoration-budget-exhausted', { used: restoreBudget.used });
+          } finally {
+            this.endSwitchAttempt();
           }
         } else {
           await this.log('warn', 'provisional-restoration-validation-failed', {

@@ -232,11 +232,15 @@ async function main() {
       lastRuntimeGuardStatus = runtimeGuard.status;
       return runtimeGuard;
   });
+  // 切换尝试临界区标记：从 beforeSwitch 到切后验证/失败隔离/回滚决策期间，定时守卫跳过本轮。
+  let switchInProgress = false;
   const watchdog = new Watchdog({
     controller,
     config,
     logger,
     runtime,
+    onSwitchStart: () => { switchInProgress = true; },
+    onSwitchEnd: () => { switchInProgress = false; },
     beforeSwitch: async () => {
       if (!config.guardrails.enabled) return;
       const runtimeGuard = await runRuntimeGuard();
@@ -299,6 +303,8 @@ async function main() {
   const runtimeGuardTimer = options.run && options.apply && config.guardrails.enabled
     ? setInterval(async () => {
         if (shuttingDown) return;
+        // 切换临界区内直接跳过本轮，不排队；切换结束后下个周期再评估。
+        if (switchInProgress) return;
         try {
           await runRuntimeGuard();
         } catch (error) {
