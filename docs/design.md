@@ -335,6 +335,9 @@
 | `src/lock.mjs` | 原子租约单实例锁与 Controller 指纹 |
 | `src/state-store.mjs` | 状态版本校验、损坏自愈与原子落盘 |
 | `src/link-probe.mjs` | HTTPS CONNECT、TLS、TTFB与WebSocket遥测 |
+| `src/clash-verge-process.mjs` | Clash Verge 进程发现/停止/启动/重启、appDir 解析与配置文件刷新等待 |
+| `src/runtime-mode.mjs` | 运行模式读取、修补与复核（controller 注入） |
+| `src/guard-journal.mjs` | 守卫状态读取、原子落盘与审计/债务字段辅助 |
 | `src/guardrails.mjs` | 已启用的客户端、运行模式与DNS守卫 |
 | `src/observability.mjs` | 日志轮转、状态快照和可读输出 |
 

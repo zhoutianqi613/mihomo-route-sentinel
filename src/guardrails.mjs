@@ -1,9 +1,5 @@
-import { execFile } from 'node:child_process';
-import {
-  access, mkdir, readFile, rename, stat, unlink, writeFile,
-} from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { promisify } from 'node:util';
 import {
   applyFixedMutations,
   ensureGuardrailBackup,
@@ -12,8 +8,33 @@ import {
   restoreGuardrailBackup,
   validateClashVergeAppDir,
 } from './dns-config.mjs';
+import {
+  discoverClashVergeAppDir,
+  ensureClashVergeRunningWindows,
+  fileRefreshed,
+  fileStamp,
+  pathExists,
+  resolveClashVergeWindows,
+  restartClashVergeWindows,
+  sameWindowsPath,
+  startClashVergeWindows,
+  stopClashVergeIfRunningWindows,
+  validateClashVergeExecutable,
+  waitForFileRefresh,
+} from './clash-verge-process.mjs';
+import {
+  DNS_RETRY_BACKOFF_MS,
+  appendGuardAudit,
+  deferPendingRetry,
+  readGuardState,
+  recordDnsBackup,
+  retryIsDue,
+  rollbackPendingDnsReload,
+  writeGuardState,
+} from './guard-journal.mjs';
+import { runtimeModeIsExpected } from './runtime-mode.mjs';
 
-// DNS 配置的解析、判定、定长写入与备份/恢复已迁到 dns-config.mjs；
+// DNS 配置读写、进程控制、运行模式与 guard journal 已拆到独立模块；
 // 这里保持原有对外导出不变，避免 cli 与既有测试改动。
 export {
   disableClashVergeDnsOverride,
@@ -21,130 +42,8 @@ export {
   replaceTopLevelScalar,
 } from './dns-config.mjs';
 export { restoreGuardrailBackup, validateClashVergeAppDir };
-
-const execFileAsync = promisify(execFile);
-const CLASH_VERGE_DIR = 'io.github.clash-verge-rev.clash-verge-rev';
-
-async function exists(target) {
-  try { await access(target); return true; } catch { return false; }
-}
-
-export function discoverClashVergeAppDir({ configuredPath = '', platform = process.platform, env = process.env } = {}) {
-  if (configuredPath) return path.resolve(configuredPath);
-  if (platform === 'win32' && env.APPDATA) return path.join(env.APPDATA, CLASH_VERGE_DIR);
-  if (platform === 'darwin' && env.HOME) {
-    return path.join(env.HOME, 'Library', 'Application Support', CLASH_VERGE_DIR);
-  }
-  if (env.XDG_CONFIG_HOME) return path.join(env.XDG_CONFIG_HOME, CLASH_VERGE_DIR);
-  if (env.HOME) return path.join(env.HOME, '.config', CLASH_VERGE_DIR);
-  return '';
-}
-
-async function resolveClashVergeWindows({ allowMissing = false } = {}) {
-  const script = [
-    '$sessionId = (Get-Process -Id $PID).SessionId',
-    "$matches = @(Get-CimInstance Win32_Process -Filter \"Name = 'clash-verge.exe'\" | Where-Object { $_.SessionId -eq $sessionId -and $_.ExecutablePath })",
-    `if ($matches.Count -eq 0 -and ${allowMissing ? '$true' : '$false'}) { exit 0 }`,
-    "if ($matches.Count -ne 1) { throw 'Expected exactly one Clash Verge GUI process in the current session' }",
-    'Write-Output $matches[0].ExecutablePath',
-  ].join('; ');
-  const { stdout } = await execFileAsync('powershell.exe', [
-    '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
-  ], { windowsHide: true, timeout: 15000 });
-  const executable = stdout.trim();
-  if (!executable && allowMissing) return null;
-  if (!path.isAbsolute(executable)) throw new Error('Clash Verge executable path was not resolved');
-  return executable;
-}
-
-async function stopClashVergeWindows(expectedExecutable) {
-  const script = [
-    '$sessionId = (Get-Process -Id $PID).SessionId',
-    "$matches = @(Get-CimInstance Win32_Process -Filter \"Name = 'clash-verge.exe'\" | Where-Object { $_.SessionId -eq $sessionId -and $_.ExecutablePath -eq $env:MIHOMO_ROUTE_SENTINEL_CLASH_EXE })",
-    "if ($matches.Count -ne 1) { throw 'Expected exactly one matching Clash Verge GUI process' }",
-    'Stop-Process -Id $matches[0].ProcessId -Force',
-  ].join('; ');
-  await execFileAsync('powershell.exe', [
-    '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
-  ], {
-    windowsHide: true,
-    timeout: 15000,
-    env: { ...process.env, MIHOMO_ROUTE_SENTINEL_CLASH_EXE: expectedExecutable },
-  });
-}
-
-async function startClashVergeWindows(executable) {
-  await execFileAsync('powershell.exe', [
-    '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command',
-    'Start-Process -FilePath $env:MIHOMO_ROUTE_SENTINEL_CLASH_EXE -WindowStyle Hidden',
-  ], {
-    windowsHide: true,
-    timeout: 15000,
-    env: { ...process.env, MIHOMO_ROUTE_SENTINEL_CLASH_EXE: executable },
-  });
-}
-
-function validateClashVergeExecutable(executable) {
-  if (!executable || !path.isAbsolute(executable)
-      || path.basename(executable).toLowerCase() !== 'clash-verge.exe') {
-    throw new Error('Clash Verge executable path is invalid');
-  }
-  return path.resolve(executable);
-}
-
-function sameWindowsPath(left, right) {
-  return path.resolve(left).toLowerCase() === path.resolve(right).toLowerCase();
-}
-
-async function stopClashVergeIfRunningWindows(expectedExecutable = null) {
-  const runningExecutable = await resolveClashVergeWindows({ allowMissing: true });
-  const executable = validateClashVergeExecutable(expectedExecutable ?? runningExecutable);
-  if (runningExecutable) {
-    if (!sameWindowsPath(runningExecutable, executable)) {
-      throw new Error('Running Clash Verge executable does not match pending repair');
-    }
-    await stopClashVergeWindows(executable);
-  }
-  return executable;
-}
-
-async function restartClashVergeWindows(expectedExecutable = null) {
-  const executable = await stopClashVergeIfRunningWindows(expectedExecutable);
-  await new Promise((resolve) => setTimeout(resolve, 800));
-  await startClashVergeWindows(executable);
-  return true;
-}
-
-async function ensureClashVergeRunningWindows(expectedExecutable) {
-  const executable = validateClashVergeExecutable(expectedExecutable);
-  const runningExecutable = await resolveClashVergeWindows({ allowMissing: true });
-  if (!runningExecutable) {
-    await startClashVergeWindows(executable);
-    return;
-  }
-  if (!sameWindowsPath(runningExecutable, executable)) {
-    throw new Error('Running Clash Verge executable does not match pending repair');
-  }
-}
-
-async function fileStamp(filePath) {
-  const metadata = await stat(filePath);
-  return { mtimeMs: metadata.mtimeMs };
-}
-
-function fileRefreshed(before, after) {
-  return Boolean(after && (!before || after.mtimeMs > before.mtimeMs));
-}
-
-async function waitForFileRefresh(filePath, previousStamp, timeoutMs = 20000) {
-  const deadline = Date.now() + timeoutMs;
-  do {
-    const current = await fileStamp(filePath).catch(() => null);
-    if (fileRefreshed(previousStamp, current)) return current;
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  } while (Date.now() < deadline);
-  return null;
-}
+export { discoverClashVergeAppDir };
+export { enforceRuntimeMode } from './runtime-mode.mjs';
 
 function publicResult(status, details = {}) {
   return {
@@ -179,7 +78,7 @@ export async function enforceClashVergeAvailability({
   let runningExecutable;
   try {
     executable = validateClashVergeExecutable(guardrails.clashVergeExecutable);
-    if (!await exists(executable)) throw new Error('configured executable does not exist');
+    if (!await pathExists(executable)) throw new Error('configured executable does not exist');
     runningExecutable = await resolveRunningExecutable({ allowMissing: true });
   } catch {
     return publicResult('blocked', {
@@ -248,75 +147,6 @@ export async function enforceClashVergeAvailability({
   return publicResult('blocked', { issues: timeoutIssues, unresolved: timeoutIssues });
 }
 
-export async function enforceRuntimeMode({ controller, expectedMode, autoRepair = true, dryRun = true } = {}) {
-  try {
-    const runtime = await controller.getConfigs();
-    if (runtime?.mode === expectedMode) return publicResult('ok');
-    if (!autoRepair || dryRun) {
-      return publicResult('would-repair', {
-        issues: ['runtime-mode'],
-        unresolved: ['runtime-mode'],
-      });
-    }
-    await controller.patchConfigs({ mode: expectedMode });
-    if (!await runtimeModeIsExpected(controller, expectedMode)) throw new Error('mode verification failed');
-    return publicResult('repaired', { issues: ['runtime-mode'], repairs: ['runtime-mode'] });
-  } catch {
-    return publicResult('blocked', {
-      issues: ['controller-unreachable'],
-      unresolved: ['controller-unreachable'],
-    });
-  }
-}
-
-async function readGuardState(stateFile) {
-  if (!stateFile) return {};
-  try {
-    const parsed = JSON.parse(await readFile(stateFile, 'utf8'));
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      throw new Error('guard state must be an object');
-    }
-    return parsed;
-  } catch (error) {
-    if (error.code === 'ENOENT') return {};
-    throw error;
-  }
-}
-
-async function writeGuardState(stateFile, state) {
-  if (!stateFile) throw new Error('guard state file is not configured');
-  await mkdir(path.dirname(stateFile), { recursive: true });
-  const temporary = `${stateFile}.${process.pid}.tmp`;
-  try {
-    await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
-    await rename(temporary, stateFile);
-  } finally {
-    await unlink(temporary).catch(() => {});
-  }
-}
-
-async function runtimeModeIsExpected(controller, expectedMode) {
-  const runtime = await controller.getConfigs();
-  return runtime?.mode === expectedMode;
-}
-
-const DNS_RETRY_BACKOFF_MS = 30_000;
-
-function retryIsDue(pending, nowMs = Date.now()) {
-  const retryAt = Date.parse(pending?.nextAttemptAt ?? '');
-  return !Number.isFinite(retryAt) || retryAt <= nowMs;
-}
-
-function deferPendingRetry(pending, nowMs = Date.now()) {
-  return {
-    ...pending,
-    attemptCount: (Number.isInteger(pending?.attemptCount) ? pending.attemptCount : 0) + 1,
-    nextAttemptAt: new Date(nowMs + DNS_RETRY_BACKOFF_MS).toISOString(),
-  };
-}
-
-const DNS_REPAIR_ROLLBACK_AUDIT_LIMIT = 20;
-
 /**
  * DNS 修复复核失败后的自动回滚：用最近备份原子恢复 verge.yaml，
  * 审计事件写入 guard journal，债务回到 repair-required 并退避。
@@ -374,17 +204,9 @@ async function rollbackDnsRepair({
   }
   if (restoreError && !record.restoreError) record.restoreError = restoreError.message;
   guardState.dnsRepairRollback = record;
-  guardState.auditEvents = [
-    ...(Array.isArray(guardState.auditEvents) ? guardState.auditEvents : []),
-    record,
-  ].slice(-DNS_REPAIR_ROLLBACK_AUDIT_LIMIT);
+  appendGuardAudit(guardState, record);
   // 回滚后 override 重新出现，债务回到待修复并退避，交给后续周期重试。
-  guardState.pendingDnsReload = {
-    ...(pendingReload ?? { kind: 'dns-reload-required' }),
-    phase: 'repair-required',
-    nextAttemptAt: new Date(Date.now() + DNS_RETRY_BACKOFF_MS).toISOString(),
-    lastRollbackAt: at,
-  };
+  guardState.pendingDnsReload = rollbackPendingDnsReload(pendingReload, at);
   try {
     await writeGuardState(guardStateFile, guardState);
   } catch (error) {
@@ -452,7 +274,7 @@ export async function enforceGuardrails({
       detect('clash-verge-appdir-untrusted');
       return { ...result('blocked'), code: error.code, guardrailReason: error.reason };
     }
-    if (appDir && await exists(vergePath) && await exists(profilesPath)) {
+    if (appDir && await pathExists(vergePath) && await pathExists(profilesPath)) {
       try {
         const profileUid = await readTopLevelScalarFile(profilesPath, 'current');
         if (!profileUid) throw new Error('active profile missing');
@@ -542,7 +364,7 @@ export async function enforceGuardrails({
                     // 先确保备份存在再写配置：即使写入中途失败，回滚也有完整原文。
                     dnsBackup = await ensureGuardrailBackup(vergePath);
                     await applyFixedMutations(vergePath, freshDns.mutations, freshDns.metadata);
-                    guardState.lastDnsBackup = dnsBackup;
+                    recordDnsBackup(guardState, dnsBackup);
                     repairs.add('dns-override-persisted');
                   }
                   dns = await inspectDnsOverrideFile(vergePath, profileUid);
@@ -673,7 +495,7 @@ export async function enforceGuardrails({
       detect('clash-verge-appdir-untrusted');
       return { ...result('blocked'), code: error.code, guardrailReason: error.reason };
     }
-    if (!appDir || !await exists(vergePath) || !await exists(profilesPath)) {
+    if (!appDir || !await pathExists(vergePath) || !await pathExists(profilesPath)) {
       detect('clash-verge-config-unavailable');
     } else {
       try {
@@ -773,7 +595,7 @@ export async function enforceGuardrails({
                 // 先确保备份存在再写配置：即使写入中途失败，回滚也有完整原文。
                 dnsBackup = await ensureGuardrailBackup(vergePath);
                 await applyFixedMutations(vergePath, freshDns.mutations, freshDns.metadata);
-                guardState.lastDnsBackup = dnsBackup;
+                recordDnsBackup(guardState, dnsBackup);
                 repairs.add('dns-override-persisted');
               }
               dns = await inspectDnsOverrideFile(vergePath, profileUid);
