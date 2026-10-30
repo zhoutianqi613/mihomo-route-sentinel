@@ -324,6 +324,7 @@
 | `src/decision-state.mjs` | 重建健康、准入、行动、预算四维状态与旧状态迁移 |
 | `src/switch-budget.mjs` | 独立优化、恢复和有界救援预算账本 |
 | `src/estimator.mjs` | Wilson 下界、分位与延迟上界等小样本估计 |
+| `src/health-policy.mjs` | 健康分级、分轮稳定性、准入证据、退化窗口与隔离等纯策略函数 |
 | `src/lock.mjs` | 原子租约单实例锁与 Controller 指纹 |
 | `src/state-store.mjs` | 状态版本校验、损坏自愈与原子落盘 |
 | `src/link-probe.mjs` | HTTPS CONNECT、TLS、TTFB与WebSocket遥测 |
