@@ -385,3 +385,43 @@ test('状态页时间统一保留原始时间并标注本地时区', async () =>
     assert.match(output, /本地 \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC[+-]\d{2}:\d{2}/);
   });
 });
+
+test('等待原因覆盖连续失败阈值与严格准入待定', async () => {
+  await withStatusDir(async (root) => {
+    const evaluation = recentEvaluation();
+    const runtime = { version: await packageVersion(), pid: process.pid, startedAt: evaluation.timestamp };
+    const thresholdFiles = await writeFiles(root, {
+      state: {
+        runtime,
+        lastEvaluation: evaluation,
+        lastDecision: {
+          at: evaluation.timestamp,
+          action: 'hold',
+          reason: 'failure-threshold-not-reached',
+          failures: 1,
+          required: 2,
+        },
+      },
+    });
+    const thresholdText = formatStatus(await buildStatusSnapshot({
+      ...thresholdFiles,
+      instance: { lockPresent: true, pid: process.pid, alive: true },
+      intervalSeconds: 30,
+    }));
+    assert.match(thresholdText, /连续失败 1 次，未到触发阈值 2 次/);
+
+    const pendingFiles = await writeFiles(root, {
+      state: {
+        runtime,
+        lastEvaluation: evaluation,
+        lastDecision: { at: evaluation.timestamp, action: 'hold', reason: 'strict-admission-pending' },
+      },
+    });
+    const pendingText = formatStatus(await buildStatusSnapshot({
+      ...pendingFiles,
+      instance: { lockPresent: true, pid: process.pid, alive: true },
+      intervalSeconds: 30,
+    }));
+    assert.match(pendingText, /当前出口健康但尚未取得严格准入/);
+  });
+});

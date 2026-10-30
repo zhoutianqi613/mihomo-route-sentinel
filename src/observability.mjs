@@ -228,6 +228,12 @@ const WAIT_REASON_TEXT = Object.freeze({
   'candidate-scan-backoff-active': (decision) => `退避剩余 ${display(decision.remainingSeconds)} 秒`,
   'pre-switch-validation-incomplete': () => '样本未采完将重试',
   'no-meaningful-improvement': (decision) => `改善不足 ${display(decision.requiredImprovementMs)} ms`,
+  'failure-threshold-not-reached': (decision) => (
+    `连续失败 ${display(decision.failures)} 次，未到触发阈值 ${display(decision.required)} 次，继续观察`
+  ),
+  'no-pre-switch-candidate': () => '本轮无候选通过切前复核，已退避后重试',
+  'upstream-outage': () => '疑似上游故障（对照地址可用），暂停切换',
+  'strict-admission-pending': () => '当前出口健康但尚未取得严格准入，继续观察',
 });
 
 // 状态页时间统一附带本地时区标注；保留原始 ISO 便于与日志逐条比对。
