@@ -1,11 +1,16 @@
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { access, mkdir, open, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
+import {
+  access, lstat, mkdir, open, readFile, realpath, rename, stat, unlink, writeFile,
+} from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
 const CLASH_VERGE_DIR = 'io.github.clash-verge-rev.clash-verge-rev';
+// 与 enforceGuardrails 实际读写/读取的文件保持一致。
+const GUARDRAIL_CONFIG_FILES = Object.freeze(['verge.yaml', 'profiles.yaml']);
 
 function lineIndent(line) {
   return line.match(/^\s*/)?.[0].length ?? 0;
@@ -141,6 +146,105 @@ export function replaceTopLevelScalar(content, key, expected) {
 
 async function exists(target) {
   try { await access(target); return true; } catch { return false; }
+}
+
+function sha256Digest(buffer) {
+  return createHash('sha256').update(buffer).digest('hex');
+}
+
+function sameFileSystemPath(left, right) {
+  const normalize = (value) => {
+    const resolved = path.resolve(value);
+    // Windows 路径大小写不敏感；其他平台保持严格比较。
+    return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+  };
+  return normalize(left) === normalize(right);
+}
+
+function guardrailDirUntrusted(reason) {
+  const error = new Error(`Clash Verge 配置目录不可信：${reason}`);
+  error.code = 'GUARDRAIL_DIR_UNTRUSTED';
+  error.reason = reason;
+  return error;
+}
+
+/**
+ * 校验 Clash Verge 配置目录是否可信：目录本身不是符号链接/联接点，
+ * 真实路径没有被重定向（中间路径若含符号链接，realpath 会与字面路径不一致），
+ * 且必须同时包含代码实际使用的 verge.yaml 与 profiles.yaml。
+ * 失败统一抛出 code='GUARDRAIL_DIR_UNTRUSTED'，由调用方转成 blocked。
+ */
+export async function validateClashVergeAppDir(appDir) {
+  if (typeof appDir !== 'string' || !appDir.trim() || !path.isAbsolute(appDir)) {
+    throw guardrailDirUntrusted('app-dir-invalid');
+  }
+  const resolved = path.resolve(appDir);
+  const directoryStats = await lstat(resolved).catch(() => null);
+  if (!directoryStats) throw guardrailDirUntrusted('app-dir-missing');
+  if (directoryStats.isSymbolicLink()) throw guardrailDirUntrusted('app-dir-symlink');
+  if (!directoryStats.isDirectory()) throw guardrailDirUntrusted('app-dir-not-directory');
+  const canonical = await realpath(resolved).catch(() => null);
+  if (!canonical) throw guardrailDirUntrusted('app-dir-unresolvable');
+  if (!sameFileSystemPath(canonical, resolved)) throw guardrailDirUntrusted('app-dir-redirected');
+  for (const name of GUARDRAIL_CONFIG_FILES) {
+    const target = path.join(resolved, name);
+    const fileStats = await lstat(target).catch(() => null);
+    if (!fileStats) throw guardrailDirUntrusted(`missing-${name}`);
+    if (fileStats.isSymbolicLink()) throw guardrailDirUntrusted(`symlink-${name}`);
+    if (!fileStats.isFile()) throw guardrailDirUntrusted(`not-file-${name}`);
+  }
+  return resolved;
+}
+
+/**
+ * 就地定长写入前备份原文件：已存在 <file>.sentinel.bak 时不覆盖，
+ * 否则用临时文件 + rename 生成完整备份（中途失败不会留下半份备份）。
+ * 返回备份路径、备份内容的 sha256 与本次是否新建。
+ */
+async function backupBeforeMutation(filePath) {
+  const backupPath = `${filePath}.sentinel.bak`;
+  if (await exists(backupPath)) {
+    const existing = await readFile(backupPath);
+    return { path: backupPath, sha256: sha256Digest(existing), created: false };
+  }
+  const original = await readFile(filePath);
+  const temporary = `${backupPath}.${process.pid}.tmp`;
+  try {
+    await writeFile(temporary, original);
+    await rename(temporary, backupPath);
+  } finally {
+    await unlink(temporary).catch(() => {});
+  }
+  return { path: backupPath, sha256: sha256Digest(original), created: true };
+}
+
+/**
+ * 从备份原子恢复目标文件（临时文件 + rename）。
+ * 只在上层显式调用时执行，不会由守护流程自动触发。
+ */
+export async function restoreGuardrailBackup(backupPath, targetPath) {
+  const invalidBackup = (message) => Object.assign(
+    new Error(message),
+    { code: 'GUARDRAIL_BACKUP_INVALID' },
+  );
+  if (typeof backupPath !== 'string' || !backupPath.trim()
+      || typeof targetPath !== 'string' || !targetPath.trim()) {
+    throw invalidBackup('备份路径与目标路径都必须提供');
+  }
+  let content;
+  try {
+    content = await readFile(backupPath);
+  } catch (error) {
+    throw Object.assign(invalidBackup(`备份不可读取：${error.code ?? error.message}`), { cause: error });
+  }
+  const temporary = `${targetPath}.${process.pid}.restore.tmp`;
+  try {
+    await writeFile(temporary, content);
+    await rename(temporary, targetPath);
+  } finally {
+    await unlink(temporary).catch(() => {});
+  }
+  return { restored: true, sha256: sha256Digest(content) };
 }
 
 export function discoverClashVergeAppDir({ configuredPath = '', platform = process.platform, env = process.env } = {}) {
@@ -337,6 +441,8 @@ async function applyFixedMutations(filePath, mutations, expectedMetadata = null)
       && (current.size !== expectedMetadata.size || current.mtimeMs !== expectedMetadata.mtimeMs)) {
     throw new Error('configuration changed before repair');
   }
+  // 真正写入前先落备份；备份失败会直接抛出，原文件保持不动。
+  const backup = await backupBeforeMutation(filePath);
   const handle = await open(filePath, 'r+');
   try {
     // 先注释子字段，最后注释 profile 头；任意中断都可用同一 journal 幂等续写。
@@ -354,6 +460,7 @@ async function applyFixedMutations(filePath, mutations, expectedMetadata = null)
   } finally {
     await handle.close();
   }
+  return { backup };
 }
 
 async function fileStamp(filePath) {
@@ -592,6 +699,14 @@ export async function enforceGuardrails({
     const vergePath = path.join(appDir, 'verge.yaml');
     const profilesPath = path.join(appDir, 'profiles.yaml');
     const runtimeConfigPath = path.join(appDir, 'clash-verge.yaml');
+    // 目录不可信时既不读也不写用户配置：直接 blocked，等待人工确认。
+    try {
+      await validateClashVergeAppDir(appDir);
+    } catch (error) {
+      if (error?.code !== 'GUARDRAIL_DIR_UNTRUSTED') throw error;
+      detect('clash-verge-appdir-untrusted');
+      return { ...result('blocked'), code: error.code, guardrailReason: error.reason };
+    }
     if (appDir && await exists(vergePath) && await exists(profilesPath)) {
       try {
         const profileUid = await readTopLevelScalarFile(profilesPath, 'current');
@@ -669,6 +784,7 @@ export async function enforceGuardrails({
               const customRestart = restartClashVerge !== restartClashVergeWindows;
               let executable = pendingReload.executable ?? null;
               let appWasStopped = false;
+              let dnsBackup = null;
               try {
                 if (phase === 'repair-required') {
                   if (!customRestart) {
@@ -678,7 +794,9 @@ export async function enforceGuardrails({
                   const freshDns = await inspectDnsOverrideFile(vergePath, profileUid);
                   if (freshDns.enabled || freshDns.globalEnabled) {
                     if (freshDns.mutations.length === 0) throw new Error('dns override changed before repair');
-                    await applyFixedMutations(vergePath, freshDns.mutations, freshDns.metadata);
+                    const applied = await applyFixedMutations(vergePath, freshDns.mutations, freshDns.metadata);
+                    dnsBackup = applied?.backup ?? null;
+                    if (dnsBackup) guardState.lastDnsBackup = dnsBackup;
                     repairs.add('dns-override-persisted');
                   }
                   dns = await inspectDnsOverrideFile(vergePath, profileUid);
@@ -691,6 +809,7 @@ export async function enforceGuardrails({
                   ...pendingReload,
                   phase: 'reload-required',
                   executable,
+                  ...(dnsBackup ? { dnsBackup } : {}),
                   runtimeStamp: await fileStamp(runtimeConfigPath).catch(() => null),
                   nextAttemptAt: null,
                 };
@@ -770,6 +889,14 @@ export async function enforceGuardrails({
     const vergePath = path.join(appDir, 'verge.yaml');
     const profilesPath = path.join(appDir, 'profiles.yaml');
     const runtimeConfigPath = path.join(appDir, 'clash-verge.yaml');
+    // 目录不可信时既不读也不写用户配置：直接 blocked，等待人工确认。
+    try {
+      await validateClashVergeAppDir(appDir);
+    } catch (error) {
+      if (error?.code !== 'GUARDRAIL_DIR_UNTRUSTED') throw error;
+      detect('clash-verge-appdir-untrusted');
+      return { ...result('blocked'), code: error.code, guardrailReason: error.reason };
+    }
     if (!appDir || !await exists(vergePath) || !await exists(profilesPath)) {
       detect('clash-verge-config-unavailable');
     } else {
@@ -857,6 +984,7 @@ export async function enforceGuardrails({
 
           let executable = pendingReload.executable ?? null;
           let appWasStopped = false;
+          let dnsBackup = null;
           try {
             if (dns.enabled || dns.globalEnabled || pendingReload.phase === 'repair-required') {
               if (!customRestart) {
@@ -866,7 +994,9 @@ export async function enforceGuardrails({
               const freshDns = await inspectDnsOverrideFile(vergePath, profileUid);
               if (freshDns.enabled || freshDns.globalEnabled) {
                 if (freshDns.mutations.length === 0) throw new Error('dns override changed before repair');
-                await applyFixedMutations(vergePath, freshDns.mutations, freshDns.metadata);
+                const applied = await applyFixedMutations(vergePath, freshDns.mutations, freshDns.metadata);
+                dnsBackup = applied?.backup ?? null;
+                if (dnsBackup) guardState.lastDnsBackup = dnsBackup;
                 repairs.add('dns-override-persisted');
               }
               dns = await inspectDnsOverrideFile(vergePath, profileUid);
@@ -875,6 +1005,7 @@ export async function enforceGuardrails({
                 ...pendingReload,
                 phase: 'reload-required',
                 executable,
+                ...(dnsBackup ? { dnsBackup } : {}),
                 runtimeStamp: await fileStamp(runtimeConfigPath).catch(() => null),
                 nextAttemptAt: null,
               };
