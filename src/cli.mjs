@@ -204,6 +204,8 @@ async function main() {
     version: packageMetadata.version,
     pid: process.pid,
     startedAt: new Date().toISOString(),
+    mode: options.run ? 'continuous' : 'once',
+    apply: options.apply === true,
   };
   let config;
   try {

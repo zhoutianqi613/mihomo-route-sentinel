@@ -166,6 +166,29 @@ function latestByEvent(records, event) {
   return records.findLast((record) => record?.event === event) ?? null;
 }
 
+function normalizeRuntime(runtime) {
+  if (!runtime || typeof runtime !== 'object') return null;
+  return {
+    ...runtime,
+    mode: runtime.mode === 'continuous' || runtime.mode === 'once' ? runtime.mode : null,
+    apply: typeof runtime.apply === 'boolean' ? runtime.apply : null,
+  };
+}
+
+// 状态里的 runtime 可能来自旧版本（没有 mode/apply），也可能落后于刚启动的 Dry Run；
+// 用 startedAt 较新的一方补全展示字段，避免把 Dry Run 误报成实际控制。
+function resolveRuntime(stateRuntime, loggedRuntime) {
+  const saved = normalizeRuntime(stateRuntime);
+  const logged = normalizeRuntime(loggedRuntime);
+  if (!saved) return logged;
+  if (!logged) return saved;
+  const savedStart = Date.parse(saved.startedAt ?? '');
+  const loggedStart = Date.parse(logged.startedAt ?? '');
+  const loggedIsNewer = Number.isFinite(loggedStart)
+    && (!Number.isFinite(savedStart) || loggedStart > savedStart);
+  return loggedIsNewer ? logged : saved;
+}
+
 const GUARDRAIL_ISSUE_TEXT = Object.freeze({
   'controller-unreachable': 'Mihomo Controller 不可达',
   'runtime-mode': '运行模式不符合预期',
@@ -358,8 +381,9 @@ export async function buildStatusSnapshot({
     getLiveSelection(controller, targetGroup),
   ]);
   const loggedEvaluation = latestByEvent(records, 'current-node-evaluated');
-  // 状态文件缺失 runtime 时回退到最近一次启动日志，避免状态页把旧进程信息显示成未知。
-  const runtime = state.runtime ?? latestByEvent(records, 'watchdog-started')?.runtime ?? null;
+  const loggedRuntime = latestByEvent(records, 'watchdog-started')?.runtime ?? null;
+  // 状态文件缺失 runtime 或刚启动的新实例尚未落盘时，回退到最近一次启动日志。
+  const runtime = resolveRuntime(state.runtime, loggedRuntime);
   const savedEvaluation = state.lastEvaluation;
   const savedTime = Date.parse(savedEvaluation?.timestamp ?? savedEvaluation?.at ?? '');
   const loggedTime = Date.parse(loggedEvaluation?.timestamp ?? '');
@@ -380,6 +404,7 @@ export async function buildStatusSnapshot({
       };
   const warnings = [...stateWarnings, ...logWarnings];
   if (live?.error) warnings.push(live.error);
+  if (runtime?.apply === false) warnings.push('当前不会切换节点（Dry Run）');
   if (instance && (!instance.lockPresent || !instance.alive)) {
     warnings.push('无运行实例（以下为上次运行记录）');
   }
@@ -612,6 +637,12 @@ export function formatStatus(snapshot) {
   const admissionText = admission
     ? `${admissionLabels[admission.profile] ?? admission.profile}，verified=${admission.verified}，${display(admission.reason)}`
     : '尚无数据';
+  const runtimeModeText = snapshot.runtime?.mode === 'continuous'
+    ? '持续守护'
+    : (snapshot.runtime?.mode === 'once' ? '单次' : '未知');
+  const runtimeApplyText = snapshot.runtime?.apply === true
+    ? '实际控制(--apply)'
+    : (snapshot.runtime?.apply === false ? 'Dry Run(--dry-run)' : '未知');
   const lines = [];
   if (snapshot.instance && (!snapshot.instance.lockPresent || !snapshot.instance.alive)) {
     lines.push('无运行实例（以下为上次运行记录）');
@@ -619,6 +650,7 @@ export function formatStatus(snapshot) {
   lines.push(
     'Mihomo Route Sentinel 运行状态',
     `运行版本       : ${display(snapshot.runtime?.version)}（PID ${display(snapshot.runtime?.pid)}，启动 ${localTimeText(snapshot.runtime?.startedAt)}）`,
+    `运行模式       : ${runtimeModeText} · ${runtimeApplyText}`,
     `当前选择       : ${display(snapshot.current?.selected)}`,
     `当前叶子节点   : ${display(snapshot.current?.leaf)}（来源：${display(snapshot.current?.source)}）`,
     `最近探测       : ${localTimeText(snapshot.probe?.at)}`,
