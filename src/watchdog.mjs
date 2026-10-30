@@ -1056,12 +1056,19 @@ export class Watchdog {
       ? ['https', 'websocket'].filter((kind) => linkTelemetry[kind]?.networkOk === false)
       : [];
     const linkFailures = networkFailures;
-    // businessAnnotations 只记录“网络可达但业务结果非 accepted/upgraded”的证据，不参与判定。
-    const businessAnnotations = linkOutcomes
-      .filter((entry) => entry.networkOk && !['accepted', 'upgraded'].includes(entry.outcome))
+    // businessAnnotations 只记录“网络可达但业务结果非 accepted/upgraded”的证据。
+    const businessFailures = linkOutcomes
+      .filter((entry) => entry.networkOk && !['accepted', 'upgraded'].includes(entry.outcome));
+    const businessAnnotations = businessFailures
       .map(({ kind, outcome, statusCode }) => ({ kind, outcome, statusCode }));
+    // 业务失败门默认关闭：保持“业务结果只记录、不参与健康判定”的既有行为。
+    const businessGateEnabled = this.config.telemetry?.businessFailureMarksDegraded === true;
     const applyLinkHealth = (probeHealth) => {
-      if (linkFailures.length === 0 || requiresImmediateResponse(probeHealth)) return probeHealth;
+      const networkDegraded = linkFailures.length > 0;
+      const businessDegraded = businessGateEnabled && businessFailures.length > 0;
+      if ((!networkDegraded && !businessDegraded) || requiresImmediateResponse(probeHealth)) {
+        return probeHealth;
+      }
       return {
         stable: false,
         emergency: false,
@@ -1073,7 +1080,7 @@ export class Watchdog {
     state.currentSelection = previousSelection;
     state.currentLeaf = currentLeaf;
     let availabilityRecoveryRequired = current.successRate < 1 || requiresImmediateResponse(health)
-      || linkFailures.length > 0;
+      || linkFailures.length > 0 || (businessGateEnabled && businessFailures.length > 0);
     recordEvaluation(current, health, previousSelection, currentLeaf, linkFailures, {
       linkOutcomes,
       businessAnnotations,
@@ -1092,6 +1099,7 @@ export class Watchdog {
       maxMs: Number.isFinite(current.maxMs) ? current.maxMs : null,
       linkFailures,
       linkOutcomes,
+      businessFailureCount: businessFailures.length,
       selectionSource: pendingAdmission ? (baselineRevalidation ? 'baseline' : 'external') : 'accepted',
       strictAdmission: Boolean(pendingAdmission),
     });
@@ -1253,7 +1261,7 @@ export class Watchdog {
       current = confirmation;
       health = effectiveHealth;
       availabilityRecoveryRequired = current.successRate < 1 || requiresImmediateResponse(health)
-        || linkFailures.length > 0;
+        || linkFailures.length > 0 || (businessGateEnabled && businessFailures.length > 0);
       recordEvaluation(current, health, previousSelection, currentLeaf, linkFailures, {
         linkOutcomes,
         businessAnnotations,
@@ -1269,6 +1277,7 @@ export class Watchdog {
         maxMs: Number.isFinite(current.maxMs) ? current.maxMs : null,
         linkFailures,
         linkOutcomes,
+        businessFailureCount: businessFailures.length,
         selectionSource: 'immediate-confirmation',
         strictAdmission: false,
       });

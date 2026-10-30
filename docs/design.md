@@ -182,7 +182,7 @@
 
 **使用边界：** 估计器只服务排序与应急比较；健康、准入仍按成功率与均值/最大值判定，不保证单次选到真实最优节点。
 
-**证据边界：** `lastEvaluation.linkOutcomes` 与 `businessAnnotations` 记录 HTTPS/WebSocket 的 outcome 与状态码；401/403 或 WS 未升级只作解释与审计，不改变健康、准入或切换。
+**证据边界：** `lastEvaluation.linkOutcomes` 与 `businessAnnotations` 记录 HTTPS/WebSocket 的 outcome 与状态码；401/403 或 WS 未升级只作解释与审计，不改变健康、准入或切换。开启 `telemetry.businessFailureMarksDegraded` 后，401/403/WS 未升级视为业务降级并计入健康与恢复路径；默认关闭。
 
 **延迟分级：** 延迟等级用于解释日志和产品判断，不能单独替代成功率与连续周期。
 

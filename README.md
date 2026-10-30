@@ -414,6 +414,7 @@ HTTP Controller 使用 secret 时，只配置环境变量名称：
 | `telemetry.httpsUrl` | `https://chatgpt.com/` | HTTPS/TLS/TTFB 遥测目标。 |
 | `telemetry.websocketUrl` | Codex Responses WebSocket | WebSocket 握手遥测目标。 |
 | `telemetry.timeoutMs` | `5000` | 每项遥测超时。 |
+| `telemetry.businessFailureMarksDegraded` | `false` | 是否把「网络可达但业务结果非 accepted/upgraded」（如 401/403、WS 未升级）视为业务降级；默认关闭，仅记录不参与健康判定。 |
 
 
 

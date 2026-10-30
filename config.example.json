@@ -80,7 +80,8 @@
     "proxyUrl": "http://127.0.0.1:7897",
     "httpsUrl": "https://chatgpt.com/",
     "websocketUrl": "wss://chatgpt.com/backend-api/codex/responses",
-    "timeoutMs": 5000
+    "timeoutMs": 5000,
+    "businessFailureMarksDegraded": false
   },
   "guardrails": {
     "enabled": true,

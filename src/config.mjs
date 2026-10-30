@@ -83,6 +83,8 @@ export const defaults = Object.freeze({
     httpsUrl: 'https://chatgpt.com/',
     websocketUrl: 'wss://chatgpt.com/backend-api/codex/responses',
     timeoutMs: 5000,
+    // 默认关闭：业务结果（401/403、WS 未升级）只做记录，不参与健康判定与恢复。
+    businessFailureMarksDegraded: false,
   },
   guardrails: {
     enabled: true,
@@ -363,6 +365,10 @@ function validate(config) {
     throw new Error('telemetry URL 不允许包含凭据；请使用安全的环境变量或凭据存储');
   }
   requireInteger(config.telemetry.timeoutMs, 'telemetry.timeoutMs', 100);
+  requireBoolean(
+    config.telemetry.businessFailureMarksDegraded,
+    'telemetry.businessFailureMarksDegraded',
+  );
 
   requireBoolean(config.guardrails.enabled, 'guardrails.enabled');
   requireBoolean(config.guardrails.autoRepair, 'guardrails.autoRepair');
