@@ -61,6 +61,10 @@ if (-not (Test-Path .\config.json)) { Copy-Item .\config.example.json .\config.j
 
 **首次成功判据：** 组名校验通过、Controller 可连接，并输出本轮真实业务探测结果。首次命令默认 Dry Run，只报告预计动作。
 
+**被守卫阻断时：** 若输出 `would-repair` 或 `blocked` 且没有探测结果，说明守卫要求先修复（如运行模式不是 `rule`、DNS 覆写开启）。Dry Run 不会自动修复或切换。
+
+**两条处理路径：** 按提示修正 Mihomo/Clash Verge 后重跑同一命令；或临时在 `config.json` 设置 `"guardrails": { "enabled": false }` 完成只读验证，验证后恢复为 `true`。
+
 ```powershell
 node .\src\cli.mjs --config .\config.json
 ```
@@ -77,6 +81,7 @@ node .\src\cli.mjs --config .\config.json --force-scan
 |---|---|
 | `healthy` | 当前节点当时满足健康门槛；不保证未来网络稳定。 |
 | `upstream-outage` | 启发式判断，不是上游官方故障公告。 |
+| `would-repair` / `blocked`（无探测结果） | 配置守卫要求先修复；按 1.3 的两条路径处理，Dry Run 不会自动修复或切换。 |
 | 保持当前节点或退避 | 尚无合格候选时可能是正确行为；结合状态中的原因判断。 |
 
 ## 02 日常操作与人工接管

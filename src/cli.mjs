@@ -62,6 +62,48 @@ function printHelp() {
   --stop        向正在运行的实例发送 SIGTERM，并等待锁文件释放（最多 5 秒）`);
 }
 
+// 守卫原因码的中文提示；只用于 Dry Run 被阻断时给出可执行下一步。
+const GUARDRAIL_REASON_TEXT = Object.freeze({
+  'controller-unreachable': '无法连接 Mihomo Controller',
+  'runtime-mode': '运行模式不符合预期，应为 rule 或 global',
+  'dns-override': '当前订阅启用了 DNS 覆写',
+  'clash-verge-config-unavailable': 'Clash Verge 配置目录不可用',
+  'clash-verge-config-invalid': 'Clash Verge 配置格式无效或发生并发修改',
+  'clash-verge-not-running': 'Clash Verge 未运行',
+  'clash-verge-executable-unavailable': 'Clash Verge 可执行文件不可用',
+  'clash-verge-executable-mismatch': '正在运行的 Clash Verge 与配置路径不一致',
+  'clash-verge-autostart-unsupported': '当前平台不支持自动启动 Clash Verge',
+  'clash-verge-start-backoff': 'Clash Verge 自动启动正在退避',
+  'clash-verge-start-failed': 'Clash Verge 自动启动失败',
+  'clash-verge-startup-timeout': 'Clash Verge 启动后 Controller 未就绪',
+  'dns-reload-pending': 'DNS 修复正在等待客户端重载确认',
+  'dns-repair-unsupported': '当前平台不支持安全自动修复 DNS 覆写',
+  'clash-verge-reload-failed': 'Clash Verge 重载或运行态复核失败',
+  'guardrail-state-invalid': '配置守卫状态文件无效',
+});
+
+function guardrailReasonCodes(guardrail) {
+  if (Array.isArray(guardrail?.unresolved) && guardrail.unresolved.length) return guardrail.unresolved;
+  return Array.isArray(guardrail?.issues) ? guardrail.issues : [];
+}
+
+function describeGuardrailReason(guardrail) {
+  const codes = guardrailReasonCodes(guardrail);
+  if (!codes.length) return '未知原因';
+  return codes.map((code) => (GUARDRAIL_REASON_TEXT[code]
+    ? `${code}（${GUARDRAIL_REASON_TEXT[code]}）`
+    : code)).join('；');
+}
+
+function printGuardrailGuidance(guardrail, { configPath, dryRun }) {
+  const label = dryRun ? '只读 Dry Run' : '实际控制';
+  console.error(`[阻塞] ${label} 被配置守卫阻断：status=${guardrail?.status ?? 'unknown'}，原因=${describeGuardrailReason(guardrail)}。`);
+  console.error('本次未执行节点探测、未修改节点选择，也未修改 Clash Verge 配置。');
+  console.error('处理方式（二选一）：');
+  console.error('  1. 人工修正后重试：按上面的原因修复 Mihomo/Clash Verge（例如把运行模式改为 rule/global、关闭 DNS 覆写或启动客户端），再执行同一命令。');
+  console.error(`  2. 临时关闭守卫完成只读验证：在 ${configPath} 中设置 "guardrails": { "enabled": false }，验证后恢复为 true。`);
+}
+
 async function isPidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return true; } catch (error) { return error?.code === 'EPERM'; }
@@ -316,6 +358,8 @@ async function main() {
       }, config.guardrails.runtimeModeCheckIntervalSeconds * 1000)
     : null;
   runtimeGuardTimer?.unref();
+  // 守卫阻断提示只打印一次：--run 持续模式每轮都会重新评估，重复打印会淹没日志。
+  let guardrailGuidancePrinted = false;
 
   try {
     do {
@@ -332,6 +376,13 @@ async function main() {
           await logger(guardrail.ready ? 'info' : 'warn', 'guardrail-evaluated', guardrail);
           if (!guardrail.ready) {
             await logger('warn', 'watchdog-cycle-completed', { status: guardrail.status });
+            if (!guardrailGuidancePrinted) {
+              guardrailGuidancePrinted = true;
+              printGuardrailGuidance(guardrail, {
+                configPath: config.configPath ?? options.config,
+                dryRun: !options.apply,
+              });
+            }
           } else {
             let linkTelemetry = null;
             if (config.telemetry?.enabled) {
