@@ -1,9 +1,10 @@
 #!/usr/bin/env node
-import { open, mkdir, readFile, unlink } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from './config.mjs';
 import { MihomoController } from './controller.mjs';
+import { acquireLock, controllerFingerprint } from './lock.mjs';
 import {
   enforceClashVergeAvailability,
   enforceGuardrails,
@@ -57,26 +58,6 @@ function printHelp() {
   --status-json 输出 JSON 运行状态，不启动守护进程`);
 }
 
-async function isPidAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try { process.kill(pid, 0); return true; } catch { return false; }
-}
-
-async function acquireLock(lockFile) {
-  await mkdir(path.dirname(lockFile), { recursive: true });
-  try {
-    const handle = await open(lockFile, 'wx');
-    await handle.writeFile(`${process.pid}\n`, 'utf8');
-    return async () => { await handle.close(); await unlink(lockFile).catch(() => {}); };
-  } catch (error) {
-    if (error.code !== 'EEXIST') throw error;
-    const oldPid = Number.parseInt(await readFile(lockFile, 'utf8').catch(() => ''), 10);
-    if (await isPidAlive(oldPid)) throw new Error(`Watchdog 已在运行（PID ${oldPid}）`);
-    await unlink(lockFile).catch(() => {});
-    return acquireLock(lockFile);
-  }
-}
-
 async function main() {
   const options = parseArgs(process.argv.slice(2));
   if (options.help) { printHelp(); return; }
@@ -104,7 +85,15 @@ async function main() {
     console.log(options.statusJson ? JSON.stringify(snapshot, null, 2) : formatStatus(snapshot));
     return;
   }
-  const releaseLock = await acquireLock(config.files.lock);
+  // 锁身份必须同时绑定连接端点与目标策略组，避免两份配置指向同一 Controller 时双实例并发切换。
+  const fingerprint = controllerFingerprint({
+    controller: config.controller,
+    groups: config.groups,
+  });
+  const releaseLock = await acquireLock(config.files.lock, {
+    controllerFingerprint: fingerprint,
+    programVersion: runtime.version,
+  });
   const logger = createRotatingLogger(config.files.log, {
     quiet: options.quiet,
     maxBytes: config.logging?.maxBytes,
