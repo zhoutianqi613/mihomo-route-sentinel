@@ -25,6 +25,8 @@
     "scanDeadlineMs": 3000,
     "preSwitchValidationDeadlineMs": 3000,
     "currentRounds": 2,
+    "confirmRounds": 3,
+    "confirmTimeoutMs": 2000,
     "currentMinSuccessRate": 1,
     "currentMaxAverageMs": 800,
     "currentMaxSingleMs": 1500,

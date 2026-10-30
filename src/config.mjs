@@ -25,6 +25,8 @@ export const defaults = Object.freeze({
     scanDeadlineMs: 3000,
     preSwitchValidationDeadlineMs: 3000,
     currentRounds: 2,
+    confirmRounds: 3,
+    confirmTimeoutMs: 2000,
     currentMinSuccessRate: 1,
     currentMaxAverageMs: 800,
     currentMaxSingleMs: 1500,
@@ -253,6 +255,8 @@ function validate(config) {
     scanDeadlineMs: 500,
     preSwitchValidationDeadlineMs: 500,
     currentRounds: 1,
+    confirmRounds: 1,
+    confirmTimeoutMs: 1,
     scanRounds: 1,
     scanUrlCount: 1,
     validationRounds: 1,
@@ -260,6 +264,9 @@ function validate(config) {
     maxValidationCandidates: 1,
     parallelism: 1,
   })) requireInteger(config.probes[name], `probes.${name}`, minimum);
+  if (config.probes.confirmRounds > 10) {
+    throw new Error('probes.confirmRounds 不得超过 10');
+  }
   if (config.probes.discoveryTimeoutMs >= config.probes.scanDeadlineMs) {
     throw new Error('probes.discoveryTimeoutMs 必须小于 probes.scanDeadlineMs');
   }

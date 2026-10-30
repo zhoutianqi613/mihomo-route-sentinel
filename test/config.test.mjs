@@ -78,6 +78,14 @@ test('未来配置版本被明确拒绝', async () => {
   });
 });
 
+test('硬故障确认默认使用三轮采样且单目标超时两秒', async () => {
+  await withConfig({ ...minimal, configVersion: CURRENT_CONFIG_VERSION }, async (configPath) => {
+    const config = await loadConfig(configPath);
+    assert.equal(config.probes.confirmRounds, 3);
+    assert.equal(config.probes.confirmTimeoutMs, 2000);
+  });
+});
+
 test('示例占位组名会给出可操作错误', async () => {
   await withConfig({ configVersion: CURRENT_CONFIG_VERSION }, async (configPath) => {
     await assert.rejects(loadConfig(configPath), /仍是占位值.*实际存在的策略组名/);
@@ -86,6 +94,9 @@ test('示例占位组名会给出可操作错误', async () => {
 
 for (const [label, override, expected] of [
   ['轮数必须为整数', { probes: { currentRounds: 1.5 } }, /currentRounds.*整数/],
+  ['确认轮数必须为整数', { probes: { confirmRounds: 2.5 } }, /confirmRounds.*整数/],
+  ['确认轮数不得超过十轮', { probes: { confirmRounds: 11 } }, /confirmRounds.*不得超过 10/],
+  ['确认超时至少一毫秒', { probes: { confirmTimeoutMs: 0 } }, /confirmTimeoutMs.*不小于 1/],
   ['并发数必须为正整数', { probes: { parallelism: 0 } }, /parallelism.*整数/],
   ['周期必须为整数', { policy: { intervalSeconds: 5.5 } }, /intervalSeconds.*整数/],
   ['切换预算必须为整数', { policy: { switchBudgetCount: 2.5 } }, /switchBudgetCount.*整数/],

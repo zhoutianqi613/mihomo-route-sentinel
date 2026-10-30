@@ -725,7 +725,8 @@ test('confirmed latency spike bypasses ordinary latency cycles and minimum dwell
     initialSelected: 'spike-node',
     candidates: ['spike-node', 'good-node'],
     delayResolver: ({ name, probeCount }) => {
-      if (name === 'spike-node') return probeCount <= 2 ? 2600 : 100;
+      // 多轮确认需要 3 轮全部为尖峰：初次探测 1 次 + 确认 3 轮。
+      if (name === 'spike-node') return probeCount <= 4 ? 2600 : 100;
       return 100;
     },
   });

@@ -310,6 +310,8 @@ HTTP Controller 使用 secret 时，只配置环境变量名称：
 | `probes.controlUrls` | Cloudflare 204 | 非 OpenAI 对照 URL，用于区分节点故障与上游服务故障。 |
 | `probes.timeoutMs` | `5000` | 单次 URL 探测超时。 |
 | `probes.currentRounds` | `2` | 每周期对当前节点执行的探测轮数。 |
+| `probes.confirmRounds` | `3` | 硬故障/尖峰二次确认的探测轮数，取值 1–10；至少 `ceil(rounds×2/3)` 轮仍异常才算确认。 |
+| `probes.confirmTimeoutMs` | `2000` | 二次确认的单目标超时上限；实际取值不高于 `probes.timeoutMs`。 |
 | `probes.currentMinSuccessRate` | `1` | 当前节点健康所需成功率；`1` 表示 100%。 |
 | `probes.currentMaxAverageMs` | `800` | 当前节点可接受的平均延迟上限。 |
 | `probes.currentMaxSingleMs` | `1500` | 当前节点可接受的单次最大延迟上限。 |

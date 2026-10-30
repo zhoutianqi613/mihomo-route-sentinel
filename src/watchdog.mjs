@@ -215,6 +215,25 @@ function requiresImmediateResponse(health) {
   return health.status === 'hard-failure' || health.status === 'latency-spike';
 }
 
+/**
+ * 把一次多轮探测按 samples[].round 还原成逐轮健康结论。
+ * 硬故障确认需要"多数轮次仍即时失败"，单轮或单样本的偶然失败不足以代表节点状态。
+ */
+function classifyProbeRounds(result, thresholds, policy) {
+  const samplesByRound = new Map();
+  for (const sample of result?.samples ?? []) {
+    const round = sample.round ?? 1;
+    if (!samplesByRound.has(round)) samplesByRound.set(round, []);
+    samplesByRound.get(round).push(sample);
+  }
+  return [...samplesByRound.entries()]
+    .sort(([left], [right]) => left - right)
+    .map(([round, samples]) => ({
+      round,
+      health: classifyHealth(summarizeSamples(result.node, samples), thresholds, policy),
+    }));
+}
+
 function getActiveQuarantines(state) {
   state.quarantinedNodes ??= {};
   const now = Date.now();
@@ -412,13 +431,13 @@ export class Watchdog {
     throw new Error(`代理组层级过深：${name}`);
   }
 
-  async probeNode(node, rounds, urls) {
+  async probeNode(node, rounds, urls, { timeoutMs = this.config.probes.timeoutMs } = {}) {
     const samples = [];
     for (let round = 1; round <= rounds; round += 1) {
       for (const url of urls) {
         try {
           const delay = await this.requestNodeDelay(
-            node, url, this.config.probes.timeoutMs, Date.now() + this.config.probes.timeoutMs,
+            node, url, timeoutMs, Date.now() + timeoutMs,
           );
           samples.push({ round, url, ok: true, delay });
         } catch (error) {
@@ -1185,23 +1204,54 @@ export class Watchdog {
     if (!forceScan && requiresImmediateResponse(health)
       && this.config.policy.hardFailureConfirmSeconds > 0) {
       const initialStatus = health.status;
+      const confirmRounds = this.config.probes.confirmRounds;
+      // 确认只用于判定"是否继续恢复流程"，单目标超时收紧到 confirmTimeoutMs，避免一次抖动换线。
+      const confirmTimeoutMs = Math.min(
+        this.config.probes.timeoutMs,
+        this.config.probes.confirmTimeoutMs,
+      );
       await sleep(this.config.policy.hardFailureConfirmSeconds * 1000);
-      const confirmation = await this.probeNode(currentLeaf, 1, this.config.probes.urls);
+      const confirmation = await this.probeNode(
+        currentLeaf, confirmRounds, this.config.probes.urls, { timeoutMs: confirmTimeoutMs },
+      );
+      const roundResults = classifyProbeRounds(confirmation, this.currentThresholds(), this.config.policy);
+      const sampledRounds = roundResults.length;
+      const immediateRounds = roundResults
+        .filter(({ health: roundHealth }) => requiresImmediateResponse(roundHealth)).length;
+      const requiredImmediateRounds = Math.ceil(confirmRounds * 2 / 3);
+      // 样本门控：轮次不齐时不确认；多数轮次即时失败才确认。
+      const confirmed = sampledRounds >= confirmRounds && immediateRounds >= requiredImmediateRounds;
       const confirmedHealth = applyLinkHealth(
         classifyHealth(confirmation, this.currentThresholds(), this.config.policy),
       );
-      const confirmedImmediate = requiresImmediateResponse(confirmedHealth);
-      await this.log(confirmedImmediate ? 'error' : 'info', 'immediate-failure-confirmed', {
+      // 确认后沿用触发时的即时状态继续恢复流程；未确认时不能凭聚合样本直接进入恢复，
+      // 否则"只采到部分失败样本/单轮抖动"仍会退化为单次失败即应急切换。
+      const effectiveHealth = confirmed
+        ? {
+          ...confirmedHealth,
+          stable: false,
+          emergency: initialStatus === 'hard-failure',
+          status: initialStatus,
+        }
+        : (requiresImmediateResponse(confirmedHealth)
+          ? { ...confirmedHealth, stable: false, emergency: false, status: 'partial-failure' }
+          : confirmedHealth);
+      await this.log(confirmed ? 'error' : 'info', 'immediate-failure-confirmed', {
         trigger: initialStatus,
-        confirmed: confirmedImmediate,
-        health: confirmedHealth.status,
-        quality: confirmedHealth.quality,
+        confirmed,
+        rounds: confirmRounds,
+        requiredImmediateRounds,
+        immediateRounds,
+        sampledRounds,
+        timeoutMs: confirmTimeoutMs,
+        health: effectiveHealth.status,
+        quality: effectiveHealth.quality,
         successRate: confirmation.successRate,
         averageMs: Number.isFinite(confirmation.averageMs) ? Math.round(confirmation.averageMs) : null,
         maxMs: Number.isFinite(confirmation.maxMs) ? confirmation.maxMs : null,
       });
       current = confirmation;
-      health = confirmedHealth;
+      health = effectiveHealth;
       availabilityRecoveryRequired = current.successRate < 1 || requiresImmediateResponse(health)
         || linkFailures.length > 0;
       recordEvaluation(current, health, previousSelection, currentLeaf, linkFailures, {
