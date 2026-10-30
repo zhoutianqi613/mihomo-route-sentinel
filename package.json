@@ -13,7 +13,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "check": "node --check src/cli.mjs && node --check src/config.mjs && node --check src/controller.mjs && node --check src/guardrails.mjs && node --check src/link-probe.mjs && node --check src/observability.mjs && node --check src/decision-state.mjs && node --check src/switch-budget.mjs && node --check src/lock.mjs && node --check src/state-store.mjs && node --check src/estimator.mjs && node --check src/health-policy.mjs && node --check src/probe-scheduler.mjs && node --check src/dns-config.mjs && node --check src/watchdog.mjs",
+    "check": "node --check src/cli.mjs && node --check src/config.mjs && node --check src/controller.mjs && node --check src/guardrails.mjs && node --check src/link-probe.mjs && node --check src/observability.mjs && node --check src/decision-state.mjs && node --check src/switch-budget.mjs && node --check src/lock.mjs && node --check src/state-store.mjs && node --check src/estimator.mjs && node --check src/health-policy.mjs && node --check src/probe-scheduler.mjs && node --check src/candidate-service.mjs && node --check src/dns-config.mjs && node --check src/watchdog.mjs",
     "test": "node --test",
     "docs:check": "node scripts/docs-publish.mjs --check",
     "docs:publish": "node scripts/docs-publish.mjs"
