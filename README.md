@@ -353,11 +353,11 @@ HTTP Controller 使用 secret 时，只配置环境变量名称：
 | `policy.degradationWindowCycles` | `10` | 统计间歇性延迟退化的滚动周期数，健康周期不会再直接抹掉历史尖峰。 |
 | `policy.degradationWindowFailures` | `3` | 滚动窗口内达到该退化次数即触发择优扫描。不得大于窗口周期数。 |
 | `policy.optimizationIntervalSeconds` | `900` | 当前节点不是“优秀”时执行周期择优的间隔；`0` 表示关闭周期择优。 |
-| `policy.hardFailureConfirmSeconds` | `5` | 硬故障或不可接受尖峰的复核等待时间。 |
+| `policy.hardFailureConfirmSeconds` | `5` | 硬故障或不可接受尖峰进入多轮确认前的等待时间；确认轮次与超时见 `probes.confirmRounds` / `probes.confirmTimeoutMs`。 |
 | `policy.minimumDwellSeconds` | `120` | 纯延迟优化的最短驻留时间；故障恢复不受此限制。 |
 | `policy.minimumImprovementMs` | `200` | 延迟型切换要求候选至少改善的绝对延迟。 |
 | `policy.minimumImprovementRatio` | `0.2` | 延迟型切换要求候选至少改善的比例；默认 20%。绝对值与比例满足其一即可。 |
-| `policy.failedNodeQuarantineSeconds` | `900` | 真实验证失败的节点隔离时间；普通切前采样因截止或取消而不完整时不隔离。 |
+| `policy.failedNodeQuarantineSeconds` | `900` | `verify` / `network` 类隔离的默认时长；切前质量不达标使用 `qualityQuarantineSeconds`，普通采样不完整不隔离。 |
 | `policy.qualityQuarantineSeconds` | `180` | 切前质量复核不达标（未过严格线）的短隔离时间；质量不足不等于网络失败，避免一次复核清空候选池。 |
 | `policy.oldNodeCooldownSeconds` | `120` | 成功切换后旧出口的冷却时间，避免它立刻被重新当成优化候选。 |
 | `policy.maxSwitchAttempts` | `3` | 单次恢复流程最多执行的实际节点切换次数；切前门禁拒绝不会占用次数，服务会继续检查候选池中的后续节点。 |
@@ -425,7 +425,7 @@ HTTP Controller 使用 secret 时，只配置环境变量名称：
 |---|---:|---|
 | `files.state` | `./var/state.json` | 健康周期、节点准入、隔离和切换预算状态文件。 |
 | `files.log` | `./var/watchdog.ndjson` | 结构化运行日志；在配置目录中可用 `Get-Content .\\var\\watchdog.ndjson -Wait` 实时查看。 |
-| `files.lock` | `./var/watchdog.lock` | 单实例锁文件，防止重复守护进程同时切换。 |
+| `files.lock` | `./var/watchdog.lock` | 原子租约单实例锁，绑定 Controller 指纹，防止同一 Controller 多实例同时切换。 |
 | `files.guardrailState` | `./var/guardrails.json` | DNS 已修改但尚未确认重载的持久债务；只有运行态复核成功才会清除。 |
 
 配置在启动时严格校验：轮数、并发数、周期和预算必须是整数，成功率必须在 0–1 内，正则必须可编译，业务探测 URL 只允许 HTTP/HTTPS，遥测 URL 必须匹配各自协议。无效配置会在连接 Controller 或切换节点前终止。
@@ -452,7 +452,7 @@ HTTP Controller 使用 secret 时，只配置环境变量名称：
 
 **扫描进度：** 状态显示实际预算、耗时、截止是否触发及严格/临时候选。后台完整扫描与前台三秒扫描分别呈现；候选快照刷新完成后立即清除 `running`。
 
-**复核时限：** 常规并行门禁最多 3 秒。紧急切换日志另记录 `decisionDurationMs` 与 `deadlineMet`；一秒目标不含故障确认和冷扫描，详见[紧急恢复的时间边界](#紧急恢复的时间边界)。
+**复核时限：** 常规切前复核按候选批次扩展，单批默认上限 20000 ms（2 轮×2 目标×5 s）；前台冷扫描上限 3000 ms。紧急切换日志另记录 `decisionDurationMs` 与 `deadlineMet`；一秒目标不含故障确认、发现和冷扫描，边界见[快照辅助恢复](docs/design.md#32-快照辅助恢复)。
 
 
 
