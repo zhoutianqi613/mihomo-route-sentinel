@@ -20,44 +20,12 @@ import {
   requiresImmediateResponse,
   summarizeSamples,
 } from './health-policy.mjs';
+import { createProbeScheduler, mapLimit, sleep, waitUntil } from './probe-scheduler.mjs';
 
 const GROUP_TYPES = new Set(['Selector', 'URLTest', 'Fallback', 'LoadBalance']);
 const SELECTION_ADMISSION_VERSION = 1;
 const SWITCH_GUARD_TIMEOUT = Symbol('switch-guard-timeout');
 const DEFAULT_GUARD_TIMEOUT_MS = 3000;
-
-const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
-
-async function mapLimit(items, limit, worker) {
-  const results = new Array(items.length);
-  let next = 0;
-  async function run() {
-    while (true) {
-      const index = next++;
-      if (index >= items.length) return;
-      results[index] = await worker(items[index], index);
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, run));
-  return results;
-}
-
-async function waitUntil(promise, deadlineAt, message) {
-  const remainingMs = Math.max(0, deadlineAt - Date.now());
-  return await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(Object.assign(new Error(message), { code: 'SCAN_DEADLINE' })), remainingMs);
-    promise.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (error) => {
-        clearTimeout(timer);
-        reject(error);
-      },
-    );
-  });
-}
 
 /**
  * 把一次多轮探测按 samples[].round 还原成逐轮健康结论。
@@ -113,91 +81,17 @@ export class Watchdog {
       : DEFAULT_GUARD_TIMEOUT_MS;
     this.runtime = runtime;
     this.activeCandidateScan = null;
-    this.nodeProbeTails = new Map();
-    this.activeNodeProbes = new Map();
-    this.activeCandidateRequests = 0;
-    this.candidateCapacityWaiters = new Set();
-    // 锁随真实 Controller 请求结束才释放；取消等待不能假装底层请求已停止。
-    this.requestNodeDelay = async (node, url, timeoutMs, deadlineAt, {
-      background = false, candidate = false, signal, onStart = () => {}, onComplete = () => {},
-    } = {}) => {
-      const previous = this.nodeProbeTails.get(node) ?? Promise.resolve();
-      let release;
-      const gate = new Promise((resolve) => { release = resolve; });
-      const tail = previous.then(() => gate);
-      this.nodeProbeTails.set(node, tail);
-      void tail.then(() => {
-        if (this.nodeProbeTails.get(node) === tail) this.nodeProbeTails.delete(node);
-      });
-      const abortController = new AbortController();
-      let rejectCancellation;
-      const cancellation = new Promise((resolve, reject) => { rejectCancellation = reject; });
-      const cancel = () => {
-        abortController.abort();
-        rejectCancellation(Object.assign(new Error('节点探测已取消'), { code: 'PROBE_CANCELLED' }));
-      };
-      // 先注册取消分支，已取消的 signal 也不会产生未处理 rejection。
-      const ready = Promise.race([previous, cancellation]);
-      signal?.addEventListener('abort', cancel, { once: true });
-      if (signal?.aborted) cancel();
-      if (!background && this.activeNodeProbes.get(node)?.background) {
-        this.activeNodeProbes.get(node).cancel();
-      }
-      let request;
-      let active;
-      let releaseCapacity = () => {};
-      try {
-        await waitUntil(ready, deadlineAt, '节点探测等待超过截止时间');
-        active = { background, cancel };
-        this.activeNodeProbes.set(node, active);
-        if (candidate) {
-          // 逻辑 worker 超时后可能继续运行；容量必须绑定仍未结束的真实请求。
-          while (this.activeCandidateRequests >= this.config.probes.parallelism) {
-            let wake;
-            const capacityReady = new Promise((resolve) => { wake = resolve; });
-            this.candidateCapacityWaiters.add(wake);
-            try {
-              await waitUntil(Promise.race([capacityReady, cancellation]), deadlineAt,
-                '候选探测等待容量超过截止时间');
-            } finally {
-              this.candidateCapacityWaiters.delete(wake);
-            }
-          }
-        }
-        if (abortController.signal.aborted || Date.now() >= deadlineAt) {
-          throw Object.assign(new Error('节点探测超过截止时间'), { code: 'SCAN_DEADLINE' });
-        }
-        if (candidate) {
-          this.activeCandidateRequests += 1;
-          releaseCapacity = () => {
-            this.activeCandidateRequests -= 1;
-            for (const wake of this.candidateCapacityWaiters) wake();
-          };
-        }
-        onStart();
-        request = Promise.resolve().then(() => this.controller.getDelay(
-          node, url, Math.max(1, Math.min(timeoutMs, deadlineAt - Date.now())),
-          { signal: abortController.signal },
-        ));
-        void request.then(onComplete, onComplete).finally(() => {
-          if (this.activeNodeProbes.get(node) === active) this.activeNodeProbes.delete(node);
-          releaseCapacity();
-          release();
-        });
-        return await waitUntil(
-          Promise.race([request, cancellation]), deadlineAt, '节点探测超过截止时间',
-        );
-      } finally {
-        signal?.removeEventListener('abort', cancel);
-        abortController.abort();
-        if (!request) {
-          if (this.activeNodeProbes.get(node) === active) this.activeNodeProbes.delete(node);
-          releaseCapacity();
-          release();
-        }
-      }
-    };
+    this.probes = createProbeScheduler({ controller, config, logger: this.log });
+    // 节点锁与真实在途容量由 probe-scheduler 实例持有；保留原方法名与签名。
+    this.requestNodeDelay = (...args) => this.probes.requestNodeDelay(...args);
   }
+
+  // 兼容既有实例内省（测试/诊断）：真实状态由 probe-scheduler 实例持有。
+  get activeNodeProbes() { return this.probes._internals.activeNodeProbes; }
+
+  get activeCandidateRequests() { return this.probes._internals.activeCandidateRequests; }
+
+  get candidateCapacityWaiters() { return this.probes._internals.candidateCapacityWaiters; }
 
   /**
    * 切换尝试临界区：一次切换尝试从 beforeSwitch 开始，覆盖 select、切后
@@ -322,91 +216,12 @@ export class Watchdog {
     throw new Error(`代理组层级过深：${name}`);
   }
 
-  async probeNode(node, rounds, urls, { timeoutMs = this.config.probes.timeoutMs } = {}) {
-    const samples = [];
-    for (let round = 1; round <= rounds; round += 1) {
-      for (const url of urls) {
-        try {
-          const delay = await this.requestNodeDelay(
-            node, url, timeoutMs, Date.now() + timeoutMs,
-          );
-          samples.push({ round, url, ok: true, delay });
-        } catch (error) {
-          samples.push({ round, url, ok: false, error: error.status ?? error.message });
-        }
-      }
-    }
-    return summarizeSamples(node, samples);
+  async probeNode(node, rounds, urls, options) {
+    return await this.probes.probeNode(node, rounds, urls, options);
   }
 
-  async probeCandidatesInParallel(nodes, rounds, urls, deadlineAt, {
-    timeoutMs = this.config.probes.timeoutMs,
-    background = false,
-    signal,
-  } = {}) {
-    const uniqueNodes = [...new Set(nodes)];
-    const logicalAttempts = uniqueNodes.length * rounds * urls.length;
-    let active = 0;
-    let peakConcurrency = 0;
-    let startedAttempts = 0;
-    let completedAttempts = 0;
-    // 同一节点的多轮/多 URL 探测必须串行，避免 Mihomo 同时对一个节点执行多个 URLTest 时互相争用；
-    // 不同节点仍由 parallelism 控制并发，从而在截止内优先完整验证排名靠前的节点。
-    const samplesByNode = await mapLimit(uniqueNodes, this.config.probes.parallelism, async (node) => {
-      const nodeSamples = [];
-      for (let round = 1; round <= rounds; round += 1) {
-        for (const url of urls) {
-          if (Date.now() >= deadlineAt || signal?.aborted) {
-            nodeSamples.push({ node, round, url, ok: false,
-              error: signal?.aborted ? 'PROBE_CANCELLED' : 'SCAN_DEADLINE' });
-            continue;
-          }
-          const remainingMs = Math.max(1, deadlineAt - Date.now());
-          const effectiveTimeoutMs = Math.max(1, Math.min(timeoutMs, remainingMs));
-          try {
-            const delay = await this.requestNodeDelay(
-              node, url, effectiveTimeoutMs, Math.min(deadlineAt, Date.now() + effectiveTimeoutMs),
-              { background, candidate: true, signal,
-                onStart: () => {
-                  active += 1;
-                  startedAttempts += 1;
-                  peakConcurrency = Math.max(peakConcurrency, active);
-                },
-                onComplete: () => { active -= 1; completedAttempts += 1; },
-              },
-            );
-            nodeSamples.push({ node, round, url, ok: true, delay });
-          } catch (error) {
-            const deadlineReached = Date.now() >= deadlineAt;
-            nodeSamples.push({
-              node,
-              round,
-              url,
-              ok: false,
-              error: deadlineReached ? 'SCAN_DEADLINE' : (error.status ?? error.code ?? error.message),
-            });
-          }
-        }
-      }
-      return nodeSamples;
-    });
-    const samples = samplesByNode.flat();
-    const results = uniqueNodes.map((node) => summarizeSamples(
-      node,
-      samples.filter((sample) => sample.node === node),
-    ));
-    Object.defineProperty(results, 'probeStats', {
-      enumerable: false,
-      value: {
-        method: 'per-node',
-        logicalAttempts,
-        controllerRequests: startedAttempts,
-        completedAttempts,
-        skippedAttempts: logicalAttempts - startedAttempts,
-        peakConcurrency,
-      },
-    });
-    return results;
+  async probeCandidatesInParallel(nodes, rounds, urls, deadlineAt, options) {
+    return await this.probes.probeCandidatesInParallel(nodes, rounds, urls, deadlineAt, options);
   }
 
   createCandidateSnapshot(search, selection, leaf) {

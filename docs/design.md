@@ -326,6 +326,7 @@
 | `src/estimator.mjs` | Wilson 下界、分位与延迟上界等小样本估计 |
 | `src/health-policy.mjs` | 健康分级、分轮稳定性、准入证据、退化窗口与隔离等纯策略函数 |
 | `src/dns-config.mjs` | Clash Verge DNS 配置解析、定长写入、备份/恢复与目录校验 |
+| `src/probe-scheduler.mjs` | 节点锁、候选在途容量、逐节点探测与截止控制 |
 | `src/lock.mjs` | 原子租约单实例锁与 Controller 指纹 |
 | `src/state-store.mjs` | 状态版本校验、损坏自愈与原子落盘 |
 | `src/link-probe.mjs` | HTTPS CONNECT、TLS、TTFB与WebSocket遥测 |
