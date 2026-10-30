@@ -189,6 +189,89 @@ function explainGuardrailIssue(issue) {
   return GUARDRAIL_ISSUE_TEXT[issue] ? `${GUARDRAIL_ISSUE_TEXT[issue]}(${issue})` : issue;
 }
 
+const QUARANTINE_KIND_TEXT = Object.freeze({
+  quality: '质量',
+  verify: '切后验证',
+  cooldown: '冷却',
+  network: '网络',
+});
+
+const WAIT_REASON_TEXT = Object.freeze({
+  'minimum-dwell-active': (decision) => `最短驻留剩余 ${display(decision.remainingSeconds)} 秒`,
+  'switch-budget-exhausted': (decision) => (
+    `本窗口额度已用尽（${display(decision.budgetClass ?? 'optimization')} `
+    + `${display(decision.used)}/${display(decision.limit)}）`
+  ),
+  'candidate-scan-backoff-active': (decision) => `退避剩余 ${display(decision.remainingSeconds)} 秒`,
+  'pre-switch-validation-incomplete': () => '样本未采完将重试',
+  'no-meaningful-improvement': (decision) => `改善不足 ${display(decision.requiredImprovementMs)} ms`,
+});
+
+// 状态页时间统一附带本地时区标注；保留原始 ISO 便于与日志逐条比对。
+function localTimeText(value) {
+  if (value === null || value === undefined || value === '') return '-';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return display(value);
+  const pad = (number) => String(number).padStart(2, '0');
+  const offsetMinutes = -date.getTimezoneOffset();
+  const sign = offsetMinutes >= 0 ? '+' : '-';
+  const absoluteOffset = Math.abs(offsetMinutes);
+  const local = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} `
+    + `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  return `${value}（本地 ${local} UTC${sign}${pad(Math.floor(absoluteOffset / 60))}:`
+    + `${pad(absoluteOffset % 60)}）`;
+}
+
+function waitReasonText(decision) {
+  if (!decision) return '-';
+  const mapper = WAIT_REASON_TEXT[decision.reason];
+  if (mapper) return `${mapper(decision)}（${decision.reason}）`;
+  if (decision.action === 'switch' || decision.action === 'recommend') {
+    return `已决策 ${display(decision.action)}：${display(decision.reason)}`;
+  }
+  return `暂无等待映射（${display(decision.reason)}）`;
+}
+
+function decisionDetailsText(decision) {
+  if (!decision) return '';
+  const parts = [];
+  if (decision.remainingSeconds !== undefined && decision.remainingSeconds !== null) {
+    parts.push(`剩余 ${decision.remainingSeconds} 秒`);
+  }
+  if (decision.used !== undefined && decision.used !== null) {
+    parts.push(`已用 ${display(decision.used)}/${display(decision.limit)}`);
+  }
+  if (decision.budgetClass) parts.push(`类别 ${decision.budgetClass}`);
+  if (decision.from !== undefined || decision.to !== undefined) {
+    parts.push(`${display(decision.from)} -> ${display(decision.to)}`);
+  }
+  if (decision.deadlineMs !== undefined && decision.deadlineMs !== null) {
+    parts.push(`截止 ${decision.deadlineMs} ms`);
+  }
+  if (decision.requiredImprovementMs !== undefined && decision.requiredImprovementMs !== null) {
+    parts.push(`改善阈值 ${decision.requiredImprovementMs} ms`);
+  }
+  return parts.join('，');
+}
+
+// 淘汰候选按原因聚合，避免长列表淹没“为什么没有切换”的主因。
+function aggregateRejectedReasons(rejected) {
+  const counts = new Map();
+  for (const entry of Array.isArray(rejected) ? rejected : []) {
+    const reasons = Array.isArray(entry?.reasons) && entry.reasons.length
+      ? entry.reasons
+      : ['unknown'];
+    for (const reason of reasons) {
+      const key = String(reason);
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+  }
+  return [...counts.entries()]
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .map(([reason, count]) => `${reason}×${count}`)
+    .join('、');
+}
+
 function telemetryForEvaluation(records, evaluation) {
   if (!evaluation) return latestByEvent(records, 'link-telemetry');
   const evaluationTimestamp = Date.parse(evaluation.timestamp);
@@ -210,7 +293,12 @@ function activeQuarantines(entries) {
   return Object.entries(entries ?? {}).flatMap(([node, entry]) => {
     const untilMs = Date.parse(entry?.until);
     if (!Number.isFinite(untilMs) || untilMs <= now) return [];
-    return [{ node, until: entry.until, reason: entry.reason ?? null }];
+    return [{
+      node,
+      until: entry.until,
+      reason: entry.reason ?? null,
+      kind: entry.kind ?? null,
+    }];
   });
 }
 
@@ -454,16 +542,22 @@ function display(value, suffix = '') {
 
 export function formatStatus(snapshot) {
   const quarantine = snapshot.quarantinedNodes.length
-    ? snapshot.quarantinedNodes.map((item) => `${item.node}（至 ${item.until}）`).join('；')
+    ? snapshot.quarantinedNodes.map((item) => {
+        const kind = QUARANTINE_KIND_TEXT[item.kind];
+        const kindText = kind
+          ? `${kind}（${item.kind}）`
+          : (item.kind ? `其他（${item.kind}）` : '未标注');
+        return `${item.node}（${kindText}，至 ${localTimeText(item.until)}）`;
+      }).join('；')
     : '无';
   const switchText = snapshot.lastSwitch
-    ? `${display(snapshot.lastSwitch.from)} -> ${display(snapshot.lastSwitch.to)} / ${display(snapshot.lastSwitch.reason)} / ${display(snapshot.lastSwitch.at)}`
+    ? `${display(snapshot.lastSwitch.from)} -> ${display(snapshot.lastSwitch.to)} / ${display(snapshot.lastSwitch.reason)} / ${localTimeText(snapshot.lastSwitch.at)} / verified=${display(snapshot.lastSwitch.verified)} / deadlineMet=${display(snapshot.lastSwitch.deadlineMet)} / 耗时 ${display(snapshot.lastSwitch.decisionDurationMs, ' ms')} / 来源 ${display(snapshot.lastSwitch.source)}`
     : '-';
   const normalizationText = snapshot.lastSelectionNormalization
-    ? `${display(snapshot.lastSelectionNormalization.from)} -> ${display(snapshot.lastSelectionNormalization.to)} / ${display(snapshot.lastSelectionNormalization.at)}`
+    ? `${display(snapshot.lastSelectionNormalization.from)} -> ${display(snapshot.lastSelectionNormalization.to)} / ${localTimeText(snapshot.lastSelectionNormalization.at)}`
     : '-';
   const backoff = snapshot.scanBackoff?.until
-    ? `至 ${snapshot.scanBackoff.until}（原因 ${display(snapshot.scanBackoff.reason)}）`
+    ? `至 ${localTimeText(snapshot.scanBackoff.until)}（原因 ${display(snapshot.scanBackoff.reason)}）`
     : '未启用';
   const budgetText = (name) => {
     const budget = snapshot.decisionState?.budget?.[name];
@@ -484,21 +578,27 @@ export function formatStatus(snapshot) {
     ? `${display(snapshot.runtimeModeGuard.status)}，问题 ${snapshot.runtimeModeGuard.issues.length}，修复 ${snapshot.runtimeModeGuard.repairs.length}`
     : '尚无检查记录（需确认服务已加载最新版）';
   const decisionText = snapshot.lastDecision
-    ? `${display(snapshot.lastDecision.action)} / ${display(snapshot.lastDecision.reason)} / ${display(snapshot.lastDecision.at)}`
+    ? [
+        display(snapshot.lastDecision.action),
+        display(snapshot.lastDecision.reason),
+        localTimeText(snapshot.lastDecision.at),
+        decisionDetailsText(snapshot.lastDecision),
+      ].filter((part) => part).join(' / ')
     : '-';
   const scanText = snapshot.lastCandidateScan
-    ? `${display(snapshot.lastCandidateScan.at)}，原因 ${display(snapshot.lastCandidateScan.reason)}，耗时 ${display(snapshot.lastCandidateScan.durationMs, ' ms')}/${display(snapshot.lastCandidateScan.deadlineMs, ' ms')}，截止 ${snapshot.lastCandidateScan.deadlineReached ? '是' : '否'}，抽样 ${display(snapshot.lastCandidateScan.sampledCount)}，严格复测 ${display(snapshot.lastCandidateScan.validatedCount)}，严格合格 ${(snapshot.lastCandidateScan.stable ?? []).join('、') || '无'}，健康线临时候选 ${(snapshot.lastCandidateScan.provisional ?? []).join('、') || '无'}；淘汰 ${(snapshot.lastCandidateScan.rejected ?? []).slice(0, 3).map((entry) => `${entry.node}[${(entry.reasons ?? []).join('/') || '未知'}]`).join('、') || '无'}`
+    ? `${localTimeText(snapshot.lastCandidateScan.at)}，原因 ${display(snapshot.lastCandidateScan.reason)}，耗时 ${display(snapshot.lastCandidateScan.durationMs, ' ms')}/${display(snapshot.lastCandidateScan.deadlineMs, ' ms')}，截止 ${snapshot.lastCandidateScan.deadlineReached ? '是' : '否'}，抽样 ${display(snapshot.lastCandidateScan.sampledCount)}，严格复测 ${display(snapshot.lastCandidateScan.validatedCount)}，严格合格 ${(snapshot.lastCandidateScan.stable ?? []).join('、') || '无'}，健康线临时候选 ${(snapshot.lastCandidateScan.provisional ?? []).join('、') || '无'}；淘汰 ${(snapshot.lastCandidateScan.rejected ?? []).slice(0, 3).map((entry) => `${entry.node}[${(entry.reasons ?? []).join('/') || '未知'}]`).join('、') || '无'}`
     : '-';
+  const rejectedReasonsText = aggregateRejectedReasons(snapshot.lastCandidateScan?.rejected);
   const discoveryStats = snapshot.lastCandidateScan?.probeStats?.discovery;
   const validationStats = snapshot.lastCandidateScan?.probeStats?.validation;
   const probeLoadText = discoveryStats || validationStats
     ? `初筛 ${display(discoveryStats?.method)}：Controller ${display(discoveryStats?.controllerRequests, '')}，节点测试 ${display(discoveryStats?.logicalAttempts, '')}；严格复测 ${display(validationStats?.method)}：Controller ${display(validationStats?.controllerRequests, '')}/${display(validationStats?.logicalAttempts, '')}，峰值并发 ${display(validationStats?.peakConcurrency, '')}`
     : '-';
   const activeScanText = snapshot.candidateScan
-    ? `${display(snapshot.candidateScan.status)}，开始 ${display(snapshot.candidateScan.startedAt)}，原因 ${display(snapshot.candidateScan.reason)}`
+    ? `${display(snapshot.candidateScan.status)}，开始 ${localTimeText(snapshot.candidateScan.startedAt)}，原因 ${display(snapshot.candidateScan.reason)}`
     : '无';
   const candidateSnapshotText = snapshot.candidateSnapshot
-    ? `${snapshot.candidateSnapshot.fresh ? '新鲜' : '过期'}，年龄 ${Math.round((snapshot.candidateSnapshot.ageMs ?? 0) / 1000)} 秒，候选 ${snapshot.candidateSnapshot.candidateCount}，生成 ${display(snapshot.candidateSnapshot.at)}`
+    ? `${snapshot.candidateSnapshot.fresh ? '新鲜' : '过期'}，年龄 ${Math.round((snapshot.candidateSnapshot.ageMs ?? 0) / 1000)} 秒，候选 ${snapshot.candidateSnapshot.candidateCount}，生成 ${localTimeText(snapshot.candidateSnapshot.at)}`
     : '无';
   const provisionalText = snapshot.provisionalFallback
     ? `${display(snapshot.provisionalFallback.selection)}（${display(snapshot.provisionalFallback.profile)}，等待严格准入）`
@@ -518,10 +618,10 @@ export function formatStatus(snapshot) {
   }
   lines.push(
     'Mihomo Route Sentinel 运行状态',
-    `运行版本       : ${display(snapshot.runtime?.version)}（PID ${display(snapshot.runtime?.pid)}，启动 ${display(snapshot.runtime?.startedAt)}）`,
+    `运行版本       : ${display(snapshot.runtime?.version)}（PID ${display(snapshot.runtime?.pid)}，启动 ${localTimeText(snapshot.runtime?.startedAt)}）`,
     `当前选择       : ${display(snapshot.current?.selected)}`,
     `当前叶子节点   : ${display(snapshot.current?.leaf)}（来源：${display(snapshot.current?.source)}）`,
-    `最近探测       : ${display(snapshot.probe?.at)}`,
+    `最近探测       : ${localTimeText(snapshot.probe?.at)}`,
     `探测身份       : ${display(snapshot.probe?.selected)} / ${display(snapshot.probe?.leaf)}${snapshot.probe && !snapshot.probe.matchesCurrent ? '（不能证明当前出口健康）' : ''}`,
     `探测结果       : 成功率 ${snapshot.probe?.successRate == null ? '-' : `${Math.round(snapshot.probe.successRate * 100)}%`}，平均 ${display(snapshot.probe?.averageMs, ' ms')}，最大 ${display(snapshot.probe?.maxMs, ' ms')}`,
     `健康/质量      : ${display(snapshot.probe?.health)} / ${display(snapshot.probe?.quality)}`,
@@ -529,9 +629,11 @@ export function formatStatus(snapshot) {
     `连续失败       : 总计 ${snapshot.consecutiveFailures.overall}，部分失败 ${snapshot.consecutiveFailures.partial}，延迟退化 ${snapshot.consecutiveFailures.latency}`,
     `滚动延迟退化   : ${snapshot.degradationWindow.failures}/${snapshot.degradationWindow.cycles}（触发 ${display(snapshot.degradationWindow.required)}/${display(snapshot.degradationWindow.size)}）`,
     `最近决策       : ${decisionText}`,
+    `等待原因       : ${waitReasonText(snapshot.lastDecision)}`,
     `后台候选扫描   : ${activeScanText}`,
     `候选快照       : ${candidateSnapshotText}`,
     `最近候选扫描   : ${scanText}`,
+    `淘汰原因聚合   : ${rejectedReasonsText || '无'}`,
     `候选探测负载   : ${probeLoadText}`,
     `临时候选状态   : ${provisionalText}`,
     `最近切换       : ${switchText}`,

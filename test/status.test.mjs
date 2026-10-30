@@ -219,3 +219,169 @@ test('state.runtime 缺失时回退最近一次 watchdog-started 日志', async 
     assert.match(output, /运行版本\s+: 1\.8\.3（PID 4242/);
   });
 });
+
+test('formatStatus 把最短驻留与扫描退避翻译为还等什么', async () => {
+  await withStatusDir(async (root) => {
+    const dwell = await writeFiles(root, {
+      state: {
+        lastEvaluation: recentEvaluation(),
+        lastDecision: {
+          at: new Date().toISOString(),
+          action: 'hold',
+          reason: 'minimum-dwell-active',
+          remainingSeconds: 12,
+        },
+      },
+    });
+    const dwellSnapshot = await buildStatusSnapshot({
+      ...dwell,
+      instance: { lockPresent: true, pid: process.pid, alive: true },
+      intervalSeconds: 30,
+    });
+    const dwellOutput = formatStatus(dwellSnapshot);
+    assert.match(dwellOutput, /等待原因\s+: 最短驻留剩余 12 秒（minimum-dwell-active）/);
+    assert.match(dwellOutput, /最近决策\s+: hold \/ minimum-dwell-active \/ .*剩余 12 秒/);
+
+    const backoff = await writeFiles(root, {
+      state: {
+        lastEvaluation: recentEvaluation(),
+        lastDecision: {
+          at: new Date().toISOString(),
+          action: 'hold',
+          reason: 'candidate-scan-backoff-active',
+          remainingSeconds: 45,
+        },
+      },
+    });
+    const backoffSnapshot = await buildStatusSnapshot({
+      ...backoff,
+      instance: { lockPresent: true, pid: process.pid, alive: true },
+      intervalSeconds: 30,
+    });
+    assert.match(formatStatus(backoffSnapshot), /退避剩余 45 秒（candidate-scan-backoff-active）/);
+  });
+});
+
+test('formatStatus 覆盖预算耗尽、改善不足与样本未采完', async () => {
+  const cases = [
+    {
+      decision: { action: 'blocked', reason: 'switch-budget-exhausted', used: 3, limit: 3, budgetClass: 'optimization' },
+      pattern: /本窗口额度已用尽/,
+    },
+    {
+      decision: { action: 'hold', reason: 'no-meaningful-improvement', requiredImprovementMs: 80 },
+      pattern: /改善不足 80 ms（no-meaningful-improvement）/,
+    },
+    {
+      decision: { action: 'hold', reason: 'pre-switch-validation-incomplete' },
+      pattern: /样本未采完将重试（pre-switch-validation-incomplete）/,
+    },
+  ];
+  for (const item of cases) {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'mihomo-status-wait-'));
+    try {
+      const files = await writeFiles(root, {
+        state: { lastEvaluation: recentEvaluation(), lastDecision: { at: new Date().toISOString(), ...item.decision } },
+      });
+      const snapshot = await buildStatusSnapshot({
+        ...files,
+        instance: { lockPresent: true, pid: process.pid, alive: true },
+        intervalSeconds: 30,
+      });
+      assert.match(formatStatus(snapshot), item.pattern);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test('最近切换输出 verified、deadlineMet、决策耗时与来源', async () => {
+  await withStatusDir(async (root) => {
+    const now = new Date().toISOString();
+    const files = await writeFiles(root, {
+      state: {
+        lastEvaluation: recentEvaluation(),
+        lastSwitchAt: now,
+        lastSwitch: {
+          from: 'old-node',
+          to: 'new-node',
+          reason: 'hard-failure',
+          verified: true,
+          deadlineMet: true,
+          decisionDurationMs: 180,
+          source: 'sentinel',
+        },
+      },
+    });
+    const snapshot = await buildStatusSnapshot({
+      ...files,
+      instance: { lockPresent: true, pid: process.pid, alive: true },
+      intervalSeconds: 30,
+    });
+    const output = formatStatus(snapshot);
+    assert.match(output, /最近切换\s+: old-node -> new-node \/ hard-failure/);
+    assert.match(output, /verified=true/);
+    assert.match(output, /deadlineMet=true/);
+    assert.match(output, /耗时 180 ms/);
+    assert.match(output, /来源 sentinel/);
+  });
+});
+
+test('隔离节点显示 kind 中文，淘汰候选按原因聚合计数', async () => {
+  await withStatusDir(async (root) => {
+    const future = new Date(Date.now() + 60_000).toISOString();
+    const files = await writeFiles(root, {
+      state: {
+        lastEvaluation: recentEvaluation(),
+        quarantinedNodes: {
+          qualityNode: { until: future, reason: 'pre-switch-validation-failed', kind: 'quality' },
+          verifyNode: { until: future, reason: 'post-switch-verification-failed', kind: 'verify' },
+          cooldownNode: { until: future, reason: 'hard-failure', kind: 'cooldown' },
+          networkNode: { until: future, reason: 'failed', kind: 'network' },
+        },
+        lastCandidateScan: {
+          at: new Date().toISOString(),
+          reason: 'periodic-optimization',
+          rejected: [
+            { node: 'node-a', reasons: ['success-rate'] },
+            { node: 'node-b', reasons: ['success-rate', 'average-latency'] },
+          ],
+        },
+      },
+    });
+    const snapshot = await buildStatusSnapshot({
+      ...files,
+      instance: { lockPresent: true, pid: process.pid, alive: true },
+      intervalSeconds: 30,
+    });
+    const output = formatStatus(snapshot);
+    assert.match(output, /隔离节点\s+: .*质量（quality）/);
+    assert.match(output, /切后验证（verify）/);
+    assert.match(output, /冷却（cooldown）/);
+    assert.match(output, /网络（network）/);
+    assert.match(output, /淘汰原因聚合\s+: success-rate×2、average-latency×1/);
+  });
+});
+
+test('状态页时间统一保留原始时间并标注本地时区', async () => {
+  await withStatusDir(async (root) => {
+    const evaluation = recentEvaluation();
+    const files = await writeFiles(root, {
+      state: {
+        runtime: { version: await packageVersion(), pid: 5, startedAt: evaluation.timestamp },
+        lastEvaluation: evaluation,
+        lastSwitchAt: evaluation.timestamp,
+        lastSwitch: { from: 'a', to: 'b', reason: 'hard-failure' },
+      },
+    });
+    const snapshot = await buildStatusSnapshot({
+      ...files,
+      instance: { lockPresent: true, pid: process.pid, alive: true },
+      programVersion: await packageVersion(),
+      intervalSeconds: 30,
+    });
+    const output = formatStatus(snapshot);
+    assert.ok(output.includes(evaluation.timestamp));
+    assert.match(output, /本地 \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC[+-]\d{2}:\d{2}/);
+  });
+});
