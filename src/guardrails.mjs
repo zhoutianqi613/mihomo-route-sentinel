@@ -6,8 +6,10 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import {
   applyFixedMutations,
+  ensureGuardrailBackup,
   inspectDnsOverrideFile,
   readTopLevelScalarFile,
+  restoreGuardrailBackup,
   validateClashVergeAppDir,
 } from './dns-config.mjs';
 
@@ -17,9 +19,8 @@ export {
   disableClashVergeDnsOverride,
   inspectClashVergeDnsOverride,
   replaceTopLevelScalar,
-  restoreGuardrailBackup,
 } from './dns-config.mjs';
-export { validateClashVergeAppDir };
+export { restoreGuardrailBackup, validateClashVergeAppDir };
 
 const execFileAsync = promisify(execFile);
 const CLASH_VERGE_DIR = 'io.github.clash-verge-rev.clash-verge-rev';
@@ -314,6 +315,84 @@ function deferPendingRetry(pending, nowMs = Date.now()) {
   };
 }
 
+const DNS_REPAIR_ROLLBACK_AUDIT_LIMIT = 20;
+
+/**
+ * DNS 修复复核失败后的自动回滚：用最近备份原子恢复 verge.yaml，
+ * 审计事件写入 guard journal，债务回到 repair-required 并退避。
+ * 恢复失败不吞错：记录原因并把错误返回给调用方。
+ */
+async function rollbackDnsRepair({
+  guardState,
+  guardStateFile,
+  vergePath,
+  backup,
+  pendingReload,
+  reason,
+  failure,
+  restoreBackup = restoreGuardrailBackup,
+}) {
+  const at = new Date().toISOString();
+  const record = {
+    event: 'dns-repair-rollback',
+    at,
+    reason,
+    failure: failure ? String(failure.message ?? failure) : null,
+    backupPath: backup?.path ?? null,
+    backupSha256: backup?.sha256 ?? null,
+    restoreRequired: true,
+    restored: false,
+    restoreError: null,
+  };
+  let restoreError = null;
+  if (!backup?.path) {
+    restoreError = new Error('缺少可用于回滚的配置备份');
+  } else {
+    // 配置未实际改动时无需覆盖用户文件；此时恢复动作视为已完成。
+    let unchanged = false;
+    try {
+      const [currentBytes, backupBytes] = await Promise.all([
+        readFile(vergePath),
+        readFile(backup.path),
+      ]);
+      unchanged = currentBytes.equals(backupBytes);
+    } catch {
+      unchanged = false;
+    }
+    if (unchanged) {
+      record.restoreRequired = false;
+      record.restored = true;
+    } else {
+      try {
+        await restoreBackup(backup.path, vergePath);
+        record.restored = true;
+      } catch (error) {
+        restoreError = error;
+        record.restoreError = error?.message ?? String(error);
+      }
+    }
+  }
+  if (restoreError && !record.restoreError) record.restoreError = restoreError.message;
+  guardState.dnsRepairRollback = record;
+  guardState.auditEvents = [
+    ...(Array.isArray(guardState.auditEvents) ? guardState.auditEvents : []),
+    record,
+  ].slice(-DNS_REPAIR_ROLLBACK_AUDIT_LIMIT);
+  // 回滚后 override 重新出现，债务回到待修复并退避，交给后续周期重试。
+  guardState.pendingDnsReload = {
+    ...(pendingReload ?? { kind: 'dns-reload-required' }),
+    phase: 'repair-required',
+    nextAttemptAt: new Date(Date.now() + DNS_RETRY_BACKOFF_MS).toISOString(),
+    lastRollbackAt: at,
+  };
+  try {
+    await writeGuardState(guardStateFile, guardState);
+  } catch (error) {
+    record.auditWriteError = error?.message ?? String(error);
+  }
+  return { record, restoreError };
+}
+
 export async function enforceGuardrails({
   controller,
   guardrails,
@@ -322,6 +401,7 @@ export async function enforceGuardrails({
   platform = process.platform,
   env = process.env,
   restartClashVerge = restartClashVergeWindows,
+  restoreBackup = restoreGuardrailBackup,
 } = {}) {
   if (!guardrails?.enabled) return publicResult('ok');
   const issues = new Set();
@@ -350,6 +430,8 @@ export async function enforceGuardrails({
   const controllerDescription = controller.describe?.() ?? {};
   const isClashVergePipe = controllerDescription.kind === 'pipe'
     && /verge-mihomo/i.test(controllerDescription.endpoint ?? '');
+  // DNS 修复后的重启等待上限：客户端/管道需在配置的启动超时内就绪，否则视为复核失败。
+  const dnsStartupTimeoutMs = Math.max(1, (guardrails.clashVergeStartupTimeoutSeconds ?? 20) * 1000);
 
   // DNS 修复可能已经停止 GUI/Core，因而不能依赖 Controller 可达后才读取债务。
   // 先把持久化 phase 恢复到“已启动并等待 Controller 复核”，随后再检查运行模式。
@@ -457,9 +539,10 @@ export async function enforceGuardrails({
                   const freshDns = await inspectDnsOverrideFile(vergePath, profileUid);
                   if (freshDns.enabled || freshDns.globalEnabled) {
                     if (freshDns.mutations.length === 0) throw new Error('dns override changed before repair');
-                    const applied = await applyFixedMutations(vergePath, freshDns.mutations, freshDns.metadata);
-                    dnsBackup = applied?.backup ?? null;
-                    if (dnsBackup) guardState.lastDnsBackup = dnsBackup;
+                    // 先确保备份存在再写配置：即使写入中途失败，回滚也有完整原文。
+                    dnsBackup = await ensureGuardrailBackup(vergePath);
+                    await applyFixedMutations(vergePath, freshDns.mutations, freshDns.metadata);
+                    guardState.lastDnsBackup = dnsBackup;
                     repairs.add('dns-override-persisted');
                   }
                   dns = await inspectDnsOverrideFile(vergePath, profileUid);
@@ -484,7 +567,9 @@ export async function enforceGuardrails({
                   : await restartClashVergeWindows(executable);
                 appWasStopped = false;
                 if (restartResult !== true) throw new Error('Clash Verge restart failed');
-                const refreshed = await waitForFileRefresh(runtimeConfigPath, pendingReload.runtimeStamp);
+                const refreshed = await waitForFileRefresh(
+                  runtimeConfigPath, pendingReload.runtimeStamp, dnsStartupTimeoutMs,
+                );
                 const persisted = await inspectDnsOverrideFile(vergePath, profileUid);
                 if (!refreshed || persisted.enabled || persisted.globalEnabled) {
                   throw new Error('runtime config was not refreshed');
@@ -496,7 +581,35 @@ export async function enforceGuardrails({
                 guardState.pendingDnsReload = pendingReload;
                 await writeGuardState(guardStateFile, guardState);
                 repairs.add('clash-verge-restarted');
-              } catch {
+              } catch (error) {
+                if (dnsBackup) {
+                  // 修复已落盘但重启/复核失败：自动回滚到备份，避免留下半修状态。
+                  const rollback = await rollbackDnsRepair({
+                    guardState,
+                    guardStateFile,
+                    vergePath,
+                    backup: dnsBackup,
+                    pendingReload,
+                    reason: error?.message ?? 'dns repair verification failed',
+                    failure: error,
+                    restoreBackup,
+                  });
+                  repairs.delete('dns-override-persisted');
+                  if (!customRestart && executable && appWasStopped) {
+                    await ensureClashVergeRunningWindows(executable).catch(() => {});
+                  }
+                  if (rollback.restoreError) {
+                    detect('dns-repair-rollback');
+                    detect('dns-repair-rollback-failed');
+                    return {
+                      ...result('error'),
+                      rollback: rollback.record,
+                      backupPath: rollback.record.backupPath,
+                    };
+                  }
+                  detect('dns-repair-rollback');
+                  return { ...result('blocked'), rollback: rollback.record };
+                }
                 pendingReload = deferPendingRetry({
                   ...pendingReload,
                   executable,
@@ -657,9 +770,10 @@ export async function enforceGuardrails({
               const freshDns = await inspectDnsOverrideFile(vergePath, profileUid);
               if (freshDns.enabled || freshDns.globalEnabled) {
                 if (freshDns.mutations.length === 0) throw new Error('dns override changed before repair');
-                const applied = await applyFixedMutations(vergePath, freshDns.mutations, freshDns.metadata);
-                dnsBackup = applied?.backup ?? null;
-                if (dnsBackup) guardState.lastDnsBackup = dnsBackup;
+                // 先确保备份存在再写配置：即使写入中途失败，回滚也有完整原文。
+                dnsBackup = await ensureGuardrailBackup(vergePath);
+                await applyFixedMutations(vergePath, freshDns.mutations, freshDns.metadata);
+                guardState.lastDnsBackup = dnsBackup;
                 repairs.add('dns-override-persisted');
               }
               dns = await inspectDnsOverrideFile(vergePath, profileUid);
@@ -690,7 +804,9 @@ export async function enforceGuardrails({
               : await restartClashVergeWindows(executable);
             appWasStopped = false;
             if (restartResult !== true) throw new Error('Clash Verge restart failed');
-            const refreshed = await waitForFileRefresh(runtimeConfigPath, pendingReload.runtimeStamp);
+            const refreshed = await waitForFileRefresh(
+              runtimeConfigPath, pendingReload.runtimeStamp, dnsStartupTimeoutMs,
+            );
             const persisted = await inspectDnsOverrideFile(vergePath, profileUid);
             if (!refreshed || persisted.enabled || persisted.globalEnabled
                 || !await runtimeModeIsExpected(controller, guardrails.expectedRuntimeMode)) {
@@ -703,7 +819,35 @@ export async function enforceGuardrails({
             resolve('dns-reload-pending', 'dns-reload-confirmed');
             repairs.add('clash-verge-restarted');
             return result('repaired-restart');
-          } catch {
+          } catch (error) {
+            if (dnsBackup) {
+              // 修复已落盘但重启/复核失败：自动回滚到备份，避免留下半修状态。
+              const rollback = await rollbackDnsRepair({
+                guardState,
+                guardStateFile,
+                vergePath,
+                backup: dnsBackup,
+                pendingReload,
+                reason: error?.message ?? 'dns repair verification failed',
+                failure: error,
+                restoreBackup,
+              });
+              repairs.delete('dns-override-persisted');
+              if (!customRestart && executable && appWasStopped) {
+                await ensureClashVergeRunningWindows(executable).catch(() => {});
+              }
+              if (rollback.restoreError) {
+                detect('dns-repair-rollback');
+                detect('dns-repair-rollback-failed');
+                return {
+                  ...result('error'),
+                  rollback: rollback.record,
+                  backupPath: rollback.record.backupPath,
+                };
+              }
+              detect('dns-repair-rollback');
+              return { ...result('blocked'), rollback: rollback.record };
+            }
             pendingReload = deferPendingRetry({
               ...pendingReload,
               executable,

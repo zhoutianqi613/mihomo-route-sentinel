@@ -1,16 +1,16 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, readdir, stat, utimes, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
-  disableClashVergeDnsOverride,
   enforceClashVergeAvailability,
   enforceGuardrails,
   enforceRuntimeMode,
   inspectClashVergeDnsOverride,
   replaceTopLevelScalar,
 } from '../src/guardrails.mjs';
+import { applyFixedMutations, inspectDnsOverrideFile } from '../src/dns-config.mjs';
 
 class MockController {
   constructor({ mode = 'rule', kind = 'pipe', refusePatch = false } = {}) {
@@ -271,7 +271,11 @@ async function expirePendingBackoff(directory) {
   await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
 }
 
-test('DNS 覆写检查和修复仅影响当前订阅', () => {
+test('DNS 覆写检查和修复仅影响当前订阅（生产路径）', async (t) => {
+  // 旧入口的独立 splice 实现已删除：断言改为走 inspectDnsOverrideFile + applyFixedMutations。
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'route-sentinel-dns-prod-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const filePath = path.join(directory, 'verge.yaml');
   const source = [
     'enable_dns_settings: true',
     'profile_dns_settings:',
@@ -282,12 +286,24 @@ test('DNS 覆写检查和修复仅影响当前订阅', () => {
     '    enabled: true',
     '',
   ].join('\n');
+  await writeFile(filePath, source, 'utf8');
   assert.equal(inspectClashVergeDnsOverride(source, 'active-profile').enabled, true);
-  const repaired = disableClashVergeDnsOverride(source, 'active-profile');
-  assert.equal(repaired.changed, true);
-  assert.equal(inspectClashVergeDnsOverride(repaired.content, 'active-profile').enabled, false);
-  assert.match(repaired.content, /other-profile:\n    enabled: true/);
-  assert.doesNotMatch(repaired.content, /confirmation:/);
+
+  const inspected = await inspectDnsOverrideFile(filePath, 'active-profile');
+  const applied = await applyFixedMutations(filePath, inspected.mutations, inspected.metadata);
+  const repaired = await readFile(filePath, 'utf8');
+
+  assert.equal(inspectClashVergeDnsOverride(repaired, 'active-profile').enabled, false);
+  assert.match(repaired, /other-profile:\n    enabled: true/);
+  // 确认字段被注释后不再生效，而不是删除行。
+  assert.doesNotMatch(repaired, /^ {4,}confirmation:/m);
+  assert.equal(await readFile(applied.backup.path, 'utf8'), source);
+
+  // 幂等：再次解析不再产生补丁，内容保持不变。
+  const second = await inspectDnsOverrideFile(filePath, 'active-profile');
+  assert.deepEqual(second.mutations, []);
+  await applyFixedMutations(filePath, second.mutations, second.metadata);
+  assert.equal(await readFile(filePath, 'utf8'), repaired);
 });
 
 test('顶层模式替换保留其余配置', () => {
@@ -376,8 +392,10 @@ test('DNS 修复后无法自动重载时 fail-closed', async () => {
   assert.equal(inspectClashVergeDnsOverride(unchanged, 'active-profile').enabled, true);
 });
 
-test('Clash Verge 重启未刷新运行配置时保持阻止状态', async () => {
+test('Clash Verge 重启失败时保持阻止状态并自动回滚配置', async () => {
   const directory = await createClashVergeFixture({ dnsEnabled: true });
+  const vergePath = path.join(directory, 'verge.yaml');
+  const original = await readFile(vergePath, 'utf8');
   const result = await enforceGuardrails({
     controller: new MockController(),
     guardrails: { ...baseGuardrails, clashVergeAppDir: directory },
@@ -387,7 +405,12 @@ test('Clash Verge 重启未刷新运行配置时保持阻止状态', async () =>
     restartClashVerge: async () => false,
   });
   assert.equal(result.status, 'blocked');
-  assert.ok(result.issues.includes('clash-verge-reload-failed'));
+  assert.ok(result.issues.includes('dns-repair-rollback'));
+  assert.equal(result.rollback?.restored, true);
+  assert.equal(await readFile(vergePath, 'utf8'), original);
+  const state = JSON.parse(await readFile(guardStateFile(directory), 'utf8'));
+  assert.equal(state.dnsRepairRollback.event, 'dns-repair-rollback');
+  assert.equal(state.pendingDnsReload.phase, 'repair-required');
 });
 
 test('DNS 重载债务跨周期和进程重启保持 fail-closed', async () => {

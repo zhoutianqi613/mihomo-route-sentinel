@@ -175,5 +175,7 @@ test('inspectClashVergeDnsOverride 与 disableClashVergeDnsOverride 只影响当
   assert.equal(disabled.changed, true);
   assert.equal(inspectClashVergeDnsOverride(disabled.content, 'active-profile').enabled, false);
   assert.match(disabled.content, /other-profile:\n    enabled: true/);
-  assert.doesNotMatch(disabled.content, /confirmation:/);
+  // 统一走生产补丁后，confirmation 行被定长注释而非删除，因此断言"不再生效"。
+  assert.doesNotMatch(disabled.content, /^ {4,}confirmation:/m);
+  assert.match(disabled.content, /#+confirmation:/);
 });

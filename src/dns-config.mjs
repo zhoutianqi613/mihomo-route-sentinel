@@ -129,31 +129,115 @@ export function inspectClashVergeDnsOverride(vergeContent, profileUid) {
   };
 }
 
-export function disableClashVergeDnsOverride(vergeContent, profileUid) {
-  const { lines, newline } = splitYaml(vergeContent);
-  let changed = false;
-  for (let index = 0; index < lines.length; index += 1) {
-    if (/^enable_dns_settings:\s*true(?:\s+#.*)?$/.test(lines[index])) {
-      lines[index] = lines[index].replace(/true/, 'false');
-      changed = true;
-      break;
+// 生产与旧入口共用的解析器：逐行接收原始行，产出与文件路径完全相同的判定和补丁。
+function createDnsOverrideScanner(profileUid) {
+  let globalEnabled = false;
+  let profileEnabled = null;
+  let inProfiles = false;
+  let inTarget = false;
+  let targetMutations = [];
+  const mutations = [];
+  const push = (raw, lineOffset) => {
+    const line = raw.toString('utf8');
+    if (!line.trim() || line.trimStart().startsWith('#')) return;
+    const indent = lineIndent(line);
+    if (indent === 0) {
+      inProfiles = /^profile_dns_settings:\s*(?:#.*)?$/.test(line);
+      inTarget = false;
+      const match = line.match(/^enable_dns_settings:\s*(true|false)(?:\s+#.*)?$/);
+      if (match) {
+        globalEnabled = match[1] === 'true';
+        if (globalEnabled) mutations.push({ offset: lineOffset, expected: 'e', replacement: '#' });
+      } else if (/^enable_dns_settings:/.test(line)) {
+        throw new Error('enable_dns_settings must be boolean');
+      }
+      return;
     }
-  }
-  const profile = profileRange(lines, sectionRange(lines, 'profile_dns_settings'), profileUid);
-  const enabled = nestedScalar(lines, profile, 'enabled');
-  if (enabled && enabled.value === 'true') {
-    lines[enabled.index] = lines[enabled.index].replace(/true/, 'false');
-    changed = true;
-  }
-  if (profile) {
-    for (let index = profile.end - 1; index > profile.start; index -= 1) {
-      if (/^\s{4,}confirmation:\s*/.test(lines[index])) {
-        lines.splice(index, 1);
-        changed = true;
+    if (!inProfiles) return;
+    if (indent === 2) {
+      const match = line.match(/^\s{2}(.+?):\s*(?:#.*)?$/);
+      inTarget = Boolean(match && stripYamlScalar(match[1]) === profileUid);
+      if (inTarget) {
+        targetMutations = [{ offset: lineOffset, expected: '  ', replacement: '##' }];
+      }
+      return;
+    }
+    if (inTarget && indent >= 4) {
+      targetMutations.push({
+        offset: lineOffset,
+        expected: ' '.repeat(indent),
+        replacement: '#'.repeat(indent),
+      });
+      const match = line.match(/^\s{4,}enabled:\s*(true|false)(?:\s+#.*)?$/);
+      if (match) {
+        profileEnabled = match[1] === 'true';
+      } else if (/^\s{4,}enabled:/.test(line)) {
+        throw new Error('profile_dns_settings.enabled must be boolean');
       }
     }
+  };
+  const finish = () => ({
+    enabled: profileEnabled ?? globalEnabled,
+    globalEnabled,
+    profileEnabled,
+    mutations: [...mutations, ...(profileEnabled ? targetMutations : [])],
+  });
+  return { push, finish };
+}
+
+// 与 scanLines 完全相同的切行规则，仅用于内存字符串入口。
+function scanContentLines(content, visitor) {
+  const buffer = Buffer.from(content, 'utf8');
+  let offset = 0;
+  for (;;) {
+    const newline = buffer.indexOf(0x0a, offset);
+    if (newline < 0) break;
+    const raw = buffer.subarray(offset, newline);
+    visitor(raw.at(-1) === 0x0d ? raw.subarray(0, -1) : raw, offset);
+    offset = newline + 1;
   }
-  return { changed, content: lines.join(newline) };
+  if (offset < buffer.length) visitor(buffer.subarray(offset), offset);
+  return buffer;
+}
+
+function mutationBuffers(mutation) {
+  const expected = Buffer.from(mutation.expected, 'utf8');
+  const replacement = Buffer.from(mutation.replacement, 'utf8');
+  if (expected.length !== replacement.length) throw new Error('mutation length mismatch');
+  return { expected, replacement };
+}
+
+// 单点补丁校验：文件随机写与内存薄包装共用同一判定，避免出现两套语义。
+function patchedBytesForMutation(currentBytes, mutation) {
+  const { expected, replacement } = mutationBuffers(mutation);
+  if (currentBytes.equals(replacement)) return null;
+  if (!currentBytes.equals(expected)) throw new Error('repair target changed');
+  return replacement;
+}
+
+// 定长补丁的内存实现：与文件写入共享同一组补丁和同一套校验语义。
+function applyFixedLengthMutations(buffer, mutations) {
+  const patched = Buffer.from(buffer);
+  for (const mutation of [...mutations].sort((a, b) => b.offset - a.offset)) {
+    const { expected } = mutationBuffers(mutation);
+    const current = patched.subarray(mutation.offset, mutation.offset + expected.length);
+    const replacement = patchedBytesForMutation(current, mutation);
+    if (!replacement) continue;
+    patched.set(replacement, mutation.offset);
+  }
+  return patched;
+}
+
+/**
+ * 兼容旧测试入口的薄包装：不再有第二套 splice 实现，
+ * 判定与补丁全部来自 createDnsOverrideScanner（与 inspectDnsOverrideFile 同源），
+ * 应用规则与 applyFixedMutations 相同的定长注释。
+ */
+export function disableClashVergeDnsOverride(vergeContent, profileUid) {
+  const scanner = createDnsOverrideScanner(profileUid);
+  const source = scanContentLines(vergeContent, scanner.push);
+  const patched = applyFixedLengthMutations(source, scanner.finish().mutations);
+  return { changed: !patched.equals(source), content: patched.toString('utf8') };
 }
 
 export function replaceTopLevelScalar(content, key, expected) {
@@ -215,6 +299,13 @@ async function backupBeforeMutation(filePath) {
     await unlink(temporary).catch(() => {});
   }
   return { path: backupPath, sha256: sha256Digest(original), created: true };
+}
+
+/**
+ * 在修复前显式确保备份存在（幂等）：写入失败或需要回滚时，调用方仍持有可用备份。
+ */
+export async function ensureGuardrailBackup(filePath) {
+  return backupBeforeMutation(filePath);
 }
 
 /**
@@ -282,56 +373,14 @@ export async function readTopLevelScalarFile(filePath, key) {
 }
 
 export async function inspectDnsOverrideFile(filePath, profileUid) {
-  let globalEnabled = false;
-  let profileEnabled = null;
-  let inProfiles = false;
-  let inTarget = false;
-  let targetMutations = [];
-  const mutations = [];
-  const metadata = await scanLines(filePath, (raw, lineOffset) => {
-    const line = raw.toString('utf8');
-    if (!line.trim() || line.trimStart().startsWith('#')) return;
-    const indent = lineIndent(line);
-    if (indent === 0) {
-      inProfiles = /^profile_dns_settings:\s*(?:#.*)?$/.test(line);
-      inTarget = false;
-      const match = line.match(/^enable_dns_settings:\s*(true|false)(?:\s+#.*)?$/);
-      if (match) {
-        globalEnabled = match[1] === 'true';
-        if (globalEnabled) mutations.push({ offset: lineOffset, expected: 'e', replacement: '#' });
-      } else if (/^enable_dns_settings:/.test(line)) {
-        throw new Error('enable_dns_settings must be boolean');
-      }
-      return;
-    }
-    if (!inProfiles) return;
-    if (indent === 2) {
-      const match = line.match(/^\s{2}(.+?):\s*(?:#.*)?$/);
-      inTarget = Boolean(match && stripYamlScalar(match[1]) === profileUid);
-      if (inTarget) {
-        targetMutations = [{ offset: lineOffset, expected: '  ', replacement: '##' }];
-      }
-      return;
-    }
-    if (inTarget && indent >= 4) {
-      targetMutations.push({
-        offset: lineOffset,
-        expected: ' '.repeat(indent),
-        replacement: '#'.repeat(indent),
-      });
-      const match = line.match(/^\s{4,}enabled:\s*(true|false)(?:\s+#.*)?$/);
-      if (match) {
-        profileEnabled = match[1] === 'true';
-      } else if (/^\s{4,}enabled:/.test(line)) {
-        throw new Error('profile_dns_settings.enabled must be boolean');
-      }
-    }
-  });
+  const scanner = createDnsOverrideScanner(profileUid);
+  const metadata = await scanLines(filePath, scanner.push);
+  const summary = scanner.finish();
   return {
-    enabled: profileEnabled ?? globalEnabled,
-    globalEnabled,
-    profileEnabled,
-    mutations: [...mutations, ...(profileEnabled ? targetMutations : [])],
+    enabled: summary.enabled,
+    globalEnabled: summary.globalEnabled,
+    profileEnabled: summary.profileEnabled,
+    mutations: summary.mutations,
     metadata: { size: metadata.size, mtimeMs: metadata.mtimeMs },
   };
 }
@@ -348,13 +397,11 @@ export async function applyFixedMutations(filePath, mutations, expectedMetadata 
   try {
     // 先注释子字段，最后注释 profile 头；任意中断都可用同一 journal 幂等续写。
     for (const mutation of [...mutations].sort((a, b) => b.offset - a.offset)) {
-      const expected = Buffer.from(mutation.expected, 'utf8');
-      const replacement = Buffer.from(mutation.replacement, 'utf8');
-      if (expected.length !== replacement.length) throw new Error('mutation length mismatch');
+      const { expected } = mutationBuffers(mutation);
       const currentBytes = Buffer.alloc(expected.length);
       await handle.read(currentBytes, 0, currentBytes.length, mutation.offset);
-      if (currentBytes.equals(replacement)) continue;
-      if (!currentBytes.equals(expected)) throw new Error('repair target changed');
+      const replacement = patchedBytesForMutation(currentBytes, mutation);
+      if (!replacement) continue;
       await handle.write(replacement, 0, replacement.length, mutation.offset);
     }
     await handle.sync();
