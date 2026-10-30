@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -146,4 +146,80 @@ test('inspectState 对缺失关键字段的骨架返回合法', () => {
   assert.equal(inspectState({ consecutiveFailures: 0, switchHistory: [], quarantinedNodes: {} }).ok, true);
   assert.equal(inspectState(null).reason, 'not-an-object');
   assert.equal(inspectState({ stateVersion: 1.5 }).reason, 'invalid-state-version');
+});
+
+test('保存使用唯一临时文件：并发写入互不踩踏且最终文件合法', async (t) => {
+  const { root, stateFile } = await makeStateFile();
+  await Promise.all([
+    saveState(stateFile, { consecutiveFailures: 1 }),
+    saveState(stateFile, { consecutiveFailures: 2 }),
+  ]);
+  const persisted = JSON.parse(await readFile(stateFile, 'utf8'));
+  assert.equal(persisted.stateVersion, STATE_VERSION);
+  assert.ok([1, 2].includes(persisted.consecutiveFailures));
+  assert.deepEqual((await readdir(root)).filter((name) => name.endsWith('.tmp')), []);
+});
+
+test('写失败不留半文件与临时文件，旧状态仍可完整读取', async (t) => {
+  const { root, stateFile } = await makeStateFile();
+  await saveState(stateFile, { consecutiveFailures: 7, lastSwitchAt: '2026-10-30T00:00:00.000Z' });
+  const before = await readFile(stateFile, 'utf8');
+  const circular = { consecutiveFailures: 8 };
+  circular.self = circular;
+  await assert.rejects(saveState(stateFile, circular));
+  assert.equal(await readFile(stateFile, 'utf8'), before);
+  const { state, recovery } = await loadState(stateFile);
+  assert.equal(recovery, null);
+  assert.equal(state.consecutiveFailures, 7);
+  assert.deepEqual((await readdir(root)).filter((name) => name.endsWith('.tmp')), []);
+});
+
+test('rename 失败（目标被占用）时清理临时文件且目标不被替换', async (t) => {
+  const { root, stateFile } = await makeStateFile();
+  await mkdir(stateFile); // 目标位置是目录：rename 在 Windows/Linux 上都会失败
+  await assert.rejects(saveState(stateFile, { consecutiveFailures: 1 }));
+  assert.deepEqual((await readdir(root)).filter((name) => name.endsWith('.tmp')), []);
+  assert.ok((await stat(stateFile)).isDirectory(), '失败后目标不应被替换');
+});
+
+test('备份文件存在且可解析；版本未变化时不重复覆盖备份', async (t) => {
+  const { stateFile } = await makeStateFile();
+  const backupFile = `${stateFile}.bak`;
+  await saveState(stateFile, { consecutiveFailures: 1 });
+  const backup = JSON.parse(await readFile(backupFile, 'utf8'));
+  assert.equal(backup.stateVersion, STATE_VERSION);
+  // 人为写入标记：若下一次保存仍然覆盖备份，标记就会丢失。
+  await writeFile(backupFile, `${JSON.stringify({ stateVersion: STATE_VERSION, marker: 'keep' })}\n`, 'utf8');
+  await saveState(stateFile, { consecutiveFailures: 2 });
+  assert.equal(JSON.parse(await readFile(backupFile, 'utf8')).marker, 'keep');
+  // 版本不一致（备份缺少 stateVersion）时必须重建备份。
+  await writeFile(backupFile, '{}\n', 'utf8');
+  await saveState(stateFile, { consecutiveFailures: 3 });
+  const rebuilt = JSON.parse(await readFile(backupFile, 'utf8'));
+  assert.equal(rebuilt.stateVersion, STATE_VERSION);
+  assert.equal(rebuilt.consecutiveFailures, 3);
+});
+
+test('连续 20 次保存后状态文件仍为合法 JSON 且无临时文件残留', async (t) => {
+  const { root, stateFile } = await makeStateFile();
+  for (let index = 0; index < 20; index += 1) {
+    await saveState(stateFile, { consecutiveFailures: index, lastSwitchAt: null });
+  }
+  const persisted = JSON.parse(await readFile(stateFile, 'utf8'));
+  assert.equal(persisted.consecutiveFailures, 19);
+  assert.equal(persisted.stateVersion, STATE_VERSION);
+  const { state, recovery } = await loadState(stateFile);
+  assert.equal(recovery, null);
+  assert.equal(state.consecutiveFailures, 19);
+  assert.deepEqual((await readdir(root)).filter((name) => name.endsWith('.tmp')), []);
+  assert.ok(JSON.parse(await readFile(`${stateFile}.bak`, 'utf8')));
+});
+
+test('备份写入失败不阻断状态写入', async (t) => {
+  const { stateFile } = await makeStateFile();
+  await mkdir(`${stateFile}.bak`); // 备份路径被目录占用，备份写入必然失败
+  await saveState(stateFile, { consecutiveFailures: 5 });
+  const persisted = JSON.parse(await readFile(stateFile, 'utf8'));
+  assert.equal(persisted.consecutiveFailures, 5);
+  assert.equal(persisted.stateVersion, STATE_VERSION);
 });

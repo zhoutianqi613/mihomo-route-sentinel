@@ -1,9 +1,15 @@
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { mkdir, open, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 export const STATE_VERSION = 1;
 
 const STATE_VERSION_UNSUPPORTED = 'STATE_VERSION_UNSUPPORTED';
+// 退避重试间隔：杀毒软件/索引服务在 Windows 上会短暂持有目标文件（EPERM/EBUSY）。
+const RENAME_RETRY_DELAYS_MS = [30, 100, 300];
+const RENAME_RETRYABLE_CODES = new Set(['EPERM', 'EBUSY']);
+
+const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -107,18 +113,72 @@ export async function loadState(stateFile) {
   return { state: parsed, recovery: null };
 }
 
+async function renameWithRetry(from, to) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await rename(from, to);
+      return;
+    } catch (error) {
+      if (!RENAME_RETRYABLE_CODES.has(error.code) || attempt >= RENAME_RETRY_DELAYS_MS.length) throw error;
+      await sleep(RENAME_RETRY_DELAYS_MS[attempt]);
+    }
+  }
+}
+
+async function syncDirectory(directory) {
+  let handle;
+  try {
+    handle = await open(directory, 'r');
+    await handle.sync();
+  } catch {
+    // Linux/macOS 上 fsync 目录可确认目录项落盘；Windows 不允许对目录取只读句柄（EPERM/EISDIR）。
+    // 目录项持久化是尽力而为，任何失败都不阻断状态写入。
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+  }
+}
+
 /**
- * 原子写入：临时文件写完再 rename，读者永远不会看到半个 JSON。
- * 写入前统一补齐 stateVersion，避免旧进程写回无版本状态。
+ * 备份只在"尚无备份"或"版本变化"时写入：正常运行时不产生额外的每周期写入。
+ */
+async function refreshBackup(stateFile, payload, version) {
+  const backupFile = `${stateFile}.bak`;
+  try {
+    const parsed = JSON.parse(await readFile(backupFile, 'utf8'));
+    if (parsed?.stateVersion === version) return;
+  } catch {
+    // 备份缺失或不可解析：重建。
+  }
+  try {
+    await writeFile(backupFile, payload, 'utf8');
+  } catch {
+    // 备份是尽力而为，写不了不影响主状态。
+  }
+}
+
+/**
+ * 原子写入：唯一临时文件 → 写入并 fsync → rename 覆盖 → 目录 fsync → 尽力维护 .bak。
+ * 读者只会看到完整 JSON：旧文件在 rename 成功前保持原样，失败也不会留下半个状态。
  */
 export async function saveState(stateFile, state) {
   const payload = `${JSON.stringify({ ...state, stateVersion: STATE_VERSION }, null, 2)}\n`;
-  await mkdir(path.dirname(stateFile), { recursive: true });
-  const temporary = `${stateFile}.${process.pid}.tmp`;
+  const directory = path.dirname(stateFile);
+  await mkdir(directory, { recursive: true });
+  // pid + UUID：同一进程内并发保存（如前后台同时落盘）也不会共用临时文件。
+  const temporary = `${stateFile}.${process.pid}.${randomUUID()}.tmp`;
   try {
-    await writeFile(temporary, payload, 'utf8');
-    await rename(temporary, stateFile);
+    const handle = await open(temporary, 'wx');
+    try {
+      await handle.writeFile(payload, 'utf8');
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await renameWithRetry(temporary, stateFile);
   } finally {
+    // 成功路径 rename 已移走临时文件，force 让这里变成无害的兜底。
     await rm(temporary, { force: true }).catch(() => {});
   }
+  await syncDirectory(directory);
+  await refreshBackup(stateFile, payload, STATE_VERSION);
 }
