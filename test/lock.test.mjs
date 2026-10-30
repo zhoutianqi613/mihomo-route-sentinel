@@ -228,3 +228,30 @@ test('活进程持有不同 fingerprint 的锁时仍拒绝，并提示先停止�
     assert.equal((await readLock(lockFile)).controllerFingerprint, otherFingerprint);
   });
 });
+
+test('旧版纯 PID 锁文件仍可识别，并可停止旧实例', async () => {
+  await withLockDir(async (lockFile) => {
+    const otherPid = await deadPid();
+    await writeFile(lockFile, `${otherPid}\n`, 'utf8');
+    const lock = await readLock(lockFile);
+    assert.equal(lock.pid, otherPid);
+    assert.equal(lock.legacy, true);
+    assert.equal(lock.controllerFingerprint, '');
+  });
+});
+
+test('旧版纯 PID 锁在进程存活时拒绝抢占，死进程时可回收', async () => {
+  await withLockDir(async (lockFile) => {
+    await writeFile(lockFile, `${process.pid}\n`, 'utf8');
+    await assert.rejects(
+      acquireLock(lockFile, { controllerFingerprint: fingerprintFor() }),
+      (error) => error.code === 'LOCK_HELD',
+    );
+
+    const dead = await deadPid();
+    await writeFile(lockFile, `${dead}\n`, 'utf8');
+    const release = await acquireLock(lockFile, { controllerFingerprint: fingerprintFor() });
+    assert.equal((await readLock(lockFile)).pid, process.pid);
+    await release();
+  });
+});

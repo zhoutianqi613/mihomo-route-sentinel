@@ -47,10 +47,22 @@ export async function readLock(lockFile) {
   try {
     parsed = JSON.parse(raw);
   } catch {
-    return null;
+    parsed = null;
   }
-  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
-  return parsed;
+  if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+  // 兼容旧版锁文件（内容为纯 PID 文本）：升级后仍能识别并停止旧实例。
+  const legacyPid = Number.parseInt(String(raw).trim(), 10);
+  if (Number.isInteger(legacyPid) && legacyPid > 0 && String(raw).trim() === String(legacyPid)) {
+    return {
+      version: 0,
+      pid: legacyPid,
+      startedAt: null,
+      controllerFingerprint: '',
+      programVersion: null,
+      legacy: true,
+    };
+  }
+  return null;
 }
 
 async function writeTempLock(tmpFile, payload) {
