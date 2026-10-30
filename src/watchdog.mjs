@@ -3,6 +3,7 @@ import path from 'node:path';
 import { consumeSwitchBudget, getSwitchBudget, recordRecoveryRollback } from './switch-budget.mjs';
 import { synchronizeDecisionState } from './decision-state.mjs';
 import { loadState, saveState } from './state-store.mjs';
+import { latencyUpperBound, quantile, wilsonLowerBound } from './estimator.mjs';
 
 const GROUP_TYPES = new Set(['Selector', 'URLTest', 'Fallback', 'LoadBalance']);
 const SELECTION_ADMISSION_VERSION = 1;
@@ -50,15 +51,32 @@ function summarizeSamples(node, samples) {
     ? delays.reduce((sum, value) => sum + ((value - averageMs) ** 2), 0) / delays.length
     : Infinity;
   const jitterMs = Number.isFinite(variance) ? Math.sqrt(variance) : Infinity;
-  const score = ((1 - successRate) * 1_000_000) + averageMs + (maxMs * 0.25) + (jitterMs * 0.5);
+  // 小样本下点估计不可信（winner's curse）：成功率用 Wilson 下界、延迟用标准误上界，
+  // 尾部用 p95。失败样本不进延迟统计，但仍计入 attempts 以压低下界。
+  const sortedDelays = [...delays].sort((a, b) => a - b);
+  const successLowerBound = wilsonLowerBound(successful.length, samples.length);
+  const p50Ms = quantile(sortedDelays, 0.5);
+  const p95Ms = quantile(sortedDelays, 0.95);
+  const stdMs = jitterMs;
+  const latencyUpperMs = latencyUpperBound(averageMs, stdMs, delays.length);
+  // 排序改为不确定性感知：先压低“成功率下界低”，再比延迟上界，
+  // 并对单次最大延迟与波动做轻量惩罚；非有限值用大数兜底，保证不可用候选排在最后。
+  const rawScore = ((1 - successLowerBound) * 1_000_000) + latencyUpperMs
+    + (maxMs * 0.15) + (stdMs * 0.25);
+  const score = Number.isFinite(rawScore) ? rawScore : 1e12;
   return {
     node,
     attempts: samples.length,
     successes: successful.length,
     successRate,
+    successLowerBound,
+    p50Ms,
+    p95Ms,
     averageMs,
     maxMs,
     jitterMs,
+    stdMs,
+    latencyUpperMs,
     score,
     samples,
   };
@@ -104,8 +122,14 @@ function hasStrictAdmissionEvidence(result, probes, thresholds) {
 }
 
 function compareAvailability(a, b) {
-  return b.successRate - a.successRate
-    || a.averageMs - b.averageMs
+  // 优先比较不确定性保守量；缓存快照等旧结构缺少新字段时回退到原点估计，
+  // 保持旧快照的排序行为不变。
+  const lowerOf = (entry) => (Number.isFinite(entry.successLowerBound)
+    ? entry.successLowerBound : entry.successRate);
+  const upperOf = (entry) => (Number.isFinite(entry.latencyUpperMs)
+    ? entry.latencyUpperMs : entry.averageMs);
+  return lowerOf(b) - lowerOf(a)
+    || upperOf(a) - upperOf(b)
     || a.maxMs - b.maxMs
     || a.jitterMs - b.jitterMs
     || a.node.localeCompare(b.node);
