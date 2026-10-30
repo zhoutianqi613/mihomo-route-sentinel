@@ -8,7 +8,6 @@ import {
   classifyHealth,
   clearCandidateScanBackoff,
   compareAvailability,
-  explainRoundStability,
   getActiveQuarantines,
   hasCompleteProbeRounds,
   hasStrictAdmissionEvidence,
@@ -20,7 +19,8 @@ import {
   requiresImmediateResponse,
   summarizeSamples,
 } from './health-policy.mjs';
-import { createProbeScheduler, mapLimit, waitUntil } from './probe-scheduler.mjs';
+import { createProbeScheduler, mapLimit } from './probe-scheduler.mjs';
+import { createCandidateService } from './candidate-service.mjs';
 
 const GROUP_TYPES = new Set(['Selector', 'URLTest', 'Fallback', 'LoadBalance']);
 const SELECTION_ADMISSION_VERSION = 1;
@@ -100,6 +100,20 @@ export class Watchdog {
     this.clock = { ...DEFAULT_CLOCK, ...(clock ?? {}) };
     this.activeCandidateScan = null;
     this.probes = createProbeScheduler({ controller, config, logger: this.log, clock: this.clock });
+    // 候选扫描状态 activeCandidateScan 仍由 Watchdog 持有；服务通过注入的 get/set 读写。
+    this.candidates = createCandidateService({
+      controller,
+      config,
+      logger: (...args) => this.log(...args),
+      probes: this.probes,
+      currentThresholds: () => this.currentThresholds(),
+      candidateThresholds: () => this.candidateThresholds(),
+      clock: this.clock,
+      getActiveCandidateScan: () => this.activeCandidateScan,
+      setActiveCandidateScan: (scan) => { this.activeCandidateScan = scan; },
+      externalFindCandidates: (...args) => this.findCandidates(...args),
+      externalDiscoverCandidates: (...args) => this.discoverCandidates(...args),
+    });
     // 节点锁与真实在途容量由 probe-scheduler 实例持有；保留原方法名与签名。
     this.requestNodeDelay = (...args) => this.probes.requestNodeDelay(...args);
   }
@@ -177,48 +191,11 @@ export class Watchdog {
   }
 
   candidateScanMatches(scan, selection, leaf) {
-    return scan?.selection === selection && scan?.leaf === leaf;
+    return this.candidates.candidateScanMatches(scan, selection, leaf);
   }
 
-  startBackgroundCandidateScan({
-    selection,
-    leaf,
-    excludedNodes,
-    allowProvisionalRecovery,
-    reason,
-    recovery = allowProvisionalRecovery,
-  }) {
-    this.activeCandidateScan?.cancel?.();
-    const abortController = new AbortController();
-    const scan = {
-      selection,
-      leaf,
-      reason,
-      recovery,
-      startedAt: this.clock.nowIso(),
-      completed: false,
-      invalidated: false,
-      result: null,
-      error: null,
-      cancel: () => abortController.abort(),
-    };
-    scan.promise = this.findCandidates(leaf, excludedNodes, {
-      allowProvisionalRecovery, background: true, signal: abortController.signal,
-    })
-      .then((result) => {
-        result.completedAt ??= this.clock.nowIso();
-        scan.result = result;
-        scan.completedAt = result.completedAt;
-        scan.completed = true;
-        return scan;
-      })
-      .catch((error) => {
-        scan.error = error;
-        scan.completed = true;
-        return scan;
-      });
-    this.activeCandidateScan = scan;
-    return scan;
+  startBackgroundCandidateScan(options) {
+    return this.candidates.startBackgroundCandidateScan(options);
   }
 
   async resolveLeaf(name) {
@@ -243,65 +220,11 @@ export class Watchdog {
   }
 
   createCandidateSnapshot(search, selection, leaf) {
-    const compact = (result) => ({
-      node: result.node,
-      attempts: result.attempts,
-      successes: result.successes,
-      successRate: result.successRate,
-      averageMs: Number.isFinite(result.averageMs) ? result.averageMs : null,
-      maxMs: Number.isFinite(result.maxMs) ? result.maxMs : null,
-      jitterMs: Number.isFinite(result.jitterMs) ? result.jitterMs : null,
-      score: Number.isFinite(result.score) ? result.score : null,
-    });
-    const strictNames = new Set(search.stable.map((entry) => entry.node));
-    const provisionalNames = new Set((search.provisional ?? []).map((entry) => entry.node));
-    return {
-      at: search.completedAt ?? this.clock.nowIso(),
-      selection,
-      leaf,
-      durationMs: search.durationMs,
-      deadlineMs: search.deadlineMs,
-      deadlineReached: search.deadlineReached,
-      probeStats: search.probeStats ?? null,
-      candidates: (search.validated ?? []).map((entry) => ({
-        ...compact(entry),
-        profile: strictNames.has(entry.node)
-          ? 'strict'
-          : (provisionalNames.has(entry.node) ? 'current-health' : 'rejected'),
-      })),
-      sampled: (search.sampled ?? []).map(compact),
-    };
+    return this.candidates.createCandidateSnapshot(search, selection, leaf);
   }
 
   searchFromCandidateSnapshot(snapshot, selection, leaf) {
-    if (!snapshot || snapshot.selection !== selection || snapshot.leaf !== leaf) return null;
-    const ageMs = this.clock.now() - Date.parse(snapshot.at ?? '');
-    if (!Number.isFinite(ageMs)
-        || ageMs > this.config.policy.candidateSnapshotMaxAgeSeconds * 1000) return null;
-    const inflate = (entry) => ({
-      ...entry,
-      averageMs: entry.averageMs ?? Infinity,
-      maxMs: entry.maxMs ?? Infinity,
-      jitterMs: entry.jitterMs ?? Infinity,
-      score: entry.score ?? Infinity,
-      samples: [],
-    });
-    const validated = (snapshot.candidates ?? []).map(inflate);
-    return {
-      stable: validated.filter((entry) => entry.profile === 'strict'),
-      provisional: validated.filter((entry) => entry.profile === 'current-health'),
-      validated,
-      sampled: (snapshot.sampled ?? []).map(inflate),
-      rejected: validated.filter((entry) => entry.profile === 'rejected')
-        .map((entry) => ({ node: entry.node, reasons: ['cached-rejected'] })),
-      durationMs: snapshot.durationMs,
-      deadlineMs: snapshot.deadlineMs,
-      deadlineReached: snapshot.deadlineReached,
-      probeStats: snapshot.probeStats ?? null,
-      completedAt: snapshot.at,
-      source: 'candidate-snapshot',
-      ageMs,
-    };
+    return this.candidates.searchFromCandidateSnapshot(snapshot, selection, leaf);
   }
 
   currentThresholds() {
@@ -321,176 +244,15 @@ export class Watchdog {
   }
 
   filterCandidates(candidates, currentLeaf, excludedNodes = new Set()) {
-    const include = this.config.probes.includeRegex ? new RegExp(this.config.probes.includeRegex, 'i') : null;
-    const exclude = this.config.probes.excludeRegex ? new RegExp(this.config.probes.excludeRegex, 'i') : null;
-    return [...new Set(candidates)].filter((name) => name !== currentLeaf
-      && !excludedNodes.has(name)
-      && (!include || include.test(name))
-      && (!exclude || !exclude.test(name)));
+    return this.candidates.filterCandidates(candidates, currentLeaf, excludedNodes);
   }
 
-  async discoverCandidates(candidates, scanUrls, deadlineAt, {
-    rounds = this.config.probes.scanRounds,
-    timeoutMs = this.config.probes.discoveryTimeoutMs,
-    event = 'candidate-discovery-completed',
-    background = false,
-    signal,
-  } = {}) {
-    const startedAt = this.clock.now();
-    // 组级 delay 会隐式探测当前节点，无法与健康检查逐节点互斥。
-    // 仅探测候选池，确保每个节点的轮次与业务目标始终串行。
-    const results = await this.probeCandidatesInParallel(
-      candidates, rounds, scanUrls, deadlineAt, { timeoutMs, background, signal },
-    );
-    const probeStats = results.probeStats;
-    const failureReasons = {};
-    for (const sample of results.flatMap((result) => result.samples)) {
-      if (sample.ok) continue;
-      const reason = Number.isInteger(sample.error) ? `HTTP_${sample.error}`
-        : (/^[A-Z][A-Z0-9_]{0,63}$/.test(sample.error) ? sample.error : 'OTHER');
-      failureReasons[reason] = (failureReasons[reason] ?? 0) + 1;
-    }
-    await this.log('info', event, {
-      method: probeStats.method,
-      durationMs: this.clock.now() - startedAt,
-      candidateCount: candidates.length,
-      responsiveCount: results.filter((result) => result.successes > 0).length,
-      failureReasons,
-      probeStats,
-    });
-    return results;
+  async discoverCandidates(candidates, scanUrls, deadlineAt, options = {}) {
+    return await this.candidates.discoverCandidates(candidates, scanUrls, deadlineAt, options);
   }
 
-  async findCandidates(currentLeaf, excludedNodes = new Set(), {
-    allowProvisionalRecovery = false, background = false, signal,
-  } = {}) {
-    const scanStartedAt = this.clock.now();
-    let deadlineMs = this.config.probes.scanDeadlineMs;
-    let deadlineAt = scanStartedAt + deadlineMs;
-    const source = await waitUntil(
-      this.controller.getProxy(this.config.groups.candidates),
-      deadlineAt,
-      '候选组读取超过扫描截止时间',
-      this.clock,
-    );
-    if (!Array.isArray(source.all) || source.all.length === 0) {
-      await this.log('error', 'candidate-source-empty', { group: this.config.groups.candidates });
-      return {
-        stable: [],
-        provisional: [],
-        sampled: [],
-        validated: [],
-        rejected: [],
-        durationMs: this.clock.now() - scanStartedAt,
-        deadlineMs: this.config.probes.scanDeadlineMs,
-        deadlineReached: false,
-      };
-    }
-    const candidates = this.filterCandidates(source.all, currentLeaf, excludedNodes);
-    const scanUrls = this.config.probes.urls.slice(0, this.config.probes.scanUrlCount);
-    // 后台发现须能保留慢速可达出口；快速初筛超时不能成为救援资格门槛。
-    const discoveryTimeoutMs = background
-      ? Math.max(this.config.probes.discoveryTimeoutMs, this.config.probes.timeoutMs)
-      : this.config.probes.discoveryTimeoutMs;
-    if (background) {
-      // 后台允许完成现有配置要求的全部样本；紧急发现仍由原 scanDeadlineMs 约束。
-      const batches = (count) => Math.ceil(count / this.config.probes.parallelism);
-      deadlineMs += batches(candidates.length) * this.config.probes.scanRounds
-        * scanUrls.length * discoveryTimeoutMs;
-      deadlineMs += batches(Math.min(candidates.length, this.config.probes.maxValidationCandidates))
-        * Math.max(2, this.config.probes.validationRounds)
-        * this.config.probes.urls.length * this.config.probes.timeoutMs;
-      deadlineAt = scanStartedAt + deadlineMs;
-    }
-    await this.log('info', 'candidate-scan-started', {
-      count: candidates.length, background, deadlineMs,
-    });
-    const quickResults = await this.discoverCandidates(candidates, scanUrls, deadlineAt, {
-      background, signal, timeoutMs: discoveryTimeoutMs,
-    });
-    const ranked = quickResults
-      .filter((result) => result.successes > 0)
-      .sort((a, b) => a.score - b.score)
-      .slice(0, this.config.probes.maxValidationCandidates);
-    await this.log('info', 'candidate-shortlist', {
-      nodes: ranked.map((result) => ({
-        node: result.node,
-        successRate: result.successRate,
-        averageMs: Math.round(result.averageMs),
-      })),
-    });
-    const validated = await this.discoverCandidates(
-      ranked.map((result) => result.node),
-      this.config.probes.urls,
-      deadlineAt,
-      {
-        rounds: Math.max(2, this.config.probes.validationRounds),
-        timeoutMs: this.config.probes.timeoutMs,
-        event: 'candidate-validation-probes-completed',
-        background, signal,
-      },
-    );
-    const validationProbeStats = validated.probeStats ?? {
-      method: 'per-node',
-      logicalAttempts: 0,
-      controllerRequests: 0,
-      completedRequests: 0,
-      peakConcurrency: 0,
-    };
-    const stable = [];
-    const provisional = [];
-    const hasCompleteSamples = (result) => hasCompleteProbeRounds(
-      result, this.config.probes.urls, Math.max(2, this.config.probes.validationRounds),
-    );
-    const strictResults = validated.filter((result) => hasStrictAdmissionEvidence(
-      result, this.config.probes, this.candidateThresholds(),
-    ));
-    stable.push(...strictResults);
-    provisional.push(...validated.filter((result) => !strictResults.includes(result)
-      && hasCompleteSamples(result)
-      && isStableAcrossRounds(result, this.currentThresholds())));
-    stable.sort((a, b) => a.score - b.score);
-    provisional.sort((a, b) => a.score - b.score);
-    const rejected = validated
-      .filter((result) => !stable.includes(result))
-      .map((result) => ({ node: result.node, ...explainRoundStability(result, this.candidateThresholds()) }));
-    await this.log('info', 'candidate-validation-completed', {
-      validatedCount: validated.length,
-      stable: stable.map((result) => ({
-        node: result.node,
-        successRate: result.successRate,
-        averageMs: Math.round(result.averageMs),
-        maxMs: result.maxMs,
-      })),
-      provisional: provisional.map((result) => ({
-        node: result.node,
-        successRate: result.successRate,
-        averageMs: Math.round(result.averageMs),
-        maxMs: result.maxMs,
-      })),
-      rejected,
-      probeStats: {
-        discovery: quickResults.probeStats ?? null,
-        validation: validationProbeStats,
-      },
-      durationMs: this.clock.now() - scanStartedAt,
-      deadlineMs,
-      deadlineReached: this.clock.now() >= deadlineAt,
-    });
-    return {
-      stable,
-      provisional,
-      sampled: quickResults,
-      validated,
-      rejected,
-      probeStats: {
-        discovery: quickResults.probeStats ?? null,
-        validation: validationProbeStats,
-      },
-      durationMs: this.clock.now() - scanStartedAt,
-      deadlineMs,
-      deadlineReached: this.clock.now() >= deadlineAt,
-    };
+  async findCandidates(currentLeaf, excludedNodes = new Set(), options = {}) {
+    return await this.candidates.findCandidates(currentLeaf, excludedNodes, options);
   }
 
   async detectUpstreamOutage(currentLeaf, current, sampledCandidates) {
