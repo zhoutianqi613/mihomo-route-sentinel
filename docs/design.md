@@ -197,10 +197,15 @@
 |---|---|
 | 后台完整扫描 | 按配置推导截止，取得完整严格快照 |
 | 前台冷发现 | 最多 `scanDeadlineMs`，默认上限 3000 ms |
+| 普通切前复核 | 基准与完整采样预算取较大值；默认单批两轮、两目标上限20000ms |
 | 紧急快速复核 | 保留原一秒决策与选择目标 |
 | 扩展实时复核 | 追加 `max(preSwitchValidationDeadlineMs, timeoutMs × 目标数)`，默认两目标为10000ms |
 
 **故障路径：** 无新鲜快照时取消后台慢扫，先执行前台有界发现，再进入快速与扩展复核。更多 Controller 请求和较慢的首次完整快照，换取严格验证不被紧急截止迫使并发抢测。
+
+**普通复核：** 总预算取 `preSwitchValidationDeadlineMs` 与“候选批次数 × max(2, validationRounds) × 业务目标数 × timeoutMs”的较大值；批次数为 `ceil(候选数 / parallelism)`。同节点保持串行，严格质量线不变。
+
+**缺样本处理：** 普通复核因截止或取消未采完整时记为 `pre-switch-validation-incomplete`，不切换、不记预算、不生成节点隔离或扫描退避，下个周期重试。已完整采样但质量失败仍执行原隔离与退避。
 
 **完整截止：** “短名单上限”取候选数与 `maxValidationCandidates` 的较小值，`ceil` 表示向上取整。配置字段与单位见[使用手册：配置字段参考](../README.md#04-配置字段参考)。
 

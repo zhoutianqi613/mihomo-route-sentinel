@@ -42,7 +42,7 @@ export function policyTable(config = defaults) {
     `| 部分失败 / 纯延迟确认 | ${p.partialFailureCycles} / ${p.latencyFailureCycles}个连续周期 | 根据异常类型处理 |`,
     `| 硬故障确认 | ${p.hardFailureConfirmSeconds}秒 | 不等于总恢复时间 |`,
     `| 快照刷新 / 最大年龄 | ${p.candidateSnapshotRefreshSeconds} / ${p.candidateSnapshotMaxAgeSeconds}秒 | 还须匹配Selector与叶子 |`,
-    `| 前台扫描 / 常规切前复核截止 | ${q.scanDeadlineMs} / ${q.preSwitchValidationDeadlineMs}ms | 后台完整验证使用独立推导时限 |`,
+    `| 前台扫描上限 / 切前复核基准 | ${q.scanDeadlineMs} / ${q.preSwitchValidationDeadlineMs}ms | 普通复核与后台完整验证分别按采样量推导实际时限 |`,
     `| 紧急决策与选择目标 | ${p.emergencySwitchDeadlineMs}ms | 有新鲜快照等前提，不是硬实时保证 |`,
     `| 日常择优 / 故障恢复预算 | 各${p.switchBudgetWindowSeconds}秒内${p.switchBudgetCount}次 | 两池独立，切前拒绝不占选择次数 |`,
     `| 额外安全恢复预算 | ${p.switchBudgetWindowSeconds}秒内1次 | 仅当前仍为硬故障且恢复池已满时可用，选择前持久化 |`,

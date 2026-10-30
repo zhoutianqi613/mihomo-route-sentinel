@@ -135,6 +135,124 @@ function unresponsiveSnapshot() {
       averageMs: null, maxMs: null, jitterMs: null, score: null }] };
 }
 
+test('普通切前复核为两轮完整目标保留单目标超时，避免三秒式截断', async (t) => {
+  let candidateCalls = 0;
+  let callsBeforeSelect;
+  const f = await fixture(t, { probe: async (node) => {
+    if (node === 'current') return 1000;
+    candidateCalls += 1;
+    await new Promise((resolve) => setTimeout(resolve, 35));
+    return 300;
+  }, selectError: () => { callsBeforeSelect = candidateCalls; } });
+  f.config.probes.preSwitchValidationDeadlineMs = 80;
+
+  const result = await f.create().runOnce({ dryRun: false, backgroundScan: true });
+
+  assert.equal(result.status, 'switched');
+  assert.equal(callsBeforeSelect, 4);
+  assert.deepEqual(f.switches, ['candidate']);
+  assert.equal((await f.readState()).decisionState.budget.optimization.used, 1);
+  const started = f.events.find(({ event }) => event === 'candidate-pre-switch-validation-started');
+  assert.equal(started.details.deadlineMs, 400);
+});
+
+test('普通复核总预算覆盖受限并发下的全部候选批次', async (t) => {
+  const counts = new Map();
+  let beforeSelect;
+  const f = await fixture(t, { probe: async (node) => {
+    if (node === 'current') return 1000;
+    counts.set(node, (counts.get(node) ?? 0) + 1);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    return 300;
+  }, selectError: () => { beforeSelect = new Map(counts); } });
+  const state = await f.readState();
+  const first = state.candidateSnapshot.candidates[0];
+  state.candidateSnapshot.candidates.push(...['candidate-b', 'candidate-c'].map((node) => ({ ...first, node })));
+  await writeFile(f.config.files.state, JSON.stringify(state));
+  f.config.probes.parallelism = 1;
+  f.config.probes.preSwitchValidationDeadlineMs = 80;
+
+  const result = await f.create().runOnce({ dryRun: false, backgroundScan: true });
+
+  assert.equal(result.status, 'switched');
+  assert.deepEqual([...beforeSelect.values()], [4, 4, 4]);
+  const started = f.events.find(({ event }) => event === 'candidate-pre-switch-validation-started');
+  assert.equal(started.details.deadlineMs, 1200);
+});
+
+test('切前采样因截止不完整时不隔离节点、不退避且不消耗预算', async (t) => {
+  const f = await fixture(t, { probe: (node) => {
+    if (node === 'current') return 1000;
+    throw Object.assign(new Error('模拟未采完'), { code: 'SCAN_DEADLINE' });
+  } });
+  const watchdog = f.create();
+
+  const first = await watchdog.runOnce({ dryRun: false, backgroundScan: true });
+  const second = await watchdog.runOnce({ dryRun: false, backgroundScan: true });
+
+  assert.equal(first.status, 'pre-switch-validation-incomplete');
+  assert.equal(second.status, 'pre-switch-validation-incomplete');
+  const state = await f.readState();
+  assert.equal(state.quarantinedNodes?.candidate, undefined);
+  assert.equal(state.candidateScanBackoffUntil, undefined);
+  assert.equal(state.decisionState.budget.optimization.used, 0);
+  assert.deepEqual(f.switches, []);
+  assert.equal(f.events.some(({ event }) => event === 'candidate-pre-switch-deferred'), true);
+});
+
+test('完整切前复核确实超时的节点继续隔离且不消耗选择预算', async (t) => {
+  const f = await fixture(t, { probe: (node) => {
+    if (node === 'current') return 1000;
+    throw Object.assign(new Error('模拟真实网络超时'), { status: 504 });
+  } });
+
+  const result = await f.create().runOnce({ dryRun: false, backgroundScan: true });
+
+  assert.equal(result.status, 'no-pre-switch-candidate');
+  const state = await f.readState();
+  assert.equal(state.quarantinedNodes.candidate.reason, 'pre-switch-validation-failed');
+  assert.ok(Date.parse(state.candidateScanBackoffUntil) > Date.now());
+  assert.equal(state.decisionState.budget.optimization.used, 0);
+  assert.deepEqual(f.switches, []);
+});
+
+test('普通复核的取消错误只延后采样，不生成故障隔离', async (t) => {
+  const f = await fixture(t, { probe: (node) => {
+    if (node === 'current') return 1000;
+    throw Object.assign(new Error('模拟请求取消'), { code: 'ABORT_ERR' });
+  } });
+
+  const result = await f.create().runOnce({ dryRun: false, backgroundScan: true });
+
+  assert.equal(result.status, 'pre-switch-validation-incomplete');
+  assert.equal((await f.readState()).quarantinedNodes?.candidate, undefined);
+  assert.deepEqual(f.switches, []);
+});
+
+test('普通复核底层不响应取消时仍按推导截止退出且不隔离节点', async (t) => {
+  const f = await fixture(t, { probe: (node) => node === 'current' ? 1000 : new Promise(() => {}) });
+  f.config.probes.timeoutMs = 40;
+  f.config.probes.preSwitchValidationDeadlineMs = 40;
+  const startedAt = performance.now();
+
+  const result = await f.create().runOnce({ dryRun: false, backgroundScan: true });
+
+  assert.equal(result.status, 'pre-switch-validation-incomplete');
+  assert.ok(performance.now() - startedAt < 700);
+  assert.equal((await f.readState()).quarantinedNodes?.candidate, undefined);
+  assert.deepEqual(f.switches, []);
+});
+
+test('放宽采样窗口不降低严格质量线，完整但700ms候选仍拒绝', async (t) => {
+  const f = await fixture(t, { probe: (node) => node === 'current' ? 1000 : 700 });
+
+  const result = await f.create().runOnce({ dryRun: false, backgroundScan: true });
+
+  assert.equal(result.status, 'no-pre-switch-candidate');
+  assert.deepEqual(f.switches, []);
+  assert.equal((await f.readState()).quarantinedNodes.candidate.reason, 'pre-switch-validation-failed');
+});
+
 test('硬故障遇到零响应快照时重新实时复核，不能永久拒绝恢复', async (t) => {
   const f = await fixture(t, { state: { candidateSnapshot: unresponsiveSnapshot(),
     candidateScanBackoffUntil: new Date(Date.now() + 60_000).toISOString(),

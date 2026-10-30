@@ -322,7 +322,7 @@ HTTP Controller 使用 secret 时，只配置环境变量名称：
 |---|---:|---|
 | `probes.discoveryTimeoutMs` | `1200` | 前台快速发现的单目标超时；后台发现取本值与 `timeoutMs` 的较大值，保留慢速可达出口。 |
 | `probes.scanDeadlineMs` | `3000` | 前台候选扫描硬截止，最大 3000 ms；后台使用独立计算的截止预算。 |
-| `probes.preSwitchValidationDeadlineMs` | `3000` | 常规切前复测总截止，最大3000ms；紧急扩展复核至少保留本值，并为一轮全部目标提供完整单目标超时。 |
+| `probes.preSwitchValidationDeadlineMs` | `3000` | 切前复核基准，配置最大3000ms；普通复核按候选批次、轮数、目标数与单目标超时扩展，紧急扩展覆盖一轮全部目标。 |
 | `probes.scanRounds` | `1` | 初筛每个候选的探测轮数。 |
 | `probes.scanUrlCount` | `2` | 初筛使用 `urls` 前 N 个地址；默认同时覆盖 ChatGPT 与 OpenAI API，降低单目标偶然值误导排序的概率。 |
 | `probes.validationRounds` | `2` | 严格验证轮数；实际至少采两轮，兼容值为1的旧配置也不能降低严格证据要求。 |
@@ -355,7 +355,7 @@ HTTP Controller 使用 secret 时，只配置环境变量名称：
 | `policy.minimumDwellSeconds` | `120` | 纯延迟优化的最短驻留时间；故障恢复不受此限制。 |
 | `policy.minimumImprovementMs` | `200` | 延迟型切换要求候选至少改善的绝对延迟。 |
 | `policy.minimumImprovementRatio` | `0.2` | 延迟型切换要求候选至少改善的比例；默认 20%。绝对值与比例满足其一即可。 |
-| `policy.failedNodeQuarantineSeconds` | `900` | 失败节点隔离时间。 |
+| `policy.failedNodeQuarantineSeconds` | `900` | 真实验证失败的节点隔离时间；普通切前采样因截止或取消而不完整时不隔离。 |
 | `policy.maxSwitchAttempts` | `3` | 单次恢复流程最多执行的实际节点切换次数；切前门禁拒绝不会占用次数，服务会继续检查候选池中的后续节点。 |
 | `policy.postSwitchDelaySeconds` | `2` | 切换后开始复核前的等待时间。 |
 | `policy.postSwitchRounds` | `2` | 切换后新节点必须通过的验证轮数。 |

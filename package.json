@@ -1,6 +1,6 @@
 {
   "name": "mihomo-route-sentinel",
-  "version": "1.8.2",
+  "version": "1.8.3",
   "private": true,
   "type": "module",
   "description": "AI service route quality monitoring and automatic failover for Mihomo",

@@ -86,7 +86,7 @@ function isStableAcrossRounds(result, thresholds) {
 function hasCompleteProbeRounds(result, urls, minimumRounds) {
   const byRound = new Map();
   for (const sample of result?.samples ?? []) {
-    if (['SCAN_DEADLINE', 'PROBE_CANCELLED'].includes(sample.error)) return false;
+    if (['SCAN_DEADLINE', 'PROBE_CANCELLED', 'ABORT_ERR'].includes(sample.error)) return false;
     if (!byRound.has(sample.round)) byRound.set(sample.round, []);
     byRound.get(sample.round).push(sample.url);
   }
@@ -1500,16 +1500,31 @@ export class Watchdog {
       return { status: 'would-switch', current, candidate };
     }
 
+    let preSwitchValidationIncomplete = false;
     if (backgroundScan && candidates.length > 0) {
       const decisionStartedAt = Date.now();
+      const preSwitchRounds = emergencyRecovery ? 1 : Math.max(2, this.config.probes.validationRounds);
+      // 普通复核也要容纳逐节点串行样本及并发批次，不能把未采完当作节点失败。
+      const normalValidationDeadlineMs = Math.max(this.config.probes.preSwitchValidationDeadlineMs,
+        Math.ceil(candidates.length / this.config.probes.parallelism)
+          * preSwitchRounds * this.config.probes.urls.length * this.config.probes.timeoutMs);
       const decisionDeadlineMs = emergencyRecovery
         ? this.config.policy.emergencySwitchDeadlineMs
-        : this.config.probes.preSwitchValidationDeadlineMs;
+        : normalValidationDeadlineMs;
+      if (!emergencyRecovery) {
+        setDecision('validate', 'candidate-pre-switch-validation', { deadlineMs: decisionDeadlineMs });
+        await persistState();
+        await this.log('info', 'candidate-pre-switch-validation-started', {
+          candidateCount: candidates.length, rounds: preSwitchRounds,
+          targetCount: this.config.probes.urls.length,
+          deadlineMs: decisionDeadlineMs, perTargetTimeoutMs: this.config.probes.timeoutMs,
+        });
+      }
       const switchReserveMs = emergencyRecovery ? Math.min(250, Math.floor(decisionDeadlineMs / 3)) : 0;
       const validationDeadlineAt = decisionStartedAt + decisionDeadlineMs - switchReserveMs;
       let preSwitchResults = await this.probeCandidatesInParallel(
         candidates.map((entry) => entry.node),
-        emergencyRecovery ? 1 : Math.max(2, this.config.probes.validationRounds),
+        preSwitchRounds,
         this.config.probes.urls,
         validationDeadlineAt,
       );
@@ -1657,6 +1672,15 @@ export class Watchdog {
         const admitted = [];
         for (const nextCandidate of candidates) {
           const verification = resultByNode.get(nextCandidate.node);
+          if (!verification || !hasCompleteProbeRounds(verification, this.config.probes.urls, preSwitchRounds)) {
+            preSwitchValidationIncomplete = true;
+            await this.log('warn', 'candidate-pre-switch-deferred', {
+              node: nextCandidate.node, reason: 'incomplete-evidence',
+              attempts: verification?.attempts ?? 0, successes: verification?.successes ?? 0,
+              deadlineMs: decisionDeadlineMs,
+            });
+            continue;
+          }
           const admissionThresholds = provisionalCandidateNames.has(nextCandidate.node)
             ? this.currentThresholds()
             : this.candidateThresholds();
@@ -1695,6 +1719,13 @@ export class Watchdog {
 
     candidate = candidates[0];
     if (!candidate) {
+      if (preSwitchValidationIncomplete) {
+        clearCandidateScanBackoff(state);
+        setDecision('hold', 'pre-switch-validation-incomplete');
+        await persistState();
+        await this.log('warn', 'pre-switch-validation-incomplete', {});
+        return { status: 'pre-switch-validation-incomplete', current };
+      }
       activateCandidateScanBackoff(state, this.config.policy, 'pre-switch-validation-failed');
       setDecision('hold', 'no-pre-switch-candidate');
       await persistState();
