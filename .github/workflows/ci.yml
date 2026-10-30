@@ -1,0 +1,42 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: node ${{ matrix.node }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [20, 22]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Install dependencies (none declared)
+        run: npm install --no-audit --no-fund
+      - name: Static syntax check
+        run: npm run check
+      - name: Test suite
+        run: npm test
+      - name: Documentation check
+        run: npm run docs:check
+      - name: Upload runtime artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: var-${{ matrix.os }}-node${{ matrix.node }}
+          path: var/
+          if-no-files-found: ignore
+          retention-days: 7
