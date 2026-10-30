@@ -184,3 +184,47 @@ test('并发获取同一把锁时只有一个实例成功且不残留临时文�
     assert.equal(await readLock(lockFile), null);
   });
 });
+
+test('死进程遗留的不同 fingerprint 陈旧锁会被回收而不是永久拒绝启动', async () => {
+  await withLockDir(async (lockFile, root) => {
+    const staleFingerprint = fingerprintFor('OLD-TARGET');
+    const newFingerprint = fingerprintFor('NEW-TARGET');
+    const otherPid = await deadPid();
+    await writeFile(lockFile, JSON.stringify({
+      version: 1,
+      pid: otherPid,
+      startedAt: new Date().toISOString(),
+      controllerFingerprint: staleFingerprint,
+      programVersion: 'old',
+    }), 'utf8');
+
+    const release = await acquireLock(lockFile, { controllerFingerprint: newFingerprint });
+    const lock = await readLock(lockFile);
+    assert.equal(lock.controllerFingerprint, newFingerprint);
+    assert.equal(lock.pid, process.pid);
+    assert.ok((await readdir(root)).some((name) => name.includes('.stale.')));
+    await release();
+  });
+});
+
+test('活进程持有不同 fingerprint 的锁时仍拒绝，并提示先停止该实例', async () => {
+  await withLockDir(async (lockFile) => {
+    const otherFingerprint = fingerprintFor('OTHER-TARGET');
+    await writeFile(lockFile, JSON.stringify({
+      version: 1,
+      pid: process.pid,
+      startedAt: new Date().toISOString(),
+      controllerFingerprint: otherFingerprint,
+      programVersion: 'other',
+    }), 'utf8');
+    await assert.rejects(
+      acquireLock(lockFile, { controllerFingerprint: fingerprintFor('MINE') }),
+      (error) => {
+        assert.equal(error.code, 'LOCK_CONTROLLER_BUSY');
+        assert.match(error.message, /请先停止 PID \d+ 的实例/);
+        return true;
+      },
+    );
+    assert.equal((await readLock(lockFile)).controllerFingerprint, otherFingerprint);
+  });
+});

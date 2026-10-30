@@ -84,6 +84,12 @@ async function reclaimStaleLock(lockFile, fingerprint) {
   const existingFingerprint = typeof existing.controllerFingerprint === 'string'
     ? existing.controllerFingerprint
     : '';
+  // 先判断持有者是否存活：进程已死时，即使配置指纹已变化（例如改过目标组或端点），
+  // 也应回收陈旧锁，而不是永久拒绝启动。
+  if (!isPidAlive(existing.pid)) {
+    await moveStaleLock(lockFile);
+    return;
+  }
   if (fingerprint && existingFingerprint && existingFingerprint !== fingerprint) {
     const error = new Error(
       `同一 Controller 只允许一个实例：现有锁 fingerprint=${existingFingerprint}，`
@@ -92,12 +98,9 @@ async function reclaimStaleLock(lockFile, fingerprint) {
     error.code = 'LOCK_CONTROLLER_BUSY';
     throw error;
   }
-  if (isPidAlive(existing.pid)) {
-    const error = new Error(`Watchdog 已在运行（PID ${existing.pid}）`);
-    error.code = 'LOCK_HELD';
-    throw error;
-  }
-  await moveStaleLock(lockFile);
+  const error = new Error(`Watchdog 已在运行（PID ${existing.pid}）`);
+  error.code = 'LOCK_HELD';
+  throw error;
 }
 
 async function releaseLock(lockFile) {
