@@ -1,10 +1,10 @@
 #!/usr/bin/env node
-import { readFile } from 'node:fs/promises';
+import { access, readFile, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from './config.mjs';
 import { MihomoController } from './controller.mjs';
-import { acquireLock, controllerFingerprint } from './lock.mjs';
+import { acquireLock, controllerFingerprint, readLock } from './lock.mjs';
 import {
   enforceClashVergeAvailability,
   enforceGuardrails,
@@ -25,6 +25,7 @@ function parseArgs(argv) {
     quiet: false,
     status: false,
     statusJson: false,
+    stop: false,
   };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -35,6 +36,7 @@ function parseArgs(argv) {
     else if (arg === '--quiet') options.quiet = true;
     else if (arg === '--status') options.status = true;
     else if (arg === '--status-json') options.statusJson = true;
+    else if (arg === '--stop') options.stop = true;
     else if (arg === '--help' || arg === '-h') options.help = true;
     else throw new Error(`未知参数：${arg}`);
   }
@@ -48,6 +50,7 @@ function printHelp() {
   node src/cli.mjs [--config config.json] [--run] [--apply] [--force-scan]
   node src/cli.mjs [--config config.json] --status
   node src/cli.mjs [--config config.json] --status-json
+  node src/cli.mjs [--config config.json] --stop
 
 默认只执行一次 Dry Run，不会切换节点。
   --run         持续监控
@@ -55,7 +58,69 @@ function printHelp() {
   --force-scan  即使当前节点健康也扫描候选节点
   --quiet       仅写入日志文件
   --status      输出可读运行状态，不启动守护进程
-  --status-json 输出 JSON 运行状态，不启动守护进程`);
+  --status-json 输出 JSON 运行状态，不启动守护进程
+  --stop        向正在运行的实例发送 SIGTERM，并等待锁文件释放（最多 5 秒）`);
+}
+
+async function isPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (error) { return error?.code === 'EPERM'; }
+}
+
+const STOP_TIMEOUT_MS = 5000;
+const STOP_POLL_INTERVAL_MS = 100;
+
+function sleep(milliseconds) {
+  return new Promise((resolve) => { setTimeout(resolve, milliseconds); });
+}
+
+async function removeStaleLock(lockFile) {
+  await unlink(lockFile).catch((error) => {
+    if (error?.code !== 'ENOENT') throw error;
+  });
+}
+
+async function stopRunningInstance(lockFile) {
+  const lock = await readLock(lockFile);
+  if (!lock) {
+    const exists = await access(lockFile).then(() => true, () => false);
+    if (!exists) {
+      console.log('未在运行');
+      return;
+    }
+    await removeStaleLock(lockFile);
+    console.log('锁文件内容无法解析，已清理陈旧锁');
+    return;
+  }
+  const pid = lock.pid;
+  if (!await isPidAlive(pid)) {
+    await removeStaleLock(lockFile);
+    console.log(`PID ${pid} 未存活，已清理陈旧锁`);
+    return;
+  }
+  try {
+    process.kill(pid, 'SIGTERM');
+  } catch (error) {
+    if (error?.code !== 'ESRCH') throw error;
+    await removeStaleLock(lockFile);
+    console.log(`PID ${pid} 未存活，已清理陈旧锁`);
+    return;
+  }
+  const deadline = Date.now() + STOP_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    await sleep(STOP_POLL_INTERVAL_MS);
+    if (!await readLock(lockFile)) {
+      console.log(`已停止（PID ${pid}）`);
+      return;
+    }
+    if (!await isPidAlive(pid)) {
+      // Windows 等平台的 SIGTERM 会直接终止进程而不执行释放逻辑，此时由停库方清理陈留锁。
+      await removeStaleLock(lockFile);
+      console.log(`已停止（PID ${pid}），已清理遗留锁`);
+      return;
+    }
+  }
+  console.log(`已向 PID ${pid} 发送 SIGTERM，但锁文件 5 秒内未释放；请确认该实例是否响应停机信号`);
 }
 
 async function main() {
@@ -68,6 +133,10 @@ async function main() {
     startedAt: new Date().toISOString(),
   };
   const config = await loadConfig(options.config);
+  if (options.stop) {
+    await stopRunningInstance(config.files.lock);
+    return;
+  }
   if (options.status || options.statusJson) {
     if (options.run || options.apply || options.forceScan) {
       throw new Error('--status/--status-json 不能与 --run、--apply 或 --force-scan 同时使用');
@@ -181,20 +250,41 @@ async function main() {
     }
   }
 
-  let stopping = false;
-  const stop = async (signal) => {
-    if (stopping) return;
-    stopping = true;
-    await logger('info', 'watchdog-stopping', { signal });
+  let currentCycle = null;
+  let shuttingDown = false;
+  // 生命周期中止信号：先停止启动新周期，再等待当前周期收尾后释放锁。
+  const shutdownController = new AbortController();
+  let lockReleased = false;
+  const releaseLockOnce = async () => {
+    if (lockReleased) return;
+    lockReleased = true;
     await releaseLock();
-    process.exit(0);
   };
-  process.on('SIGINT', () => void stop('SIGINT'));
-  process.on('SIGTERM', () => void stop('SIGTERM'));
+  const shutdown = async (signal) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    try {
+      // 先写停机日志；即使日志写入失败，也必须继续中止周期并释放锁。
+      await logger('info', 'watchdog-stopping', { signal }).catch(() => {});
+      shutdownController.abort();
+      if (currentCycle) {
+        // 真实探测可能仍在进行；最多等 2 秒收尾，超时后仍按优雅停机退出。
+        await Promise.race([currentCycle.catch(() => {}), sleep(2000)]);
+      }
+    } finally {
+      try {
+        await releaseLockOnce();
+      } finally {
+        process.exit(0);
+      }
+    }
+  };
+  process.on('SIGINT', () => { void shutdown('SIGINT'); });
+  process.on('SIGTERM', () => { void shutdown('SIGTERM'); });
 
   const runtimeGuardTimer = options.run && options.apply && config.guardrails.enabled
     ? setInterval(async () => {
-        if (stopping) return;
+        if (shuttingDown) return;
         try {
           await runRuntimeGuard();
         } catch (error) {
@@ -211,57 +301,64 @@ async function main() {
     do {
       const cycleStartedAt = Date.now();
       let backgroundWake = null;
-      try {
-        const guardrail = await enqueueGuard(() => enforceGuardrails({
-          controller,
-          guardrails: config.guardrails,
-          guardStateFile: config.files.guardrailState,
-          dryRun: !options.apply,
-        }));
-        await logger(guardrail.ready ? 'info' : 'warn', 'guardrail-evaluated', guardrail);
-        if (!guardrail.ready) {
-          await logger('warn', 'watchdog-cycle-completed', { status: guardrail.status });
-        } else {
-          let linkTelemetry = null;
-          if (config.telemetry?.enabled) {
+      currentCycle = (async () => {
+        try {
+          const guardrail = await enqueueGuard(() => enforceGuardrails({
+            controller,
+            guardrails: config.guardrails,
+            guardStateFile: config.files.guardrailState,
+            dryRun: !options.apply,
+          }));
+          await logger(guardrail.ready ? 'info' : 'warn', 'guardrail-evaluated', guardrail);
+          if (!guardrail.ready) {
+            await logger('warn', 'watchdog-cycle-completed', { status: guardrail.status });
+          } else {
+            let linkTelemetry = null;
+            if (config.telemetry?.enabled) {
+              try {
+                linkTelemetry = await probeRealLinks(config.telemetry);
+                await logger('info', 'link-telemetry', { metrics: linkTelemetry });
+              } catch (error) {
+                // 遥测只提供辅助信号；任何意外都不能阻断节点健康检查与故障恢复。
+                linkTelemetry = { enabled: true, error: 'telemetry-cycle-error' };
+                await logger('warn', 'link-telemetry-failed', { errorType: error?.name ?? 'Error' });
+              }
+            }
+            const result = await watchdog.runOnce({
+              dryRun: !options.apply,
+              forceScan: options.forceScan,
+              linkTelemetry,
+              backgroundScan: options.run,
+            });
+            backgroundWake = result.backgroundWake ?? null;
+            await logger('info', 'watchdog-cycle-completed', { status: result.status });
+          }
+        } catch (error) {
+          let recoveredController = false;
+          if (options.run && config.guardrails.enabled && error?.code === 'ENOENT') {
             try {
-              linkTelemetry = await probeRealLinks(config.telemetry);
-              await logger('info', 'link-telemetry', { metrics: linkTelemetry });
-            } catch (error) {
-              // 遥测只提供辅助信号；任何意外都不能阻断节点健康检查与故障恢复。
-              linkTelemetry = { enabled: true, error: 'telemetry-cycle-error' };
-              await logger('warn', 'link-telemetry-failed', { errorType: error?.name ?? 'Error' });
+              const recovery = await runRuntimeGuard();
+              recoveredController = recovery.ready;
+            } catch {
+              recoveredController = false;
             }
           }
-          const result = await watchdog.runOnce({
-            dryRun: !options.apply,
-            forceScan: options.forceScan,
-            linkTelemetry,
-            backgroundScan: options.run,
-          });
-          backgroundWake = result.backgroundWake ?? null;
-          await logger('info', 'watchdog-cycle-completed', { status: result.status });
-        }
-      } catch (error) {
-        let recoveredController = false;
-        if (options.run && config.guardrails.enabled && error?.code === 'ENOENT') {
-          try {
-            const recovery = await runRuntimeGuard();
-            recoveredController = recovery.ready;
-          } catch {
-            recoveredController = false;
+          if (recoveredController) {
+            await logger('warn', 'watchdog-cycle-interrupted-by-client-restart', {
+              errorType: error?.code ?? error?.name ?? 'Error',
+            });
+          } else {
+            await logger('error', 'watchdog-cycle-failed', { error: error.message });
           }
+          if (!options.run) throw error;
         }
-        if (recoveredController) {
-          await logger('warn', 'watchdog-cycle-interrupted-by-client-restart', {
-            errorType: error?.code ?? error?.name ?? 'Error',
-          });
-        } else {
-          await logger('error', 'watchdog-cycle-failed', { error: error.message });
-        }
-        if (!options.run) throw error;
+      })();
+      try {
+        await currentCycle;
+      } finally {
+        currentCycle = null;
       }
-      if (!options.run || stopping) break;
+      if (!options.run || shuttingDown) break;
       const cycleElapsedMs = Date.now() - cycleStartedAt;
       const waitMs = Math.max(0, (config.policy.intervalSeconds * 1000) - cycleElapsedMs);
       if (waitMs > 0) {
@@ -275,10 +372,10 @@ async function main() {
           }
         });
       }
-    } while (!stopping);
+    } while (!shuttingDown);
   } finally {
     if (runtimeGuardTimer) clearInterval(runtimeGuardTimer);
-    if (!stopping) await releaseLock();
+    if (!shuttingDown) await releaseLockOnce();
   }
 }
 
