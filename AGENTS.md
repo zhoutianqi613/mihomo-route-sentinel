@@ -19,8 +19,15 @@
 - 本次开发影响产品范围、操作、控制流程或阶段结果时，在同一交付中更新 `PRODUCT.md`、`README.md`、`docs/design.md` 或 `docs/iterations.md` 对应正文；无影响时说明理由。不要额外生成空模板或重复摘要。
 - 仓库是四篇正文的唯一编辑源；飞书Backlog是任务状态的唯一来源。飞书文档是发布快照，不要求Bear双写。
 - 先运行 `npm run docs:check` 与 `npm run docs:publish` 预览。用户已授权本次飞书同步时才执行 `npm run docs:publish -- --apply`；未授权或同步失败时明确报告未发布，不把本地完成说成线上完成。
-- 发布只允许固定四页与本项目文档同步日期；远端手改、评论或版本漂移时停止覆盖。不得因此重启服务、切换代理、自动提交或推送Git。
+- 发布只允许固定四页与本项目文档同步日期；远端手改、评论或版本漂移时停止覆盖。发布动作与Git交付分开执行，不能绕过Git推送前的验证要求。
 - Bear已批准本版式并授权推广至Mahjong Assistant和Project Search MCP；本仓库发布器仍只操作本项目，不因此扩大发布权限。公共展示层由 `../../tools/portfolio-docs` 维护，经同步工具生成仓库内模块，避免三份排版手工漂移。
+
+## Git 交付
+
+- 每次修复都必须在验证通过后创建Git提交并推送到项目远端分支；仅保存在工作区或本地提交都不算完成。
+- 同一修复同时影响代码、测试和项目文档时，须纳入对应提交；运行配置、日志、状态和`MEMORY.md`继续遵守忽略规则，不写入公开提交。
+- 推送前确认测试、文档检查及版本记录已完成；推送后读取远端分支SHA，确认与本地HEAD一致。
+- 提交或推送失败时，任务必须明确保持“未完成”，记录失败命令和原因，不能把本地验证通过当作交付完成。
 
 ## 文档可读性与交付状态
 
@@ -42,3 +49,5 @@
 - Run `npm test`.
 - Run a dry-run one-shot check against the current Mihomo controller.
 - Validate JSON configuration and confirm no secrets are present in tracked files.
+- Commit the complete fix and push it to the project remote branch after verification.
+- Compare local `HEAD` with the remote branch SHA before reporting completion.
