@@ -3,7 +3,7 @@ import path from 'node:path';
 import { synchronizeDecisionState } from './decision-state.mjs';
 
 export const DEFAULT_LOGGING = Object.freeze({
-  maxBytes: 5 * 1024 * 1024,
+  maxBytes: 30 * 1024 * 1024,
   retainedFiles: 14,
 });
 

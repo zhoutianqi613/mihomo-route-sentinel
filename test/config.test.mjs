@@ -33,7 +33,7 @@ test('v1 配置可内存迁移到当前版本并补齐新默认值', async () =>
     assert.equal(config.policy.intervalSeconds, 30);
     assert.equal(config.policy.candidateSnapshotRefreshSeconds, 60);
     assert.equal(config.policy.candidateSnapshotMaxAgeSeconds, 120);
-    assert.equal(config.logging.maxBytes, 5242880);
+    assert.equal(config.logging.maxBytes, 31457280);
     assert.equal(config.telemetry.enabled, true);
     assert.equal(config.guardrails.expectedRuntimeMode, 'rule');
     assert.equal(config.guardrails.disableClashVergeDnsOverride, true);

@@ -74,7 +74,7 @@ export const defaults = Object.freeze({
     emergencySwitchDeadlineMs: 1000,
   },
   logging: {
-    maxBytes: 5242880,
+    maxBytes: 31457280,
     retainedFiles: 14,
   },
   telemetry: {

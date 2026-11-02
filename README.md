@@ -421,8 +421,8 @@ HTTP Controller 使用 secret 时，只配置环境变量名称：
 
 | 字段 | 默认值 | 说明 |
 |---|---:|---|
-| `logging.maxBytes` | `5242880` | 单个 NDJSON 日志文件达到该字节数后轮转。 |
-| `logging.retainedFiles` | `14` | 保留的轮转日志份数。 |
+| `logging.maxBytes` | `31457280` | 单个 NDJSON 日志文件达到 30 MiB（31,457,280 字节）后轮转。 |
+| `logging.retainedFiles` | `14` | 最多保留 14 份归档；`.1` 最新，数字越大越旧。 |
 | `telemetry.enabled` | `true` | 是否额外检测经本地代理访问 HTTPS 与 WebSocket 的真实链路。 |
 | `telemetry.proxyUrl` | `http://127.0.0.1:7897` | 遥测使用的本地 HTTP 代理地址，应与客户端监听端口一致。 |
 | `telemetry.httpsUrl` | `https://chatgpt.com/` | HTTPS/TLS/TTFB 遥测目标。 |
@@ -450,7 +450,7 @@ HTTP Controller 使用 secret 时，只配置环境变量名称：
 ### 5.1 状态总览
 
 - **`var/state.json`：** 当前节点、连续失败、后台扫描状态、最近扫描/切换、隔离节点和滚动切换预算。Dry Run 不写此文件。
-- **`var/watchdog.ndjson`：** 健康结果和 TLS/TTFB/WebSocket 指标，不记录 Controller secret 或节点服务器地址。达到 `logging.maxBytes` 后轮转，保留 `logging.retainedFiles` 份。
+- **`var/watchdog.ndjson`：** 健康结果和 TLS/TTFB/WebSocket 指标，不记录 Controller secret 或节点服务器地址。达到 30 MiB 后自动归档，保留 `logging.retainedFiles` 份。
 - **`var/watchdog.lock`：** 防止重复实例。
 - **`var/guardrails.json`：** DNS 修复后的待重载/待复核债务，问题确认解决后自动清除。
 
@@ -522,6 +522,14 @@ Windows 可自动完成上述 DNS 修复闭环。Linux 和 macOS 只有显式配
 **日志定位**
 
 使用 `--status` 查看状态中的绝对日志路径。结构化日志记录健康结果、候选扫描、选择、守卫与真实链路遥测；Controller secret、订阅和节点服务器地址不会写入日志。
+
+```powershell
+Get-ChildItem .\var\watchdog.ndjson* |
+  Sort-Object LastWriteTime -Descending |
+  Select-Object Name, Length, LastWriteTime
+```
+
+`watchdog.ndjson` 是当前日志；`.1` 为最新归档，数字越大越旧。
 
 **升级检查**
 

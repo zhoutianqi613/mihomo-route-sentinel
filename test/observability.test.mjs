@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdtemp, open, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
   buildStatusSnapshot,
   createRotatingLogger,
+  DEFAULT_LOGGING,
   formatStatus,
   readRecentNdjson,
 } from '../src/observability.mjs';
@@ -29,6 +30,25 @@ test('rotating logger retains valid NDJSON and redacts credentials', async () =>
     for (const line of content.trim().split('\n')) assert.doesNotThrow(() => JSON.parse(line));
   }
   await assert.rejects(readFile(`${logFile}.3`, 'utf8'), /ENOENT/);
+});
+
+test('默认日志在达到 30 MiB 前轮转为归档', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'watchdog-log-default-limit-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const logFile = path.join(root, 'watchdog.ndjson');
+  const handle = await open(logFile, 'w');
+  try {
+    await handle.truncate(DEFAULT_LOGGING.maxBytes);
+  } finally {
+    await handle.close();
+  }
+
+  const logger = createRotatingLogger(logFile, { quiet: true });
+  await logger('info', 'default-limit-check', { ok: true });
+
+  assert.equal(DEFAULT_LOGGING.maxBytes, 30 * 1024 * 1024);
+  assert.equal((await stat(`${logFile}.1`)).size, DEFAULT_LOGGING.maxBytes);
+  assert.match(await readFile(logFile, 'utf8'), /default-limit-check/);
 });
 
 test('status snapshot uses live selection and recent probe without failing on optional fields', async () => {
