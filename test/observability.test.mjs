@@ -443,6 +443,50 @@ test('status exposes candidate snapshot freshness and emergency switch duration'
   assert.match(output, /emergency-best-effort/);
 });
 
+test('status exposes authenticated application health and warns when signal is stale', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'sentinel-application-health-status-'));
+  const stateFile = path.join(root, 'state.json');
+  const logFile = path.join(root, 'watchdog.ndjson');
+  const now = new Date().toISOString();
+  await writeFile(stateFile, JSON.stringify({
+    currentSelection: 'node',
+    currentLeaf: 'node',
+    selectionAdmissionVersion: 1,
+    selectionAdmission: {
+      selection: 'node', leaf: 'node', profile: 'strict', verified: true, at: now,
+    },
+    lastEvaluation: {
+      timestamp: now,
+      selected: 'node',
+      leaf: 'node',
+      successRate: 1,
+      averageMs: 300,
+      maxMs: 400,
+      health: 'partial-failure',
+      quality: 'partial-failure',
+      linkFailures: [],
+      applicationHealth: {
+        enabled: true,
+        fresh: false,
+        ok: false,
+        status: 'stale',
+        checkedAt: '2026-01-01T00:00:00.000Z',
+        consecutiveFailures: 3,
+        kind: 'codex-websocket',
+        counted: false,
+      },
+    },
+  }));
+  await writeFile(logFile, '');
+
+  const snapshot = await buildStatusSnapshot({ stateFile, logFile });
+  const output = formatStatus(snapshot);
+
+  assert.equal(snapshot.applicationHealth.status, 'stale');
+  assert.ok(snapshot.warnings.some((message) => message.includes('已鉴权长连接可用性未知')));
+  assert.match(output, /应用健康信号\s+: stale，新鲜 否，连续失败 3，类型 codex-websocket/);
+});
+
 test('当前健康与待准入独立展示，较新状态证据优先于历史拒绝日志', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'sentinel-four-state-'));
   const stateFile = path.join(root, 'state.json');

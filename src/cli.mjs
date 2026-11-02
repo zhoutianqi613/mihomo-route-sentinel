@@ -3,6 +3,7 @@ import { access, readFile, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from './config.mjs';
+import { readApplicationHealth } from './application-health.mjs';
 import { MihomoController } from './controller.mjs';
 import { acquireLock, controllerFingerprint, readLock } from './lock.mjs';
 import {
@@ -437,10 +438,24 @@ async function main() {
                 await logger('warn', 'link-telemetry-failed', { errorType: error?.name ?? 'Error' });
               }
             }
+            let applicationHealth = null;
+            if (config.telemetry.applicationHealthFile) {
+              applicationHealth = await readApplicationHealth(
+                config.telemetry.applicationHealthFile,
+                {
+                  maxAgeSeconds: config.telemetry.applicationHealthMaxAgeSeconds,
+                  now: Date.now(),
+                },
+              );
+              const level = ['degraded', 'invalid', 'missing'].includes(applicationHealth.status)
+                ? 'warn' : 'info';
+              await logger(level, 'application-health', applicationHealth);
+            }
             const result = await watchdog.runOnce({
               dryRun: !options.apply,
               forceScan: options.forceScan,
               linkTelemetry,
+              applicationHealth,
               backgroundScan: options.run,
             });
             backgroundWake = result.backgroundWake ?? null;

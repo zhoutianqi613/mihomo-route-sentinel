@@ -85,6 +85,10 @@ export const defaults = Object.freeze({
     timeoutMs: 5000,
     // 默认关闭：业务结果（401/403、WS 未升级）只做记录，不参与健康判定与恢复。
     businessFailureMarksDegraded: false,
+    // 可选的已鉴权应用健康信号；文件由具备凭据的外部生产者写入，Sentinel 不读取凭据。
+    applicationHealthFile: '',
+    applicationHealthMaxAgeSeconds: 120,
+    applicationFailureCycles: 2,
   },
   guardrails: {
     enabled: true,
@@ -107,13 +111,19 @@ export const defaults = Object.freeze({
   },
 });
 
+function cloneValue(value) {
+  if (Array.isArray(value)) return value.map(cloneValue);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, cloneValue(child)]));
+}
+
 function merge(base, override) {
-  if (!override || typeof override !== 'object' || Array.isArray(override)) return base;
-  const result = { ...base };
+  if (!override || typeof override !== 'object' || Array.isArray(override)) return cloneValue(base);
+  const result = cloneValue(base);
   for (const [key, value] of Object.entries(override)) {
     result[key] = value && typeof value === 'object' && !Array.isArray(value)
       ? merge(base?.[key] ?? {}, value)
-      : value;
+      : cloneValue(value);
   }
   return result;
 }
@@ -369,6 +379,19 @@ function validate(config) {
     config.telemetry.businessFailureMarksDegraded,
     'telemetry.businessFailureMarksDegraded',
   );
+  if (typeof config.telemetry.applicationHealthFile !== 'string') {
+    throw new Error('telemetry.applicationHealthFile 必须是字符串');
+  }
+  requireInteger(
+    config.telemetry.applicationHealthMaxAgeSeconds,
+    'telemetry.applicationHealthMaxAgeSeconds',
+    5,
+  );
+  requireInteger(
+    config.telemetry.applicationFailureCycles,
+    'telemetry.applicationFailureCycles',
+    1,
+  );
 
   requireBoolean(config.guardrails.enabled, 'guardrails.enabled');
   requireBoolean(config.guardrails.autoRepair, 'guardrails.autoRepair');
@@ -433,8 +456,18 @@ export async function loadConfig(configPath) {
   for (const key of ['state', 'log', 'lock', 'guardrailState']) {
     config.files[key] = path.resolve(baseDir, config.files[key]);
   }
-  if (new Set(Object.values(config.files)).size !== Object.keys(config.files).length) {
-    throw new Error('files.state、files.log、files.lock 和 files.guardrailState 必须指向不同文件');
+  if (config.telemetry.applicationHealthFile) {
+    config.telemetry.applicationHealthFile = path.resolve(
+      baseDir,
+      config.telemetry.applicationHealthFile,
+    );
+  }
+  const runtimePaths = Object.values(config.files);
+  if (config.telemetry.applicationHealthFile) {
+    runtimePaths.push(config.telemetry.applicationHealthFile);
+  }
+  if (new Set(runtimePaths).size !== runtimePaths.length) {
+    throw new Error('files.state、files.log、files.lock、files.guardrailState 与应用健康信号必须指向不同文件');
   }
   config.configPath = absolutePath;
   return config;

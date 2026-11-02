@@ -398,6 +398,8 @@ export async function buildStatusSnapshot({
     ? { ...savedEvaluation, timestamp: savedEvaluation.timestamp ?? savedEvaluation.at }
     : loggedEvaluation;
   const telemetry = telemetryForEvaluation(records, evaluation);
+  const loggedApplicationHealth = latestByEvent(records, 'application-health');
+  const applicationHealth = evaluation?.applicationHealth ?? loggedApplicationHealth ?? null;
   const guardrail = latestByEvent(records, 'guardrail-evaluated');
   const processGuard = latestByEvent(records, 'clash-verge-process-guard-evaluated');
   const runtimeModeGuard = latestByEvent(records, 'runtime-mode-guard-evaluated');
@@ -416,6 +418,9 @@ export async function buildStatusSnapshot({
   }
   if (runtime?.version && programVersion && runtime.version !== programVersion) {
     warnings.push(`后台运行 ${runtime.version} ≠ 当前程序 ${programVersion}，任务可能仍加载旧代码`);
+  }
+  if (applicationHealth?.enabled === true && applicationHealth.fresh === false) {
+    warnings.push('应用健康信号缺失、损坏或过期：已鉴权长连接可用性未知');
   }
   const evaluationTimestamp = Date.parse(evaluation?.timestamp ?? '');
   if (!evaluation) {
@@ -518,6 +523,7 @@ export async function buildStatusSnapshot({
       at: telemetry.timestamp ?? null,
       ...telemetry.metrics,
     } : null,
+    applicationHealth,
     guardrails: guardrail ? {
       at: guardrail.timestamp ?? null,
       status: guardrail.status ?? null,
@@ -596,6 +602,7 @@ export function formatStatus(snapshot) {
   };
   const httpsTelemetry = snapshot.telemetry?.https;
   const websocketTelemetry = snapshot.telemetry?.websocket;
+  const applicationHealth = snapshot.applicationHealth;
   const guardrailText = snapshot.guardrails
     ? `${display(snapshot.guardrails.status)}，问题 ${snapshot.guardrails.issues.length}，修复 ${snapshot.guardrails.repairs.length}`
     : '尚无数据';
@@ -683,6 +690,7 @@ export function formatStatus(snapshot) {
     `救援预算       : ${budgetText('rescue')}`,
     `HTTPS 真实链路 : ${httpsTelemetry ? `网络 ${httpsTelemetry.networkOk ? '成功' : '失败'}，HTTP ${display(httpsTelemetry.statusCode)}，代理 TCP ${display(httpsTelemetry.connectMs, ' ms')}，CONNECT ${display(httpsTelemetry.tunnelMs, ' ms')}，TLS ${display(httpsTelemetry.tlsMs, ' ms')}，TTFB ${display(httpsTelemetry.ttfbMs, ' ms')}` : '尚无数据'}`,
     `WebSocket 链路 : ${websocketTelemetry ? `网络 ${websocketTelemetry.networkOk ? '成功' : '失败'}，升级 ${websocketTelemetry.websocketOk ? '成功' : '未成功'}，HTTP ${display(websocketTelemetry.statusCode)}，代理 TCP ${display(websocketTelemetry.connectMs, ' ms')}，CONNECT ${display(websocketTelemetry.tunnelMs, ' ms')}，TLS ${display(websocketTelemetry.tlsMs, ' ms')}，TTFB ${display(websocketTelemetry.ttfbMs, ' ms')}` : '尚无数据'}`,
+    `应用健康信号   : ${applicationHealth ? `${display(applicationHealth.status)}，新鲜 ${applicationHealth.fresh ? '是' : '否'}，连续失败 ${display(applicationHealth.consecutiveFailures)}，类型 ${display(applicationHealth.kind)}` : '未配置；已鉴权长连接未验证'}`,
     `配置守卫       : ${guardrailText}`,
     `客户端进程守卫 : ${processGuardText}`,
     `外部节点准入   : ${externalAdmissionText}`,

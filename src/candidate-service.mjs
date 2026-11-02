@@ -7,6 +7,7 @@ import {
   hasStrictAdmissionEvidence,
   isStableAcrossRounds,
 } from './health-policy.mjs';
+import { latencyUpperBound, wilsonLowerBound } from './estimator.mjs';
 import { waitUntil } from './probe-scheduler.mjs';
 
 const REAL_CLOCK = Object.freeze({
@@ -28,6 +29,7 @@ export function createCandidateService({
   externalFindCandidates = null,
   externalDiscoverCandidates = null,
 }) {
+  let backgroundScanSequence = 0;
   const service = {
     candidateScanMatches(scan, selection, leaf) {
       return scan?.selection === selection && scan?.leaf === leaf;
@@ -43,7 +45,10 @@ export function createCandidateService({
     }) {
       getActiveCandidateScan()?.cancel?.();
       const abortController = new AbortController();
+      backgroundScanSequence += 1;
+      const id = `scan-${clock.now()}-${backgroundScanSequence}`;
       const scan = {
+        id,
         selection,
         leaf,
         reason,
@@ -59,9 +64,10 @@ export function createCandidateService({
       const runFindCandidates = externalFindCandidates
         ?? ((...args) => service.findCandidates(...args));
       scan.promise = runFindCandidates(leaf, excludedNodes, {
-        allowProvisionalRecovery, background: true, signal: abortController.signal,
+        allowProvisionalRecovery, background: true, signal: abortController.signal, scanId: id,
       })
         .then((result) => {
+          result.scanId ??= id;
           result.completedAt ??= clock.nowIso();
           scan.result = result;
           scan.completedAt = result.completedAt;
@@ -83,6 +89,11 @@ export function createCandidateService({
         attempts: result.attempts,
         successes: result.successes,
         successRate: result.successRate,
+        successLowerBound: Number.isFinite(result.successLowerBound)
+          ? result.successLowerBound : null,
+        latencyUpperMs: Number.isFinite(result.latencyUpperMs) ? result.latencyUpperMs : null,
+        p50Ms: Number.isFinite(result.p50Ms) ? result.p50Ms : null,
+        p95Ms: Number.isFinite(result.p95Ms) ? result.p95Ms : null,
         averageMs: Number.isFinite(result.averageMs) ? result.averageMs : null,
         maxMs: Number.isFinite(result.maxMs) ? result.maxMs : null,
         jitterMs: Number.isFinite(result.jitterMs) ? result.jitterMs : null,
@@ -97,6 +108,7 @@ export function createCandidateService({
         durationMs: search.durationMs,
         deadlineMs: search.deadlineMs,
         deadlineReached: search.deadlineReached,
+        scanId: search.scanId ?? null,
         probeStats: search.probeStats ?? null,
         candidates: (search.validated ?? []).map((entry) => ({
           ...compact(entry),
@@ -115,6 +127,16 @@ export function createCandidateService({
           || ageMs > config.policy.candidateSnapshotMaxAgeSeconds * 1000) return null;
       const inflate = (entry) => ({
         ...entry,
+        successLowerBound: Number.isFinite(entry.successLowerBound)
+          ? entry.successLowerBound
+          : wilsonLowerBound(entry.successes ?? 0, entry.attempts ?? 0),
+        latencyUpperMs: Number.isFinite(entry.latencyUpperMs)
+          ? entry.latencyUpperMs
+          : latencyUpperBound(
+            Number.isFinite(entry.averageMs) ? entry.averageMs : Infinity,
+            Number.isFinite(entry.jitterMs) ? entry.jitterMs : Infinity,
+            entry.successes ?? 0,
+          ),
         averageMs: entry.averageMs ?? Infinity,
         maxMs: entry.maxMs ?? Infinity,
         jitterMs: entry.jitterMs ?? Infinity,
@@ -132,6 +154,7 @@ export function createCandidateService({
         durationMs: snapshot.durationMs,
         deadlineMs: snapshot.deadlineMs,
         deadlineReached: snapshot.deadlineReached,
+        scanId: snapshot.scanId ?? null,
         probeStats: snapshot.probeStats ?? null,
         completedAt: snapshot.at,
         source: 'candidate-snapshot',
@@ -181,7 +204,7 @@ export function createCandidateService({
     },
 
     async findCandidates(currentLeaf, excludedNodes = new Set(), {
-      allowProvisionalRecovery = false, background = false, signal,
+      allowProvisionalRecovery = false, background = false, signal, scanId = null,
     } = {}) {
       const scanStartedAt = clock.now();
       let deadlineMs = config.probes.scanDeadlineMs;
@@ -195,6 +218,7 @@ export function createCandidateService({
       if (!Array.isArray(source.all) || source.all.length === 0) {
         await logger('error', 'candidate-source-empty', { group: config.groups.candidates });
         return {
+          scanId,
           stable: [],
           provisional: [],
           sampled: [],
@@ -273,7 +297,7 @@ export function createCandidateService({
       stable.sort((a, b) => a.score - b.score);
       provisional.sort((a, b) => a.score - b.score);
       const rejected = validated
-        .filter((result) => !stable.includes(result))
+        .filter((result) => !stable.includes(result) && !provisional.includes(result))
         .map((result) => ({ node: result.node, ...explainRoundStability(result, candidateThresholds()) }));
       await logger('info', 'candidate-validation-completed', {
         validatedCount: validated.length,
@@ -288,6 +312,7 @@ export function createCandidateService({
           successRate: result.successRate,
           averageMs: Math.round(result.averageMs),
           maxMs: result.maxMs,
+          strictReasons: explainRoundStability(result, candidateThresholds()).reasons,
         })),
         rejected,
         probeStats: {
@@ -299,6 +324,7 @@ export function createCandidateService({
         deadlineReached: clock.now() >= deadlineAt,
       });
       return {
+        scanId,
         stable,
         provisional,
         sampled: quickResults,

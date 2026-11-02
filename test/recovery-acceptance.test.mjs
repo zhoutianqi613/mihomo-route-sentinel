@@ -279,6 +279,130 @@ test('放宽采样窗口不降低严格质量线，完整但700ms候选仍拒绝
   assert.equal((await f.readState()).quarantinedNodes.candidate.reason, 'pre-switch-validation-failed');
 });
 
+test('已完成的新候选扫描优先于仍新鲜的旧快照', async (t) => {
+  const f = await fixture(t);
+  const watchdog = f.create();
+  const fresh = {
+    node: 'fresh-candidate', attempts: 4, successes: 4, successRate: 1,
+    successLowerBound: 0.51, latencyUpperMs: 320, averageMs: 300, maxMs: 320,
+    jitterMs: 10, score: 360,
+  };
+  watchdog.activeCandidateScan = {
+    selection: 'current',
+    leaf: 'current',
+    completed: true,
+    invalidated: false,
+    result: {
+      stable: [fresh], provisional: [], validated: [fresh], sampled: [], rejected: [],
+      durationMs: 10, deadlineMs: 100, deadlineReached: false,
+    },
+    promise: Promise.resolve(),
+    cancel: () => {},
+  };
+
+  const result = await watchdog.runOnce({
+    dryRun: true, forceScan: true, backgroundScan: true,
+  });
+
+  assert.equal(result.candidate.node, 'fresh-candidate');
+  assert.equal(f.events.some(({ event }) => event === 'candidate-snapshot-refreshed'), true);
+  assert.equal(f.events.some(({ event }) => event === 'candidate-snapshot-used'), false);
+});
+
+test('切前实时证据会重新排序，稳定候选优先于更快的抖动候选', async (t) => {
+  const slowStable = {
+    node: 'stable-candidate', attempts: 4, successes: 4, successRate: 1,
+    successLowerBound: 0.51, latencyUpperMs: 450, averageMs: 450, maxMs: 450,
+    jitterMs: 0, score: 490_450, profile: 'strict',
+  };
+  const fastNoisy = {
+    node: 'noisy-candidate', attempts: 4, successes: 4, successRate: 1,
+    successLowerBound: 0.51, latencyUpperMs: 480, averageMs: 300, maxMs: 550,
+    jitterMs: 250, score: 610_000, profile: 'strict',
+  };
+  const f = await fixture(t, {
+    probe: (node, url, count) => {
+      if (node === 'current') return 1000;
+      if (node === 'stable-candidate') return 450;
+      if (node === 'noisy-candidate') return count % 2 === 1 ? 50 : 550;
+      return 500;
+    },
+    state: {
+      candidateSnapshot: {
+        at: new Date().toISOString(), selection: 'current', leaf: 'current', sampled: [],
+        candidates: [fastNoisy, slowStable],
+      },
+    },
+  });
+
+  await f.create().runOnce({ dryRun: false, backgroundScan: true });
+
+  assert.equal(f.switches[0], 'stable-candidate');
+  const rejected = f.events.find(({ event }) => event === 'candidate-pre-switch-rejected');
+  assert.equal(rejected, undefined);
+});
+
+test('切前拒绝日志包含逐轮证据和阈值', async (t) => {
+  const f = await fixture(t, {
+    probe: (node, url, count) => {
+      if (node === 'current') return 1000;
+      return count <= 2 ? 100 : 900;
+    },
+  });
+
+  await f.create().runOnce({ dryRun: false, backgroundScan: true });
+
+  const rejected = f.events.find(({ event }) => event === 'candidate-pre-switch-rejected');
+  assert.ok(rejected.details.decisionId);
+  assert.deepEqual(rejected.details.thresholds, {
+    minSuccessRate: 1, maxAverageMs: 600, maxSingleMs: 1200,
+  });
+  assert.equal(rejected.details.evidence.rounds.length, 2);
+  assert.equal(rejected.details.evidence.rounds[1].reasons.includes('average-latency'), true);
+});
+
+test('新鲜且连续达到阈值的应用健康失败参与恢复', async (t) => {
+  const f = await fixture(t, { probe: (node) => node === 'current' ? 300 : 200 });
+
+  await f.create().runOnce({
+    dryRun: false,
+    backgroundScan: true,
+    applicationHealth: {
+      enabled: true,
+      fresh: true,
+      ok: false,
+      status: 'degraded',
+      consecutiveFailures: 2,
+      checkedAt: new Date().toISOString(),
+      kind: 'codex-websocket',
+    },
+  });
+
+  assert.deepEqual(f.switches, ['candidate']);
+  const state = await f.readState();
+  assert.equal(state.lastEvaluation.applicationHealth.status, 'degraded');
+  assert.equal(state.lastEvaluation.applicationHealth.counted, true);
+});
+
+test('过期或未达到阈值的应用健康失败不触发切换', async (t) => {
+  const f = await fixture(t, { probe: (node) => node === 'current' ? 300 : 300 });
+  await f.create().runOnce({
+    dryRun: false,
+    backgroundScan: true,
+    applicationHealth: {
+      enabled: true,
+      fresh: false,
+      ok: false,
+      status: 'stale',
+      consecutiveFailures: 10,
+      checkedAt: '2026-01-01T00:00:00.000Z',
+      kind: 'codex-websocket',
+    },
+  });
+
+  assert.deepEqual(f.switches, []);
+});
+
 test('硬故障遇到零响应快照时重新实时复核，不能永久拒绝恢复', async (t) => {
   const f = await fixture(t, { state: { candidateSnapshot: unresponsiveSnapshot(),
     candidateScanBackoffUntil: new Date(Date.now() + 60_000).toISOString(),

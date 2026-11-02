@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { CURRENT_CONFIG_VERSION, loadConfig } from '../src/config.mjs';
+import { CURRENT_CONFIG_VERSION, defaults, loadConfig } from '../src/config.mjs';
 
 async function withConfig(value, action) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'mihomo-config-'));
@@ -35,6 +35,9 @@ test('v1 配置可内存迁移到当前版本并补齐新默认值', async () =>
     assert.equal(config.policy.candidateSnapshotMaxAgeSeconds, 120);
     assert.equal(config.logging.maxBytes, 31457280);
     assert.equal(config.telemetry.enabled, true);
+    assert.equal(config.telemetry.applicationHealthFile, '');
+    assert.equal(config.telemetry.applicationHealthMaxAgeSeconds, 120);
+    assert.equal(config.telemetry.applicationFailureCycles, 2);
     assert.equal(config.guardrails.expectedRuntimeMode, 'rule');
     assert.equal(config.guardrails.disableClashVergeDnsOverride, true);
     assert.equal(config.guardrails.ensureClashVergeRunning, false);
@@ -139,6 +142,51 @@ test('运行文件路径不能相互覆盖', async () => {
   }, async (configPath) => {
     await assert.rejects(loadConfig(configPath), /files\.state.*不同文件/);
   });
+});
+
+test('应用健康信号文件相对配置文件目录解析', async () => {
+  await withConfig({
+    ...minimal,
+    configVersion: CURRENT_CONFIG_VERSION,
+    telemetry: { applicationHealthFile: './runtime/application-health.json' },
+  }, async (configPath) => {
+    const config = await loadConfig(configPath);
+    assert.equal(
+      config.telemetry.applicationHealthFile,
+      path.join(path.dirname(configPath), 'runtime', 'application-health.json'),
+    );
+  });
+});
+
+test('应用健康信号不能与运行文件共用路径', async () => {
+  await withConfig({
+    ...minimal,
+    configVersion: CURRENT_CONFIG_VERSION,
+    files: {
+      state: './shared.json',
+      log: './watchdog.ndjson',
+      lock: './watchdog.lock',
+      guardrailState: './guardrails.json',
+    },
+    telemetry: { applicationHealthFile: './shared.json' },
+  }, async (configPath) => {
+    await assert.rejects(loadConfig(configPath), /应用健康信号必须指向不同文件/);
+  });
+});
+
+test('加载配置不会改写全局默认嵌套对象', async () => {
+  const originalState = defaults.files.state;
+  const originalUrls = JSON.stringify(defaults.probes.urls);
+  await withConfig({
+    ...minimal,
+    configVersion: CURRENT_CONFIG_VERSION,
+  }, async (configPath) => {
+    const config = await loadConfig(configPath);
+    config.files.state = path.join(path.dirname(configPath), 'mutated.json');
+    config.probes.urls.push('https://mutated.example/');
+  });
+  assert.equal(defaults.files.state, originalState);
+  assert.equal(JSON.stringify(defaults.probes.urls), originalUrls);
 });
 
 test('未知字段会在启动时报错而不是静默忽略', async () => {

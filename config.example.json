@@ -81,7 +81,10 @@
     "httpsUrl": "https://chatgpt.com/",
     "websocketUrl": "wss://chatgpt.com/backend-api/codex/responses",
     "timeoutMs": 5000,
-    "businessFailureMarksDegraded": false
+    "businessFailureMarksDegraded": false,
+    "applicationHealthFile": "",
+    "applicationHealthMaxAgeSeconds": 120,
+    "applicationFailureCycles": 2
   },
   "guardrails": {
     "enabled": true,

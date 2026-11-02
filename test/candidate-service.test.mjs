@@ -149,6 +149,8 @@ test('candidate snapshot keeps identity and expires after the configured age', (
     ['provisional', 'current-health'],
     ['rejected', 'rejected'],
   ]);
+  assert.equal(Number.isFinite(snapshot.candidates[0].successLowerBound), true);
+  assert.equal(Number.isFinite(snapshot.candidates[0].latencyUpperMs), true);
   assert.equal(snapshot.sampled[0].node, 'sampled');
 
   const restored = service.searchFromCandidateSnapshot(snapshot, 'selection', 'leaf');
@@ -164,6 +166,26 @@ test('candidate snapshot keeps identity and expires after the configured age', (
 
   clock.advance(121_000);
   assert.equal(service.searchFromCandidateSnapshot(snapshot, 'selection', 'leaf'), null);
+});
+
+test('legacy candidate snapshots restore uncertainty-aware ranking fields', () => {
+  const clock = createFakeClock();
+  const { service } = createHarness({ clock });
+  const snapshot = {
+    at: clock.nowIso(),
+    selection: 's',
+    leaf: 'l',
+    candidates: [{
+      node: 'legacy', attempts: 4, successes: 4, successRate: 1,
+      averageMs: 300, maxMs: 400, jitterMs: 50, score: 400, profile: 'strict',
+    }],
+    sampled: [],
+  };
+
+  const restored = service.searchFromCandidateSnapshot(snapshot, 's', 'l');
+
+  assert.equal(Number.isFinite(restored.stable[0].successLowerBound), true);
+  assert.equal(Number.isFinite(restored.stable[0].latencyUpperMs), true);
 });
 
 test('searchFromCandidateSnapshot inflates missing metrics and preserves probe stats', () => {
@@ -224,7 +246,7 @@ test('findCandidates ranks the shortlist, classifies strict/provisional/rejected
 
   assert.deepEqual(result.stable.map((entry) => entry.node), ['strict']);
   assert.deepEqual(result.provisional.map((entry) => entry.node), ['provisional']);
-  assert.deepEqual(result.rejected.map((entry) => entry.node).sort(), ['provisional', 'rejected']);
+  assert.deepEqual(result.rejected.map((entry) => entry.node), ['rejected']);
   assert.equal(result.rejected.every((entry) => entry.reasons.includes('average-latency')), true);
   assert.equal(result.sampled.length, 4);
   assert.deepEqual(result.probeStats.discovery, { method: 'per-node', controllerRequests: 4 });

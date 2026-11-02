@@ -429,6 +429,26 @@ HTTP Controller 使用 secret 时，只配置环境变量名称：
 | `telemetry.websocketUrl` | Codex Responses WebSocket | WebSocket 握手遥测目标。 |
 | `telemetry.timeoutMs` | `5000` | 每项遥测超时。 |
 | `telemetry.businessFailureMarksDegraded` | `false` | 是否把「网络可达但业务结果非 accepted/upgraded」（如 401/403、WS 未升级）视为业务降级；默认关闭，仅记录不参与健康判定。 |
+| `telemetry.applicationHealthFile` | 空 | 可选的已鉴权应用健康信号文件；相对路径以配置文件目录为基准，空值表示禁用。 |
+| `telemetry.applicationHealthMaxAgeSeconds` | `120` | 应用健康信号的最大有效期；过期后只标记未知，不生成故障。 |
+| `telemetry.applicationFailureCycles` | `2` | 信号内连续失败次数达到该值时，才计入健康与恢复路径。 |
+
+**应用健康信号：** 生产方应使用已有登录态检测长连接，并将结果原子写入配置的文件。Sentinel不读取凭据，也不接收聊天正文或错误详情。
+
+文件只读取以下受控字段；额外字段会被忽略，不能进入日志或状态：
+
+```json
+{
+  "ok": false,
+  "checkedAt": "2026-11-02T13:14:00.000Z",
+  "consecutiveFailures": 2,
+  "kind": "codex-websocket"
+}
+```
+
+**判读：** `ok=true` 表示最近一次已鉴权检测成功；`ok=false` 且信号新鲜、连续失败达到阈值时才参与恢复。
+
+**信号缺失：** 未配置、损坏或过期时不伪造失败，只显示“已鉴权长连接未验证/未知”。
 
 
 

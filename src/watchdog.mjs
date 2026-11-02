@@ -8,6 +8,7 @@ import {
   classifyHealth,
   clearCandidateScanBackoff,
   compareAvailability,
+  explainRoundStability,
   getActiveQuarantines,
   hasCompleteProbeRounds,
   hasStrictAdmissionEvidence,
@@ -19,6 +20,7 @@ import {
   requiresImmediateResponse,
   summarizeSamples,
 } from './health-policy.mjs';
+import { evaluateApplicationHealth } from './application-health.mjs';
 import { createProbeScheduler, mapLimit } from './probe-scheduler.mjs';
 import { createSwitchExecutor } from './switch-executor.mjs';
 import { createCandidateService } from './candidate-service.mjs';
@@ -234,11 +236,20 @@ export class Watchdog {
     };
   }
 
-  async runOnce({ dryRun = true, forceScan = false, linkTelemetry, backgroundScan = false } = {}) {
+  async runOnce({
+    dryRun = true,
+    forceScan = false,
+    linkTelemetry,
+    applicationHealth,
+    backgroundScan = false,
+  } = {}) {
     const { state, recovery } = await loadState(this.config.files.state);
     if (recovery) await this.log('warn', 'state-file-recovered', recovery);
     if (!this.activeCandidateScan && state.candidateScan?.status === 'running') delete state.candidateScan;
     if (this.runtime) state.runtime = this.runtime;
+    let currentCycleLinkEvidence = {};
+    this.decisionSequence = (this.decisionSequence ?? 0) + 1;
+    const decisionId = `decision-${this.clock.now()}-${this.decisionSequence}`;
     const setDecision = (action, reason, details = {}) => {
       state.lastDecision = { at: this.clock.nowIso(), action, reason, ...details };
     };
@@ -246,7 +257,14 @@ export class Watchdog {
       synchronizeDecisionState(state, this.config.policy, { probes: this.config.probes, now: this.clock.now() });
       if (!dryRun) await saveState(this.config.files.state, state);
     };
-    const recordEvaluation = (result, evaluatedHealth, selected, leaf, linkFailures = [], linkEvidence = {}) => {
+    const recordEvaluation = (
+      result,
+      evaluatedHealth,
+      selected,
+      leaf,
+      linkFailures = [],
+      linkEvidence = currentCycleLinkEvidence,
+    ) => {
       state.lastEvaluation = {
         timestamp: this.clock.nowIso(), selected, leaf,
         successRate: result.successRate,
@@ -258,6 +276,7 @@ export class Watchdog {
         linkOutcomes: Array.isArray(linkEvidence.linkOutcomes) ? linkEvidence.linkOutcomes : [],
         businessAnnotations: Array.isArray(linkEvidence.businessAnnotations)
           ? linkEvidence.businessAnnotations : [],
+        applicationHealth: linkEvidence.applicationHealth ?? null,
       };
     };
     const recordAdmission = (profile, selection, leaf) => {
@@ -524,12 +543,17 @@ export class Watchdog {
       .filter((entry) => entry.networkOk && !['accepted', 'upgraded'].includes(entry.outcome));
     const businessAnnotations = businessFailures
       .map(({ kind, outcome, statusCode }) => ({ kind, outcome, statusCode }));
+    const applicationHealthEvidence = evaluateApplicationHealth(applicationHealth, {
+      minimumFailures: this.config.telemetry.applicationFailureCycles,
+    });
+    const applicationFailureActive = applicationHealthEvidence.counted;
     // 业务失败门默认关闭：保持“业务结果只记录、不参与健康判定”的既有行为。
     const businessGateEnabled = this.config.telemetry?.businessFailureMarksDegraded === true;
     const applyLinkHealth = (probeHealth) => {
       const networkDegraded = linkFailures.length > 0;
       const businessDegraded = businessGateEnabled && businessFailures.length > 0;
-      if ((!networkDegraded && !businessDegraded) || requiresImmediateResponse(probeHealth)) {
+      if ((!networkDegraded && !businessDegraded && !applicationFailureActive)
+          || requiresImmediateResponse(probeHealth)) {
         return probeHealth;
       }
       return {
@@ -543,11 +567,14 @@ export class Watchdog {
     state.currentSelection = previousSelection;
     state.currentLeaf = currentLeaf;
     let availabilityRecoveryRequired = current.successRate < 1 || requiresImmediateResponse(health)
-      || linkFailures.length > 0 || (businessGateEnabled && businessFailures.length > 0);
-    recordEvaluation(current, health, previousSelection, currentLeaf, linkFailures, {
+      || linkFailures.length > 0 || (businessGateEnabled && businessFailures.length > 0)
+      || applicationFailureActive;
+    currentCycleLinkEvidence = {
       linkOutcomes,
       businessAnnotations,
-    });
+      applicationHealth: applicationHealthEvidence,
+    };
+    recordEvaluation(current, health, previousSelection, currentLeaf, linkFailures);
     if (selectionAdmissionRejected && health.stable) {
       state.lastOptimizationScanAt ??= this.clock.nowIso();
     }
@@ -563,6 +590,7 @@ export class Watchdog {
       linkFailures,
       linkOutcomes,
       businessFailureCount: businessFailures.length,
+      applicationHealth: applicationHealthEvidence,
       selectionSource: pendingAdmission ? (baselineRevalidation ? 'baseline' : 'external') : 'accepted',
       strictAdmission: Boolean(pendingAdmission),
     });
@@ -609,6 +637,7 @@ export class Watchdog {
         if (snapshotScan.error) {
           await this.log('warn', 'candidate-snapshot-refresh-failed', {
             errorType: snapshotScan.error?.code ?? snapshotScan.error?.name ?? 'Error',
+            scanId: snapshotScan.id ?? null,
           });
         } else {
           state.candidateSnapshot = this.createCandidateSnapshot(
@@ -619,6 +648,7 @@ export class Watchdog {
           await this.log('info', 'candidate-snapshot-refreshed', {
             candidateCount: state.candidateSnapshot.candidates.length,
             durationMs: state.candidateSnapshot.durationMs,
+            scanId: state.candidateSnapshot.scanId,
           });
         }
         this.activeCandidateScan = null;
@@ -724,7 +754,8 @@ export class Watchdog {
       current = confirmation;
       health = effectiveHealth;
       availabilityRecoveryRequired = current.successRate < 1 || requiresImmediateResponse(health)
-        || linkFailures.length > 0 || (businessGateEnabled && businessFailures.length > 0);
+        || linkFailures.length > 0 || (businessGateEnabled && businessFailures.length > 0)
+        || applicationFailureActive;
       recordEvaluation(current, health, previousSelection, currentLeaf, linkFailures, {
         linkOutcomes,
         businessAnnotations,
@@ -741,6 +772,7 @@ export class Watchdog {
         linkFailures,
         linkOutcomes,
         businessFailureCount: businessFailures.length,
+        applicationHealth: applicationHealthEvidence,
         selectionSource: 'immediate-confirmation',
         strictAdmission: false,
       });
@@ -781,7 +813,7 @@ export class Watchdog {
       state.consecutiveLatencyFailures = 0;
     }
 
-    if (!forceScan && !rollingDegradationTriggered && !optimizationDue
+    if (!forceScan && !applicationFailureActive && !rollingDegradationTriggered && !optimizationDue
         && requiredFailures > 0 && state.consecutiveFailures < requiredFailures) {
       setDecision('hold', 'failure-threshold-not-reached', {
         failures: state.consecutiveFailures,
@@ -883,7 +915,31 @@ export class Watchdog {
         previousSelection,
         currentLeaf,
       );
-      if (cachedSearch) {
+      const completedSearch = active?.completed
+        && !active.invalidated
+        && this.candidateScanMatches(active, previousSelection, currentLeaf)
+        ? active : null;
+      if (completedSearch?.error) {
+        await this.log('warn', 'candidate-snapshot-refresh-failed', {
+          errorType: completedSearch.error?.code ?? completedSearch.error?.name ?? 'Error',
+          scanId: completedSearch.id ?? null,
+        });
+      }
+      if (completedSearch?.result) {
+        search = completedSearch.result;
+        state.candidateSnapshot = this.createCandidateSnapshot(
+          search,
+          previousSelection,
+          currentLeaf,
+        );
+        this.activeCandidateScan = null;
+        delete state.candidateScan;
+        await this.log('info', 'candidate-snapshot-refreshed', {
+          candidateCount: state.candidateSnapshot.candidates.length,
+          durationMs: state.candidateSnapshot.durationMs,
+          scanId: state.candidateSnapshot.scanId,
+        });
+      } else if (cachedSearch) {
         search = cachedSearch;
         const hasResponsiveCandidate = [...cachedSearch.sampled, ...cachedSearch.validated]
           .some((entry) => entry.successes > 0);
@@ -896,6 +952,9 @@ export class Watchdog {
           ageMs: Math.round(cachedSearch.ageMs),
           candidateCount: cachedSearch.validated.length,
           trigger: scanReason,
+          snapshotAt: cachedSearch.completedAt ?? null,
+          scanId: cachedSearch.scanId ?? null,
+          decisionId,
         });
       } else if (active?.completed) {
         if (active.invalidated || !this.candidateScanMatches(active, previousSelection, currentLeaf)) {
@@ -968,6 +1027,7 @@ export class Watchdog {
       at: search.completedAt ?? this.clock.nowIso(),
       reason: scanReason,
       source: search.source ?? 'live-scan',
+      scanId: search.scanId ?? null,
       ageMs: search.ageMs ?? 0,
       sampledCount: search.sampled.length,
       validatedCount: search.validated?.length ?? 0,
@@ -1061,8 +1121,13 @@ export class Watchdog {
       return { status: 'no-candidate', current };
     }
     if (dryRun) {
-      setDecision('recommend', 'dry-run-would-switch', { from: previousSelection, to: candidate.node });
-      await this.log('info', 'switch-dry-run', { from: previousSelection, to: candidate.node });
+      setDecision('recommend', 'dry-run-would-switch', {
+        from: previousSelection, to: candidate.node, decisionId,
+      });
+      await this.log('info', 'switch-dry-run', {
+        from: previousSelection, to: candidate.node, decisionId,
+        source: search.source ?? 'live-scan', scanId: search.scanId ?? null,
+      });
       return { status: 'would-switch', current, candidate };
     }
 
@@ -1084,6 +1149,8 @@ export class Watchdog {
           candidateCount: candidates.length, rounds: preSwitchRounds,
           targetCount: this.config.probes.urls.length,
           deadlineMs: decisionDeadlineMs, perTargetTimeoutMs: this.config.probes.timeoutMs,
+          decisionId, source: search.source ?? 'live-scan', scanId: search.scanId ?? null,
+          snapshotAt: search.completedAt ?? null,
         });
       }
       const switchReserveMs = emergencyRecovery ? Math.min(250, Math.floor(decisionDeadlineMs / 3)) : 0;
@@ -1284,7 +1351,8 @@ export class Watchdog {
             await this.log('warn', 'candidate-pre-switch-deferred', {
               node: nextCandidate.node, reason: 'incomplete-evidence',
               attempts: verification?.attempts ?? 0, successes: verification?.successes ?? 0,
-              deadlineMs: decisionDeadlineMs,
+              deadlineMs: decisionDeadlineMs, decisionId,
+              source: search.source ?? 'live-scan', scanId: search.scanId ?? null,
             });
             continue;
           }
@@ -1309,22 +1377,46 @@ export class Watchdog {
               node: nextCandidate.node,
               profile: provisionalCandidateNames.has(nextCandidate.node) ? 'current-health' : 'strict',
               kind: 'quality',
+              decisionId,
+              source: search.source ?? 'live-scan',
+              scanId: search.scanId ?? null,
+              snapshotAt: search.completedAt ?? null,
+              thresholds: admissionThresholds,
+              attempts: verification.attempts,
+              successes: verification.successes,
+              score: Number.isFinite(verification.score) ? verification.score : null,
               successRate: verification?.successRate ?? 0,
               averageMs: Number.isFinite(verification?.averageMs) ? Math.round(verification.averageMs) : null,
               maxMs: Number.isFinite(verification?.maxMs) ? verification.maxMs : null,
+              evidence: explainRoundStability(verification, admissionThresholds),
             });
             continue;
           }
-          admitted.push({ ...nextCandidate, preSwitchVerification: verification });
+          const admissionProfile = provisionalCandidateNames.has(nextCandidate.node)
+            ? 'current-health' : 'strict';
+          admitted.push({ ...nextCandidate, preSwitchVerification: verification, admissionProfile });
           await this.log('info', 'candidate-pre-switch-admitted', {
             node: nextCandidate.node,
-            profile: provisionalCandidateNames.has(nextCandidate.node) ? 'current-health' : 'strict',
+            profile: admissionProfile,
+            decisionId,
+            source: search.source ?? 'live-scan',
+            scanId: search.scanId ?? null,
+            snapshotAt: search.completedAt ?? null,
+            thresholds: admissionThresholds,
+            attempts: verification.attempts,
+            successes: verification.successes,
+            score: Number.isFinite(verification.score) ? verification.score : null,
             successRate: verification.successRate,
             averageMs: Math.round(verification.averageMs),
             maxMs: verification.maxMs,
+            evidence: explainRoundStability(verification, admissionThresholds),
           });
         }
-        candidates = admitted;
+        candidates = admitted.sort((left, right) => {
+          const profileOrder = { strict: 0, 'current-health': 1 };
+          return (profileOrder[left.admissionProfile] - profileOrder[right.admissionProfile])
+            || compareAvailability(left.preSwitchVerification, right.preSwitchVerification);
+        });
       }
     }
 
