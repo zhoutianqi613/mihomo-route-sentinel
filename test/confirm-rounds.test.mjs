@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -12,6 +12,7 @@ async function fixture(t, {
   currentDelay = () => null,
   probes: probeOverrides = {},
   policy: policyOverrides = {},
+  state: stateOverrides = {},
 } = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'sentinel-confirm-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -52,6 +53,7 @@ async function fixture(t, {
     selectionAdmissionVersion: 1,
     selectionAdmission: { selection: 'current', leaf: 'current', profile: 'strict', verified: true },
     lastSwitchAt: new Date().toISOString(),
+    ...stateOverrides,
   }));
   let selected = 'current';
   const switches = [];
@@ -84,7 +86,8 @@ async function fixture(t, {
     logger: async (level, event, details) => events.push({ level, event, details }),
   });
   const confirmation = () => events.find((entry) => entry.event === 'immediate-failure-confirmed');
-  return { watchdog, config, calls, switches, events, confirmation };
+  return { watchdog, config, calls, switches, events, confirmation,
+    readState: async () => JSON.parse(await readFile(config.files.state, 'utf8')) };
 }
 
 test('3 轮中 2 轮仍然即时失败时确认硬故障并继续恢复', async (t) => {
@@ -165,4 +168,79 @@ test('确认阶段使用 min(timeoutMs, confirmTimeoutMs) 作为单目标超时'
   // 3 轮 × 2 个目标全部进入确认探测。
   assert.equal(confirmCalls.length, 3 * urls.length);
   assert.equal(f.confirmation().details.timeoutMs, 60);
+});
+
+function exhaustedRecovery() {
+  return { switchHistory: Array.from({ length: 3 }, () => ({
+    timestamp: new Date().toISOString(), budgetClass: 'recovery', kind: 'candidate-attempt',
+  })) };
+}
+
+test('尖峰确认变为硬故障后按最新等级使用一次额外恢复额度', async (t) => {
+  const f = await fixture(t, {
+    probes: { confirmTimeoutMs: 2000 },
+    currentDelay: ({ node, url, count }) => {
+      if (node !== 'current') return 300;
+      if (count === 1) return url === urls[0] ? 3100 : 100;
+      return count === 2 && url === urls[0] ? 1212 : null;
+    },
+    state: exhaustedRecovery(),
+  });
+
+  const outcome = await f.watchdog.runOnce({ dryRun: false });
+  const confirmation = f.confirmation().details;
+  const state = await f.readState();
+  assert.equal(confirmation.trigger, 'latency-spike');
+  assert.equal(confirmation.confirmed, true);
+  assert.equal(confirmation.successRate, 1 / 6);
+  assert.equal(confirmation.health, 'hard-failure');
+  assert.equal(outcome.status, 'switched');
+  assert.deepEqual(f.switches, ['candidate']);
+  assert.equal(state.decisionState.budget.recovery.used, 3);
+  assert.equal(state.decisionState.budget.rescue.used, 1);
+});
+
+for (const latest of ['partial-failure', 'latency-spike']) {
+  test(`原硬故障确认后变为${latest}时不能继承额外恢复资格`, async (t) => {
+    const f = await fixture(t, {
+      probes: { confirmTimeoutMs: latest === 'latency-spike' ? 4000 : 2000 },
+      currentDelay: ({ node, url, count }) => {
+        if (node !== 'current') return 300;
+        if (count === 1) return null;
+        if (latest === 'latency-spike') return url === urls[0] ? 3100 : 100;
+        return count < 4 && url === urls[1] ? null : 300;
+      },
+      state: exhaustedRecovery(),
+    });
+
+    const outcome = await f.watchdog.runOnce({ dryRun: false });
+    const confirmation = f.confirmation().details;
+    assert.equal(confirmation.confirmed, true);
+    assert.equal(confirmation.health, latest);
+    assert.equal(outcome.status, 'switch-budget-exhausted');
+    assert.deepEqual(f.switches, []);
+    assert.equal((await f.readState()).decisionState.budget.rescue.used, 0);
+  });
+}
+
+test('多数轮确认通过但汇总为部分失败时仍立即使用普通恢复额度', async (t) => {
+  const f = await fixture(t, {
+    probes: { confirmTimeoutMs: 2000 },
+    currentDelay: ({ node, url, count }) => {
+      if (node !== 'current') return 300;
+      if (count === 1) return null;
+      return count < 4 && url === urls[1] ? null : 300;
+    },
+  });
+
+  const outcome = await f.watchdog.runOnce({ dryRun: false });
+  const confirmation = f.confirmation().details;
+  assert.equal(confirmation.confirmed, true);
+  assert.equal(confirmation.immediateRounds, 2);
+  assert.equal(confirmation.health, 'partial-failure');
+  assert.equal(outcome.status, 'switched');
+  assert.deepEqual(f.switches, ['candidate']);
+  const state = await f.readState();
+  assert.equal(state.decisionState.budget.recovery.used, 1);
+  assert.equal(state.decisionState.budget.rescue.used, 0);
 });

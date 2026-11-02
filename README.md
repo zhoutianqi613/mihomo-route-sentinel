@@ -24,7 +24,7 @@
 - **故障分级：** 区分瞬时异常、部分失败、延迟退化和硬故障。
 - **候选探测：** 全部使用逐节点 delay API。后台完成发现与短名单严格复测，并维护快照；前台使用独立有界发现和实时复核，不等待后台慢扫描。
 - **抖动抑制：** 使用最短驻留、改善幅度、节点隔离、扫描退避和切换预算。
-- **上游识别：** 使用公共对照 URL 识别整体故障，避免无意义换节点。
+- **上游识别：** 候选全部完整受测且共同失败、没有业务响应反证时，结合公共对照 URL 判断疑似共同故障；截止、取消或快照缺证据不生成上游退避。
 - **链路观测：** 记录 HTTPS 的 TLS/TTFB 与 WebSocket 指标，结构化日志按大小轮转。
 - **配置版本：** 兼容无版本的 v1，拒绝未来的不兼容版本。
 - **客户端守卫：** Windows 可选；启动时或运行中发现 Clash Verge 退出，按退避策略后台恢复。
@@ -384,7 +384,7 @@ HTTP Controller 使用 secret 时，只配置环境变量名称：
 | `policy.candidateScanBackoffSeconds` | `120` | 没有合格候选后的再次扫描退避。 |
 | `policy.switchBudgetCount` | `3` | 优化池与恢复池各自的滚动切换上限；两池独立。另有受条件约束的安全恢复额度。 |
 | `policy.switchBudgetWindowSeconds` | `600` | 优化、恢复与安全恢复三本账共用的滚动窗口长度；`rescue` 固定为同窗口一次，不新增配置项。 |
-| `policy.upstreamFailureMinCandidates` | `3` | 至少多少个候选呈现同类业务失败时，可结合对照 URL 判定上游故障并抑制切换。 |
+| `policy.upstreamFailureMinCandidates` | `3` | 共同故障判断所需的最少独立候选数；全部受测候选须具备完整失败证据，有业务响应或缺样本时不触发上游退避。 |
 | `policy.candidateSnapshotRefreshSeconds` | `60` | 持续运行时后台刷新候选快照的间隔。 |
 | `policy.candidateSnapshotMaxAgeSeconds` | `120` | 可复用快照的最大年龄，不得小于刷新间隔。过期或选择不匹配即失效。 |
 | `policy.emergencySwitchDeadlineMs` | `1000` | 紧急快速路径的目标，最大 1000 ms。扩展复核结束后，守卫会重新获得独立且有限的窗口，因此总耗时可超过该值并记 `deadlineMet=false`。 |

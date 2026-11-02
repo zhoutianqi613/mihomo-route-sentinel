@@ -221,12 +221,22 @@ export class Watchdog {
     return await this.candidates.findCandidates(currentLeaf, excludedNodes, options);
   }
 
-  async detectUpstreamOutage(currentLeaf, current, sampledCandidates) {
+  async detectUpstreamOutage(currentLeaf, current, sampledCandidates, validatedCandidates = []) {
     const controlUrls = this.config.probes.controlUrls ?? [];
     const minimumCandidates = this.config.policy.upstreamFailureMinCandidates ?? 3;
     if (controlUrls.length === 0 || current.successRate > 0) return null;
-    const failedCandidates = sampledCandidates.filter((result) => result.successRate === 0);
-    if (failedCandidates.length < minimumCandidates) return null;
+    // 任一业务响应都是共同故障的反证；后续验证也可能推翻初筛失败。
+    if ([...sampledCandidates, ...validatedCandidates].some((result) => result.successes > 0
+      || result.successRate > 0)) return null;
+    if (!hasCompleteProbeRounds(current, this.config.probes.urls, 1)) return null;
+    const sampledByNode = new Map(sampledCandidates
+      .filter((result) => result.node !== currentLeaf).map((result) => [result.node, result]));
+    const scanUrls = this.config.probes.urls.slice(0, this.config.probes.scanUrlCount);
+    const failedCandidates = [...sampledByNode.values()].filter((result) => result.successRate === 0
+      && hasCompleteProbeRounds(result, scanUrls, this.config.probes.scanRounds));
+    // 截止、取消或旧快照缺失逐目标证据时保持未知，不能提前阻断实时恢复。
+    if (failedCandidates.length < minimumCandidates
+      || failedCandidates.length !== sampledByNode.size) return null;
     const control = await this.probeNode(currentLeaf, 1, controlUrls);
     if (control.successRate < 1) return null;
     return {
@@ -702,6 +712,7 @@ export class Watchdog {
       };
     }
 
+    let immediateFailureConfirmed = false;
     if (!forceScan && requiresImmediateResponse(health)
       && this.config.policy.hardFailureConfirmSeconds > 0) {
       const initialStatus = health.status;
@@ -722,18 +733,14 @@ export class Watchdog {
       const requiredImmediateRounds = Math.ceil(confirmRounds * 2 / 3);
       // 样本门控：轮次不齐时不确认；多数轮次即时失败才确认。
       const confirmed = sampledRounds >= confirmRounds && immediateRounds >= requiredImmediateRounds;
+      immediateFailureConfirmed = confirmed;
       const confirmedHealth = applyLinkHealth(
         classifyHealth(confirmation, this.currentThresholds(), this.config.policy),
       );
-      // 确认后沿用触发时的即时状态继续恢复流程；未确认时不能凭聚合样本直接进入恢复，
-      // 否则"只采到部分失败样本/单轮抖动"仍会退化为单次失败即应急切换。
+      // 多数轮确认决定是否立即行动；最新样本决定健康等级与额外恢复资格。
+      // 未确认时仍降为部分失败，不能凭单轮抖动直接进入即时恢复。
       const effectiveHealth = confirmed
-        ? {
-          ...confirmedHealth,
-          stable: false,
-          emergency: initialStatus === 'hard-failure',
-          status: initialStatus,
-        }
+        ? confirmedHealth
         : (requiresImmediateResponse(confirmedHealth)
           ? { ...confirmedHealth, stable: false, emergency: false, status: 'partial-failure' }
           : confirmedHealth);
@@ -746,6 +753,7 @@ export class Watchdog {
         sampledRounds,
         timeoutMs: confirmTimeoutMs,
         health: effectiveHealth.status,
+        emergency: effectiveHealth.emergency,
         quality: effectiveHealth.quality,
         successRate: confirmation.successRate,
         averageMs: Number.isFinite(confirmation.averageMs) ? Math.round(confirmation.averageMs) : null,
@@ -813,7 +821,8 @@ export class Watchdog {
       state.consecutiveLatencyFailures = 0;
     }
 
-    if (!forceScan && !applicationFailureActive && !rollingDegradationTriggered && !optimizationDue
+    if (!forceScan && !immediateFailureConfirmed && !applicationFailureActive
+        && !rollingDegradationTriggered && !optimizationDue
         && requiredFailures > 0 && state.consecutiveFailures < requiredFailures) {
       setDecision('hold', 'failure-threshold-not-reached', {
         failures: state.consecutiveFailures,
@@ -1042,7 +1051,9 @@ export class Watchdog {
     // 扫描与串行切前门禁是两个阶段；立即落盘可避免状态把后续门禁误报为扫描超时。
     await persistState();
 
-    const upstreamOutage = await this.detectUpstreamOutage(currentLeaf, current, search.sampled);
+    const upstreamOutage = await this.detectUpstreamOutage(
+      currentLeaf, current, search.sampled, search.validated ?? [],
+    );
     if (upstreamOutage) {
       activateCandidateScanBackoffAt(this.clock, state, this.config.policy, 'upstream-outage');
       setDecision('hold', 'upstream-outage');
