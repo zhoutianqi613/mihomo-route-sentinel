@@ -387,7 +387,7 @@ HTTP Controller 使用 secret 时，只配置环境变量名称：
 | `policy.upstreamFailureMinCandidates` | `3` | 至少多少个候选呈现同类业务失败时，可结合对照 URL 判定上游故障并抑制切换。 |
 | `policy.candidateSnapshotRefreshSeconds` | `60` | 持续运行时后台刷新候选快照的间隔。 |
 | `policy.candidateSnapshotMaxAgeSeconds` | `120` | 可复用快照的最大年龄，不得小于刷新间隔。过期或选择不匹配即失效。 |
-| `policy.emergencySwitchDeadlineMs` | `1000` | 紧急快速复核、决策、守卫和 Controller 切换的 SLO，最大 1000 ms；不是端到端恢复承诺。 |
+| `policy.emergencySwitchDeadlineMs` | `1000` | 紧急快速路径的目标，最大 1000 ms。扩展复核结束后，守卫会重新获得独立且有限的窗口，因此总耗时可超过该值并记 `deadlineMet=false`。 |
 
 预算消费与回滚规则见[三类切换预算](#三类切换预算)；快照与一秒目标见[紧急恢复的时间边界](#紧急恢复的时间边界)；质量阈值见[延迟等级与遥测](#延迟等级与遥测)。
 

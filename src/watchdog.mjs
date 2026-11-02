@@ -1095,6 +1095,10 @@ export class Watchdog {
         validationDeadlineAt,
       );
       const resultByNode = new Map(preSwitchResults.map((entry) => [entry.node, entry]));
+      let emergencyGuardBudget = emergencyRecovery ? {
+        timeoutMs: this.switchExecutor.guardTimeoutFor(decisionStartedAt + decisionDeadlineMs),
+        source: 'emergency-decision-budget',
+      } : null;
 
       if (emergencyRecovery) {
         // 真实链路失败与 URLTest 延迟属于不同证据；完整可达的备选可作有预算的待验证恢复，
@@ -1133,6 +1137,11 @@ export class Watchdog {
             .filter(isRecoveryImprovement)
             .sort(compareAvailability);
           verificationSource = 'live-recovery-validation';
+          // 扩展复核已使用独立的完整探测窗口，不能再让后续守卫只继承早已过期的一秒决策窗口。
+          emergencyGuardBudget = {
+            timeoutMs: this.switchExecutor.guardTimeoutFor(),
+            source: 'post-recovery-guard-budget',
+          };
         }
         const emergencyCandidate = ranked[0];
         for (const result of preSwitchResults) {
@@ -1158,13 +1167,13 @@ export class Watchdog {
         } else {
           this.beginSwitchAttempt();
           try {
-            // emergency 决策窗口紧张：守卫最多只能吃掉决策剩余时间，且不低于 250ms。
+            // 快速路径沿用紧急决策剩余时间；扩展恢复路径重新获得有限的完整守卫预算。
             const remainingDecisionMs = Math.max(0, (decisionStartedAt + decisionDeadlineMs) - this.clock.now());
             const emergencySwitch = await this.guardedSelect(
               this.config.groups.target,
               emergencyCandidate.node,
               {
-                timeoutMs: this.switchExecutor.guardTimeoutFor(decisionStartedAt + decisionDeadlineMs),
+                timeoutMs: emergencyGuardBudget.timeoutMs,
                 beforeSelect: async () => {
                   const budget = consumeSwitchBudget(state, this.config.policy, {
                     from: previousSelection,
@@ -1193,6 +1202,7 @@ export class Watchdog {
                   phase: 'emergency',
                   timeoutMs: emergencySwitch.timeoutMs,
                   remainingDecisionMs,
+                  guardBudgetSource: emergencyGuardBudget.source,
                 });
                 return { status: 'guardrail-timeout', current };
               }
@@ -1251,6 +1261,8 @@ export class Watchdog {
               decisionDurationMs,
               deadlineMs: decisionDeadlineMs,
               deadlineMet: decisionDurationMs <= decisionDeadlineMs,
+              guardTimeoutMs: emergencyGuardBudget.timeoutMs,
+              guardBudgetSource: emergencyGuardBudget.source,
             });
             return {
               status: 'emergency-fallback',

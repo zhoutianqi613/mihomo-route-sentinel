@@ -15,7 +15,8 @@ function history(budgetClass, count = 3) {
 }
 
 async function fixture(t, { probe = (node) => node === 'current' ? null : 300,
-  state: overrides = {}, selectError = null } = {}) {
+  state: overrides = {}, selectError = null, beforeSwitch = async () => {},
+  guardTimeoutMs } = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'sentinel-p0-acceptance-'));
   t.after(() => {
     assert.equal(path.dirname(path.resolve(root)), path.resolve(os.tmpdir()));
@@ -63,7 +64,7 @@ async function fixture(t, { probe = (node) => node === 'current' ? null : 300,
       selected = node;
     },
   };
-  const create = () => new Watchdog({ controller, config,
+  const create = () => new Watchdog({ controller, config, beforeSwitch, guardTimeoutMs,
     logger: async (level, event, details) => events.push({ event, details }) });
   return { config, controller, create, switches, events,
     readState: async () => JSON.parse(await readFile(config.files.state, 'utf8')) };
@@ -94,6 +95,31 @@ test('扩展恢复使用与当前节点相同的单目标超时，不将慢速�
   assert.equal(result.verificationSource, 'live-recovery-validation');
   assert.deepEqual(f.switches, ['candidate']);
   assert.equal((await f.readState()).lastSwitch.verified, false);
+});
+
+test('扩展恢复完成后重新给予守卫完整有界预算', async (t) => {
+  const f = await fixture(t, {
+    probe: (node, url, count, switches, timeoutMs) => {
+      if (node === 'current' || timeoutMs < 95) return null;
+      return 80;
+    },
+    beforeSwitch: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    },
+    guardTimeoutMs: 500,
+  });
+  f.config.probes.preSwitchValidationDeadlineMs = 80;
+  f.config.policy.emergencySwitchDeadlineMs = 20;
+
+  const result = await f.create().runOnce({ dryRun: false, backgroundScan: true });
+
+  assert.equal(result.status, 'emergency-fallback');
+  assert.equal(result.verificationSource, 'live-recovery-validation');
+  assert.deepEqual(f.switches, ['candidate']);
+  assert.equal(f.events.some(({ event }) => event === 'switch-guardrail-timeout'), false);
+  const switched = f.events.find(({ event }) => event === 'emergency-fallback-switched');
+  assert.equal(switched.details.guardBudgetSource, 'post-recovery-guard-budget');
+  assert.equal(switched.details.guardTimeoutMs, 500);
 });
 
 test('测速成功但实际链路失败时允许完整可达的备选恢复，不套用延迟择优门槛', async (t) => {

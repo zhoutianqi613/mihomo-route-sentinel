@@ -95,9 +95,10 @@ function runCli(configPath, extraArgs) {
 
 test('锁缺失时状态页首行提示无运行实例并附带警告', async () => {
   await withStatusDir(async (root) => {
+    const version = await packageVersion();
     const files = await writeFiles(root, {
       state: {
-        runtime: { version: await packageVersion(), pid: 4321, startedAt: new Date().toISOString() },
+        runtime: { version, pid: 4321, startedAt: new Date().toISOString() },
         lastEvaluation: recentEvaluation(),
       },
     });
@@ -111,7 +112,7 @@ test('锁缺失时状态页首行提示无运行实例并附带警告', async ()
     const output = formatStatus(snapshot);
     assert.equal(output.split('\n')[0], '无运行实例（以下为上次运行记录）');
     // runtime 仍展示上次运行记录，而不是被清空。
-    assert.match(output, /运行版本\s+: 1\.8\.3（PID 4321/);
+    assert.match(output, new RegExp(`运行版本\\s+: ${version.replaceAll('.', '\\.')}（PID 4321`));
   });
 });
 
