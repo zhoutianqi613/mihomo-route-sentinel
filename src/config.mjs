@@ -49,6 +49,11 @@ export const defaults = Object.freeze({
     degradationWindowCycles: 10,
     degradationWindowFailures: 3,
     optimizationIntervalSeconds: 900,
+    optimizationHistoryEnabled: true,
+    optimizationHistoryWindowSeconds: 900,
+    optimizationHistoryMinComparisons: 3,
+    optimizationHistoryAlpha: 0.25,
+    optimizationHistoryMaxSkewSeconds: 30,
     hardFailureConfirmSeconds: 5,
     minimumDwellSeconds: 120,
     minimumImprovementMs: 200,
@@ -317,6 +322,9 @@ function validate(config) {
     degradationWindowCycles: 1,
     degradationWindowFailures: 1,
     optimizationIntervalSeconds: 0,
+    optimizationHistoryWindowSeconds: 60,
+    optimizationHistoryMinComparisons: 2,
+    optimizationHistoryMaxSkewSeconds: 1,
     hardFailureConfirmSeconds: 0,
     minimumDwellSeconds: 0,
     minimumImprovementMs: 0,
@@ -337,6 +345,19 @@ function validate(config) {
     emergencySwitchDeadlineMs: 300,
   })) requireInteger(config.policy[name], `policy.${name}`, minimum);
   requireRate(config.policy.minimumImprovementRatio, 'policy.minimumImprovementRatio');
+  requireBoolean(config.policy.optimizationHistoryEnabled, 'policy.optimizationHistoryEnabled');
+  requireRate(config.policy.optimizationHistoryAlpha, 'policy.optimizationHistoryAlpha');
+  if (config.policy.optimizationHistoryAlpha <= 0
+    || config.policy.optimizationHistoryWindowSeconds > 3600
+    || config.policy.optimizationHistoryMinComparisons > 32
+    || config.policy.optimizationHistoryMaxSkewSeconds > config.policy.optimizationHistoryWindowSeconds) {
+    throw new Error('历史择优要求 alpha > 0、窗口不超过3600秒、比较次数不超过32且配对时差不超过窗口');
+  }
+  if (config.policy.optimizationHistoryEnabled
+    && config.policy.optimizationHistoryWindowSeconds
+      < config.policy.intervalSeconds * (config.policy.optimizationHistoryMinComparisons - 1)) {
+    throw new Error('历史窗口不足以容纳所需的独立检查周期');
+  }
   requireRate(config.policy.emergencySuccessRate, 'policy.emergencySuccessRate');
   requireBoolean(config.policy.rollbackOnFailure, 'policy.rollbackOnFailure');
   if (config.policy.emergencySuccessRate >= config.probes.currentMinSuccessRate) {

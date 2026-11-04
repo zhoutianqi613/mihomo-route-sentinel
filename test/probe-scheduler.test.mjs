@@ -172,3 +172,19 @@ test('failed requests release candidate capacity for later probes', async () => 
   assert.equal(recovered.probeStats.controllerRequests, 1);
   assert.deepEqual(requestedNodes, ['node-fail-a', 'node-fail-b', 'node-ok']);
 });
+
+test('历史观察回调复用实际测速结果，不增加Controller请求', async () => {
+  let now = Date.now();
+  let requests = 0;
+  const observed = [];
+  const scheduler = createProbeScheduler({
+    controller: { async getDelay() { requests += 1; now += 1; return 10; } },
+    config: { probes: { parallelism: 2, timeoutMs: 100 } },
+    clock: { now: () => now },
+    onObservation: (result, timing) => observed.push({ result, timing }),
+  });
+  await scheduler.probeCandidatesInParallel(['a', 'b'], 2, ['https://a.example/', 'https://b.example/'], now + 2000);
+  assert.equal(requests, 8);
+  assert.equal(observed.length, 2);
+  assert.ok(observed.every(row => row.result.attempts === 4 && row.timing.fullTimeout));
+});

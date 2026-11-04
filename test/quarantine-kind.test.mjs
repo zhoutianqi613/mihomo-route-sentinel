@@ -35,6 +35,7 @@ async function fixture(t, { probe, state: overrides = {} } = {}) {
     parallelism: 2,
   });
   Object.assign(config.policy, {
+    optimizationHistoryEnabled: false,
     hardFailureConfirmSeconds: 0, postSwitchDelaySeconds: 0, postSwitchRounds: 2,
     partialFailureCycles: 1, latencyFailureCycles: 1, minimumDwellSeconds: 0,
     optimizationIntervalSeconds: 0, emergencySwitchDeadlineMs: 500,

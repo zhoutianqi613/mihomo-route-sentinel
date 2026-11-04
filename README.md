@@ -24,6 +24,7 @@
 - **故障分级：** 区分瞬时异常、部分失败、延迟退化和硬故障。
 - **候选探测：** 全部使用逐节点 delay API。后台完成发现与短名单严格复测，并维护快照；前台使用独立有界发现和实时复核，不等待后台慢扫描。
 - **抖动抑制：** 使用最短驻留、改善幅度、节点隔离、扫描退避和切换预算。
+- **历史择优：** 默认按同时间窗口的节点历史成功率、EWMA延迟和尾部波动比较；优势持续出现且实时严格合格后才普通择优。故障恢复不等待历史。
 - **上游识别：** 候选全部完整受测且共同失败、没有业务响应反证时，结合公共对照 URL 判断疑似共同故障；截止、取消或快照缺证据不生成上游退避。
 - **链路观测：** 记录 HTTPS 的 TLS/TTFB 与 WebSocket 指标，结构化日志按大小轮转。
 - **配置版本：** 兼容无版本的 v1，拒绝未来的不兼容版本。
@@ -81,6 +82,7 @@ node .\src\cli.mjs --config .\config.json --force-scan
 |---|---|
 | `healthy` | 当前节点当时满足健康门槛；不保证未来网络稳定。 |
 | `upstream-outage` | 启发式判断，不是上游官方故障公告。 |
+| `optimization-history-pending` | 配对历史不足或持续优势未成立，继续积累；通常需要数分钟，不表示守护停机。 |
 | `would-repair` / `blocked`（无探测结果） | 配置守卫要求先修复；按 1.3 的两条路径处理，Dry Run 不会自动修复或切换。 |
 | 保持当前节点或退避 | 尚无合格候选时可能是正确行为；结合状态中的原因判断。 |
 
@@ -367,10 +369,15 @@ HTTP Controller 使用 secret 时，只配置环境变量名称：
 | `policy.degradationWindowCycles` | `10` | 统计间歇性延迟退化的滚动周期数，健康周期不会再直接抹掉历史尖峰。 |
 | `policy.degradationWindowFailures` | `3` | 滚动窗口内达到该退化次数即触发择优扫描。不得大于窗口周期数。 |
 | `policy.optimizationIntervalSeconds` | `900` | 当前节点不是“优秀”时执行周期择优的间隔；`0` 表示关闭周期择优。 |
+| `policy.optimizationHistoryEnabled` | `true` | 普通择优启用历史比较；`false` 恢复原批次比较。故障恢复不受此开关约束。 |
+| `policy.optimizationHistoryWindowSeconds` | `900` | 历史滚动窗口，60–3600秒，至少覆盖所需独立检查周期；过期数据不参与比较。 |
+| `policy.optimizationHistoryMinComparisons` | `3` | 持续占优所需的独立配对窗口数，2–32；重复快照和同周期复测不增加次数。 |
+| `policy.optimizationHistoryAlpha` | `0.25` | EWMA新样本权重，须大于0且不超过1；越大越快响应近期变化。 |
+| `policy.optimizationHistoryMaxSkewSeconds` | `30` | 当前与候选允许的最大采样时间差，至少1秒且不超过历史窗口。 |
 | `policy.hardFailureConfirmSeconds` | `5` | 硬故障或不可接受尖峰进入多轮确认前的等待时间；确认轮次与超时见 `probes.confirmRounds` / `probes.confirmTimeoutMs`。 |
 | `policy.minimumDwellSeconds` | `120` | 纯延迟优化的最短驻留时间；故障恢复不受此限制。 |
-| `policy.minimumImprovementMs` | `200` | 延迟型切换要求候选至少改善的绝对延迟。 |
-| `policy.minimumImprovementRatio` | `0.2` | 延迟型切换要求候选至少改善的比例；默认 20%。绝对值与比例满足其一即可。 |
+| `policy.minimumImprovementMs` | `200` | 普通择优要求的绝对改善量；启用历史时作用于历史综合延迟评分。 |
+| `policy.minimumImprovementRatio` | `0.2` | 普通择优要求的改善比例；默认20%。与绝对改善量满足其一即可；启用历史时比较历史评分。 |
 | `policy.failedNodeQuarantineSeconds` | `900` | `verify` / `network` 类隔离的默认时长；切前质量不达标使用 `qualityQuarantineSeconds`，普通采样不完整不隔离。 |
 | `policy.qualityQuarantineSeconds` | `180` | 切前质量复核不达标（未过严格线）的短隔离时间；质量不足不等于网络失败，避免一次复核清空候选池。 |
 | `policy.oldNodeCooldownSeconds` | `120` | 成功切换后旧出口的冷却时间，避免它立刻被重新当成优化候选。 |

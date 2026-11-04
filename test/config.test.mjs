@@ -31,6 +31,11 @@ test('v1 配置可内存迁移到当前版本并补齐新默认值', async () =>
     assert.equal(config.policy.switchBudgetCount, 3);
     assert.equal(config.policy.immediateMaxSingleMs, 2500);
     assert.equal(config.policy.intervalSeconds, 30);
+    assert.equal(config.policy.optimizationHistoryEnabled, true);
+    assert.equal(config.policy.optimizationHistoryWindowSeconds, 900);
+    assert.equal(config.policy.optimizationHistoryMinComparisons, 3);
+    assert.equal(config.policy.optimizationHistoryAlpha, 0.25);
+    assert.equal(config.policy.optimizationHistoryMaxSkewSeconds, 30);
     assert.equal(config.policy.candidateSnapshotRefreshSeconds, 60);
     assert.equal(config.policy.candidateSnapshotMaxAgeSeconds, 120);
     assert.equal(config.logging.maxBytes, 31457280);
@@ -219,3 +224,21 @@ test('README 逐项解释示例配置中的全部字段', async () => {
     assert.ok(readme.includes(`\`${field}\``), `README 缺少配置字段说明：${field}`);
   }
 });
+
+for (const policy of [
+  { optimizationHistoryEnabled: 'true' },
+  { optimizationHistoryAlpha: 0 },
+  { optimizationHistoryAlpha: 1.1 },
+  { optimizationHistoryWindowSeconds: 0 },
+  { optimizationHistoryWindowSeconds: 3601 },
+  { optimizationHistoryMinComparisons: 1 },
+  { optimizationHistoryMinComparisons: 33 },
+  { optimizationHistoryMaxSkewSeconds: 901 },
+  { optimizationHistoryWindowSeconds: 60, optimizationHistoryMinComparisons: 4 },
+]) {
+  test(`非法历史择优参数被拒绝：${JSON.stringify(policy)}`, async () => {
+    await withConfig({ ...minimal, policy }, async configPath => {
+      await assert.rejects(loadConfig(configPath));
+    });
+  });
+}

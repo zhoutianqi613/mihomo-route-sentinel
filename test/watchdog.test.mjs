@@ -114,6 +114,8 @@ async function makeConfig(controllerUrl) {
   config.probes.candidateMaxAverageMs = 600;
   config.probes.candidateMaxSingleMs = 1200;
   config.policy.partialFailureCycles = 1;
+  // 此夹具验证原有单次门禁；历史择优由独立集成用例覆盖。
+  config.policy.optimizationHistoryEnabled = false;
   config.policy.latencyFailureCycles = 1;
   config.policy.hardFailureConfirmSeconds = 0;
   config.policy.minimumDwellSeconds = 0;

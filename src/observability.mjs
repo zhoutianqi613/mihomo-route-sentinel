@@ -234,6 +234,7 @@ const WAIT_REASON_TEXT = Object.freeze({
   'no-pre-switch-candidate': () => '本轮无候选通过切前复核，已退避后重试',
   'upstream-outage': () => '疑似上游故障（对照地址可用），暂停切换',
   'strict-admission-pending': () => '当前出口健康但尚未取得严格准入，继续观察',
+  'optimization-history-pending': () => '配对历史不足或持续优势未成立，保持当前并继续积累',
 });
 
 // 状态页时间统一附带本地时区标注；保留原始 ISO 便于与日志逐条比对。
@@ -560,6 +561,7 @@ export async function buildStatusSnapshot({
       size: policy?.degradationWindowCycles ?? null,
     },
     lastDecision: state.lastDecision ?? null,
+    lastOptimizationComparison: state.lastOptimizationComparison ?? null,
     candidateScan: state.candidateScan ?? null,
     candidateSnapshot,
     lastCandidateScan: state.lastCandidateScan ?? null,

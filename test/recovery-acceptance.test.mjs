@@ -28,6 +28,7 @@ async function fixture(t, { probe = (node) => node === 'current' ? null : 300,
   Object.assign(config.probes, { urls, controlUrls: [], currentRounds: 2, timeoutMs: 100,
     discoveryTimeoutMs: 100, scanDeadlineMs: 500, preSwitchValidationDeadlineMs: 500 });
   Object.assign(config.policy, { hardFailureConfirmSeconds: 0, postSwitchDelaySeconds: 0,
+    optimizationHistoryEnabled: false,
     partialFailureCycles: 1, latencyFailureCycles: 1, minimumDwellSeconds: 0,
     optimizationIntervalSeconds: 0, emergencySwitchDeadlineMs: 500 });
   config.files = { state: path.join(root, 'state.json'), log: path.join(root, 'unused.ndjson'),

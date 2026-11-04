@@ -277,6 +277,10 @@ test('formatStatus 覆盖预算耗尽、改善不足与样本未采完', async (
       decision: { action: 'hold', reason: 'pre-switch-validation-incomplete' },
       pattern: /样本未采完将重试（pre-switch-validation-incomplete）/,
     },
+    {
+      decision: { action: 'hold', reason: 'optimization-history-pending' },
+      pattern: /配对历史不足或持续优势未成立/,
+    },
   ];
   for (const item of cases) {
     const root = await mkdtemp(path.join(os.tmpdir(), 'mihomo-status-wait-'));

@@ -30,6 +30,7 @@ test('默认策略表反映当前配置，而不把旧评审的值当默认值',
   assert.match(policyTable(), /3000 \/ 3000ms/);
   assert.match(policyTable(), /日常择优 \/ 故障恢复预算.*各600秒内3次/);
   assert.match(policyTable(), /额外安全恢复预算.*600秒内1次/);
+  assert.match(policyTable(), /普通历史择优.*900秒窗口，3次持续配对/);
 });
 
 test('更新历史在现有迭代页保留版本与阶段三列简表', async () => {
@@ -41,7 +42,7 @@ test('更新历史在现有迭代页保留版本与阶段三列简表', async ()
   assert.doesNotMatch(body, /阶段 \/ 版本/);
   assert.ok(body.indexOf('1.8.0') < body.indexOf('1.7.1'));
   for (const label of ['原问题', '主要变化', '本地证据', '投用证据', '后台观察', '限制']) assert.ok(body.includes(`**${label}：**`), label);
-  assert.match(body, /<h3>1\.2 v1\.8 系列<\/h3>/);
+  assert.match(body, /<h3>1\.2 近期版本<\/h3>/);
   assert.match(body, /<h3>1\.3 v1\.7 及更早<\/h3>/);
   assert.equal(pages.length, 4);
 });

@@ -24,6 +24,8 @@ import { evaluateApplicationHealth } from './application-health.mjs';
 import { createProbeScheduler, mapLimit } from './probe-scheduler.mjs';
 import { createSwitchExecutor } from './switch-executor.mjs';
 import { createCandidateService } from './candidate-service.mjs';
+import { createHistoryObservation, mergeOptimizationHistory, evaluateHistoricalCandidate }
+  from './optimization-history.mjs';
 
 const GROUP_TYPES = new Set(['Selector', 'URLTest', 'Fallback', 'LoadBalance']);
 const SELECTION_ADMISSION_VERSION = 1;
@@ -101,7 +103,13 @@ export class Watchdog {
     this.runtime = runtime;
     this.clock = { ...DEFAULT_CLOCK, ...(clock ?? {}) };
     this.activeCandidateScan = null;
-    this.probes = createProbeScheduler({ controller, config, logger: this.log, clock: this.clock });
+    this.historyObservations = [];
+    this.probes = createProbeScheduler({ controller, config, logger: this.log, clock: this.clock,
+      onObservation: (result, timing) => {
+        const row = createHistoryObservation(result, timing, config);
+        if (row) this.historyObservations.push(row);
+        if (this.historyObservations.length > 1024) this.historyObservations.shift();
+      } });
     this.switchExecutor = createSwitchExecutor({
       controller,
       config,
@@ -263,7 +271,11 @@ export class Watchdog {
     const setDecision = (action, reason, details = {}) => {
       state.lastDecision = { at: this.clock.nowIso(), action, reason, ...details };
     };
+    const mergeHistory = () => mergeOptimizationHistory(
+      state, this.historyObservations.splice(0), this.config, this.clock.now(),
+    );
     const persistState = async () => {
+      mergeHistory();
       synchronizeDecisionState(state, this.config.policy, { probes: this.config.probes, now: this.clock.now() });
       if (!dryRun) await saveState(this.config.files.state, state);
     };
@@ -905,7 +917,9 @@ export class Watchdog {
       };
     }
 
-    if (optimizationDue) state.lastOptimizationScanAt = this.clock.nowIso();
+    if (optimizationDue && !this.config.policy.optimizationHistoryEnabled) {
+      state.lastOptimizationScanAt = this.clock.nowIso();
+    }
     setDecision('scan', scanReason);
     let quarantined = getActiveQuarantines(state, this.clock.now());
     const allowProvisionalRecovery = !health.stable;
@@ -952,7 +966,8 @@ export class Watchdog {
         search = cachedSearch;
         const hasResponsiveCandidate = [...cachedSearch.sampled, ...cachedSearch.validated]
           .some((entry) => entry.successes > 0);
-        if (active && (hasResponsiveCandidate || !availabilityRecoveryRequired)) {
+        if (active && (hasResponsiveCandidate || !availabilityRecoveryRequired)
+          && (!this.config.policy.optimizationHistoryEnabled || availabilityRecoveryRequired)) {
           active.invalidated = true;
           active.invalidatedReason = 'fresh-candidate-snapshot-used';
           active.cancel?.();
@@ -1080,11 +1095,45 @@ export class Watchdog {
       });
     }
     const provisionalCandidateNames = new Set(provisionalCandidates.map((entry) => entry.node));
+    const historicalOptimization = this.config.policy.optimizationHistoryEnabled === true
+      && !availabilityRecoveryRequired;
+    const rankByHistory = async (entries, stage) => {
+      mergeHistory();
+      const evaluated = [];
+      for (const entry of entries) {
+        const evidence = evaluateHistoricalCandidate(state, currentLeaf, entry.node, this.config, this.clock.now());
+        if (evidence.eligible && await this.resolveLeaf(entry.node) !== entry.node) {
+          evidence.eligible = false;
+          evidence.reason = 'dynamic-candidate-history-unbound';
+        }
+        evaluated.push({ entry: { ...entry, historicalComparison: evidence }, evidence });
+      }
+      state.lastOptimizationComparison = { at: this.clock.nowIso(), currentLeaf, stage,
+        candidates: evaluated.slice(0, this.config.probes.maxValidationCandidates)
+          .map(({ entry, evidence }) => ({ node: entry.node, ...evidence })) };
+      await this.log('info', 'historical-optimization-evaluated', { decisionId, ...state.lastOptimizationComparison });
+      return evaluated.filter(row => row.evidence.eligible).map(row => row.entry)
+        .sort((a, b) => b.historicalComparison.candidate.successRate - a.historicalComparison.candidate.successRate
+          || a.historicalComparison.candidate.score - b.historicalComparison.candidate.score);
+    };
+    if (historicalOptimization) {
+      const pool = [...new Map([...candidates, ...(search.validated ?? [])]
+        .map(entry => [entry.node, entry])).values()]
+        .filter(entry => entry.node !== currentLeaf && entry.successes > 0 && !quarantined.has(entry.node));
+      candidates = (await rankByHistory(pool, 'history')).slice(0, this.config.probes.topCandidates);
+      if (candidates.length === 0) {
+        setDecision('hold', 'optimization-history-pending');
+        await persistState();
+        return { status: 'optimization-history-pending', current,
+          backgroundWake: this.activeCandidateScan?.promise ?? null };
+      }
+      if (optimizationDue) state.lastOptimizationScanAt = this.clock.nowIso();
+    }
     const meaningfulImprovementRequired = !availabilityRecoveryRequired
       && (!selectionAdmissionRejected || health.stable) && candidates.length > 0
       && (health.status === 'latency-degraded' || rollingDegradationTriggered
         || optimizationDue || (forceScan && health.stable));
-    if (meaningfulImprovementRequired) {
+    if (meaningfulImprovementRequired && !historicalOptimization) {
       const improvement = Math.min(
         this.config.policy.minimumImprovementMs,
         current.averageMs * this.config.policy.minimumImprovementRatio,
@@ -1144,6 +1193,11 @@ export class Watchdog {
 
     let preSwitchValidationIncomplete = false;
     if (backgroundScan && candidates.length > 0) {
+      if (historicalOptimization && this.activeCandidateScan && !this.activeCandidateScan.completed) {
+        this.activeCandidateScan.invalidated = true;
+        this.activeCandidateScan.invalidatedReason = 'historical-optimization-live-validation';
+        this.activeCandidateScan.cancel?.();
+      }
       const decisionStartedAt = this.clock.now();
       const preSwitchRounds = emergencyRecovery ? 1 : Math.max(2, this.config.probes.validationRounds);
       // 普通复核也要容纳逐节点串行样本及并发批次，不能把未采完当作节点失败。
@@ -1367,10 +1421,11 @@ export class Watchdog {
             });
             continue;
           }
-          const admissionThresholds = provisionalCandidateNames.has(nextCandidate.node)
+          const useCurrentThresholds = !historicalOptimization && provisionalCandidateNames.has(nextCandidate.node);
+          const admissionThresholds = useCurrentThresholds
             ? this.currentThresholds()
             : this.candidateThresholds();
-          const admittedEvidence = verification && (provisionalCandidateNames.has(nextCandidate.node)
+          const admittedEvidence = verification && (useCurrentThresholds
             ? hasCompleteProbeRounds(verification, this.config.probes.urls, 1)
               && isStableAcrossRounds(verification, admissionThresholds)
             : hasStrictAdmissionEvidence(verification, this.config.probes, admissionThresholds));
@@ -1386,7 +1441,7 @@ export class Watchdog {
             );
             await this.log('warn', 'candidate-pre-switch-rejected', {
               node: nextCandidate.node,
-              profile: provisionalCandidateNames.has(nextCandidate.node) ? 'current-health' : 'strict',
+              profile: useCurrentThresholds ? 'current-health' : 'strict',
               kind: 'quality',
               decisionId,
               source: search.source ?? 'live-scan',
@@ -1403,7 +1458,7 @@ export class Watchdog {
             });
             continue;
           }
-          const admissionProfile = provisionalCandidateNames.has(nextCandidate.node)
+          const admissionProfile = useCurrentThresholds
             ? 'current-health' : 'strict';
           admitted.push({ ...nextCandidate, preSwitchVerification: verification, admissionProfile });
           await this.log('info', 'candidate-pre-switch-admitted', {
@@ -1428,6 +1483,14 @@ export class Watchdog {
           return (profileOrder[left.admissionProfile] - profileOrder[right.admissionProfile])
             || compareAvailability(left.preSwitchVerification, right.preSwitchVerification);
         });
+        if (historicalOptimization) {
+          candidates = await rankByHistory(candidates, 'pre-switch');
+          if (!candidates.length && admitted.length > 0) {
+            setDecision('hold', 'optimization-history-pending');
+            await persistState();
+            return { status: 'optimization-history-pending', current };
+          }
+        }
       }
     }
 

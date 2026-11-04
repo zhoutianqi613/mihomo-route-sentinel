@@ -38,7 +38,7 @@ export async function waitUntil(promise, deadlineAt, message, clock = null) {
   });
 }
 
-export function createProbeScheduler({ controller, config, logger, clock } = {}) {
+export function createProbeScheduler({ controller, config, logger, clock, onObservation = () => {} } = {}) {
   const probeClock = {
     now: typeof clock?.now === 'function' ? clock.now : Date.now,
     setTimeout: typeof clock?.setTimeout === 'function' ? clock.setTimeout : setTimeout,
@@ -133,19 +133,23 @@ export function createProbeScheduler({ controller, config, logger, clock } = {})
 
   const probeNode = async (node, rounds, urls, { timeoutMs = config.probes.timeoutMs } = {}) => {
     const samples = [];
+    let startedAt = null;
     for (let round = 1; round <= rounds; round += 1) {
       for (const url of urls) {
         try {
           const delay = await scheduler.requestNodeDelay(
-            node, url, timeoutMs, now() + timeoutMs,
+            node, url, timeoutMs, now() + timeoutMs, { onStart: () => { startedAt ??= now(); } },
           );
           samples.push({ round, url, ok: true, delay });
         } catch (error) {
-          samples.push({ round, url, ok: false, error: error.status ?? error.message });
+          samples.push({ round, url, ok: false, error: error.status ?? error.code ?? error.message });
         }
       }
     }
-    return summarizeSamples(node, samples);
+    const result = summarizeSamples(node, samples);
+    onObservation(result, { at: startedAt === null ? NaN : (startedAt + now()) / 2,
+      timeoutMs, fullTimeout: true });
+    return result;
   };
 
   const probeCandidatesInParallel = async (nodes, rounds, urls, deadlineAt, {
@@ -159,10 +163,13 @@ export function createProbeScheduler({ controller, config, logger, clock } = {})
     let peakConcurrency = 0;
     let startedAttempts = 0;
     let completedAttempts = 0;
+    const timings = new Map();
     // 同一节点的多轮/多 URL 探测必须串行，避免 Mihomo 同时对一个节点执行多个 URLTest 时互相争用；
     // 不同节点仍由 parallelism 控制并发，从而在截止内优先完整验证排名靠前的节点。
     const samplesByNode = await mapLimit(uniqueNodes, config.probes.parallelism, async (node) => {
       const nodeSamples = [];
+      let startedAt = null;
+      let fullTimeout = true;
       for (let round = 1; round <= rounds; round += 1) {
         for (const url of urls) {
           if (now() >= deadlineAt || signal?.aborted) {
@@ -172,11 +179,13 @@ export function createProbeScheduler({ controller, config, logger, clock } = {})
           }
           const remainingMs = Math.max(1, deadlineAt - now());
           const effectiveTimeoutMs = Math.max(1, Math.min(timeoutMs, remainingMs));
+          if (effectiveTimeoutMs < timeoutMs) fullTimeout = false;
           try {
             const delay = await scheduler.requestNodeDelay(
               node, url, effectiveTimeoutMs, Math.min(deadlineAt, now() + effectiveTimeoutMs),
               { background, candidate: true, signal,
                 onStart: () => {
+                  startedAt ??= now();
                   active += 1;
                   startedAttempts += 1;
                   peakConcurrency = Math.max(peakConcurrency, active);
@@ -197,6 +206,8 @@ export function createProbeScheduler({ controller, config, logger, clock } = {})
           }
         }
       }
+      timings.set(node, { at: startedAt === null ? NaN : (startedAt + now()) / 2,
+        timeoutMs, fullTimeout });
       return nodeSamples;
     });
     const samples = samplesByNode.flat();
@@ -204,6 +215,7 @@ export function createProbeScheduler({ controller, config, logger, clock } = {})
       node,
       samples.filter((sample) => sample.node === node),
     ));
+    for (const result of results) onObservation(result, timings.get(result.node));
     Object.defineProperty(results, 'probeStats', {
       enumerable: false,
       value: {
