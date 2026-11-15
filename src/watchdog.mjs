@@ -1342,6 +1342,10 @@ export class Watchdog {
             }
             state.currentSelection = emergencyCandidate.node;
             state.currentLeaf = await this.resolveLeaf(emergencyCandidate.node);
+            // 连续失败属于旧出口，成功接管后须从新节点重新累计。
+            state.consecutiveFailures = 0;
+            state.consecutivePartialFailures = 0;
+            state.consecutiveLatencyFailures = 0;
             recordEvaluation(emergencyCandidate,
               classifyHealth(emergencyCandidate, this.currentThresholds(), this.config.policy),
               emergencyCandidate.node, state.currentLeaf);

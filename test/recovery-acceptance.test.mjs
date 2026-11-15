@@ -16,7 +16,7 @@ function history(budgetClass, count = 3) {
 
 async function fixture(t, { probe = (node) => node === 'current' ? null : 300,
   state: overrides = {}, selectError = null, beforeSwitch = async () => {},
-  guardTimeoutMs } = {}) {
+  guardTimeoutMs, candidateNodes = ['candidate'] } = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'sentinel-p0-acceptance-'));
   t.after(() => {
     assert.equal(path.dirname(path.resolve(root)), path.resolve(os.tmpdir()));
@@ -48,8 +48,8 @@ async function fixture(t, { probe = (node) => node === 'current' ? null : 300,
   const events = [];
   const controller = {
     async getProxy(name) {
-      if (name === 'target') return { type: 'Selector', now: selected, all: ['current', 'candidate'] };
-      if (name === 'candidates') return { type: 'URLTest', all: ['current', 'candidate'] };
+      if (name === 'target') return { type: 'Selector', now: selected, all: ['current', ...candidateNodes] };
+      if (name === 'candidates') return { type: 'URLTest', all: ['current', ...candidateNodes] };
       return { type: 'Shadowsocks' };
     },
     async getDelay(node, url, timeoutMs) {
@@ -70,6 +70,101 @@ async function fixture(t, { probe = (node) => node === 'current' ? null : 300,
   return { config, controller, create, switches, events,
     readState: async () => JSON.parse(await readFile(config.files.state, 'utf8')) };
 }
+
+for (const failure of ['partial', 'hard']) {
+  test(`应急切换成功后清零旧节点的连续失败计数：${failure}`, async (t) => {
+    const f = await fixture(t, {
+      probe: (node, url, count) => node !== 'current' ? 300
+        : (failure === 'hard' || count % 4 === 0 ? null : 300),
+      state: { consecutiveFailures: 1, consecutivePartialFailures: 1, consecutiveLatencyFailures: 3 },
+    });
+    f.config.policy.partialFailureCycles = 2;
+
+    const result = await f.create().runOnce({ dryRun: false, backgroundScan: true });
+
+    assert.equal(result.status, 'emergency-fallback');
+    assert.deepEqual(f.switches, ['candidate']);
+    const state = await f.readState();
+    assert.equal(state.consecutiveFailures, 0);
+    assert.equal(state.consecutivePartialFailures, 0);
+    assert.equal(state.consecutiveLatencyFailures, 0);
+    assert.equal(state.decisionState.budget.recovery.used, 1);
+    assert.equal(state.lastSwitch.verified, false);
+    assert.equal(state.provisionalFallback.requiresStrictAdmission, true);
+  });
+}
+
+test('应急新节点首次部分失败等待，连续第二次失败仍恢复并保留预算', async (t) => {
+  const f = await fixture(t, {
+    candidateNodes: ['candidate', 'next'],
+    probe: (node, url, count, switches) =>
+      (node === 'current' || (node === 'candidate' && switches.length > 0)) && count % 4 === 0
+        ? null : 300,
+    state: { consecutiveFailures: 1, consecutivePartialFailures: 1 },
+  });
+  f.config.policy.partialFailureCycles = 2;
+  const watchdog = f.create();
+  assert.equal((await watchdog.runOnce({ dryRun: false, backgroundScan: true })).status, 'emergency-fallback');
+  const state = await f.readState();
+  state.candidateSnapshot = { ...state.candidateSnapshot, at: new Date().toISOString(),
+    selection: 'candidate', leaf: 'candidate',
+    candidates: [{ ...state.candidateSnapshot.candidates[0], node: 'next' }] };
+  await writeFile(f.config.files.state, JSON.stringify(state));
+
+  const firstFailure = await watchdog.runOnce({ dryRun: false, backgroundScan: true });
+
+  assert.equal(firstFailure.status, 'transient');
+  assert.deepEqual(f.switches, ['candidate']);
+  const pending = await f.readState();
+  assert.equal(pending.consecutivePartialFailures, 1);
+  assert.equal(pending.decisionState.budget.recovery.used, 1);
+  const secondFailure = await watchdog.runOnce({ dryRun: false, backgroundScan: true });
+  assert.equal(secondFailure.status, 'emergency-fallback');
+  assert.deepEqual(f.switches, ['candidate', 'next']);
+  const recovered = await f.readState();
+  assert.equal(recovered.consecutivePartialFailures, 0);
+  assert.equal(recovered.decisionState.budget.recovery.used, 2);
+  assert.equal(recovered.decisionState.budget.rescue.used, 0);
+});
+
+test('应急新节点真实硬故障仍可立即恢复', async (t) => {
+  const f = await fixture(t, {
+    candidateNodes: ['candidate', 'next'],
+    probe: (node, url, count, switches) => node === 'current'
+      || (node === 'candidate' && switches.length > 0) ? null : 300,
+  });
+  f.config.policy.partialFailureCycles = 2;
+  const watchdog = f.create();
+  assert.equal((await watchdog.runOnce({ dryRun: false, backgroundScan: true })).status, 'emergency-fallback');
+  const state = await f.readState();
+  state.candidateSnapshot = { ...state.candidateSnapshot, at: new Date().toISOString(),
+    selection: 'candidate', leaf: 'candidate',
+    candidates: [{ ...state.candidateSnapshot.candidates[0], node: 'next' }] };
+  await writeFile(f.config.files.state, JSON.stringify(state));
+
+  const result = await watchdog.runOnce({ dryRun: false, backgroundScan: true });
+
+  assert.equal(result.status, 'emergency-fallback');
+  assert.deepEqual(f.switches, ['candidate', 'next']);
+  assert.equal((await f.readState()).decisionState.budget.recovery.used, 2);
+});
+
+test('应急选择抛错时保留旧节点失败计数与已预留预算', async (t) => {
+  const f = await fixture(t, {
+    probe: (node, url, count) => node === 'current' && count % 4 === 0 ? null : 300,
+    state: { consecutiveFailures: 1, consecutivePartialFailures: 1 },
+    selectError: () => { throw new Error('模拟选择失败'); },
+  });
+  f.config.policy.partialFailureCycles = 2;
+
+  await assert.rejects(f.create().runOnce({ dryRun: false, backgroundScan: true }), /模拟选择失败/);
+
+  const state = await f.readState();
+  assert.equal(state.currentSelection, 'current');
+  assert.equal(state.consecutiveFailures, 2);
+  assert.equal(state.consecutivePartialFailures, 2);
+  assert.equal(state.decisionState.budget.recovery.used, 1);
+});
 
 test('P0：择优预算耗尽后仍可使用独立恢复预算', async (t) => {
   const f = await fixture(t, { state: { switchHistory: history('optimization') } });
