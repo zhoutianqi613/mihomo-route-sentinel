@@ -1167,6 +1167,51 @@ test('periodic optimization keeps an acceptable node when improvement is insuffi
   assert.deepEqual(mock.switches, []);
 });
 
+test('暂停周期择优时保持可用出口，真实故障仍可使用恢复预算', async (t) => {
+  let currentFailed = false;
+  const mock = await startMockController({ initialSelected: 'acceptable-node',
+    candidates: ['acceptable-node', 'faster-node'],
+    delayResolver: ({ name }) => name === 'acceptable-node' ? (currentFailed ? null : 650) : 100,
+  });
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  config.policy.optimizationIntervalSeconds = 0;
+  await writeFile(config.files.state, JSON.stringify({ currentSelection: 'acceptable-node', currentLeaf: 'acceptable-node',
+    selectionAdmissionVersion: 1, selectionAdmission: { profile: 'strict', selection: 'acceptable-node', leaf: 'acceptable-node' },
+    lastOptimizationScanAt: new Date(0).toISOString() }));
+  const watchdog = new Watchdog({ controller: new MihomoController(config.controller, {}), config, logger: async () => {} });
+  const warmup = await watchdog.runOnce({ dryRun: false, backgroundScan: true });
+  await warmup.backgroundWake;
+  await watchdog.runOnce({ dryRun: false, backgroundScan: true });
+  assert.deepEqual(mock.switches, []);
+  currentFailed = true;
+  await watchdog.runOnce({ dryRun: false, backgroundScan: true });
+  assert.deepEqual(mock.switches, ['faster-node']);
+  const state = JSON.parse(await readFile(config.files.state, 'utf8'));
+  assert.equal(state.switchHistory.filter(row => row.budgetClass === 'recovery').length, 1);
+  assert.equal(state.switchHistory.filter(row => row.budgetClass === 'optimization').length, 0);
+});
+
+test('故障恢复不能从旧快照重新选入显式排除的俄罗斯节点', async (t) => {
+  const blocked = '🇷🇺 俄罗斯 01 [D]';
+  const mock = await startMockController({ candidates: ['bad-node', blocked, 'good-node'],
+    delayResolver: ({ name }) => name === 'bad-node' ? null : name === blocked ? 50 : 200 });
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  config.probes.excludeRegex = '俄罗斯|Russia|🇷🇺';
+  await writeFile(config.files.state, JSON.stringify({ candidateSnapshot: { at: new Date().toISOString(),
+    selection: 'bad-node', leaf: 'bad-node', durationMs: 1, candidates: [{ node: blocked,
+      profile: 'strict', attempts: 4, successes: 4, successRate: 1, averageMs: 50, maxMs: 50 }], sampled: [] } }));
+  const watchdog = new Watchdog({ controller: new MihomoController(config.controller, {}), config, logger: async () => {} });
+  const first = await watchdog.runOnce({ dryRun: false, backgroundScan: true });
+  if (first.status !== 'emergency-fallback') {
+    await first.backgroundWake;
+    await watchdog.runOnce({ dryRun: false, backgroundScan: true });
+  }
+  assert.deepEqual(mock.switches, ['good-node']);
+  assert.equal([...mock.probeCounts.keys()].some(key => key.startsWith(blocked + '\u0000')), false);
+});
+
 test('adaptive validation continues past a noisy first batch', async (t) => {
   const noisy = ['noisy-1', 'noisy-2', 'noisy-3'];
   const mock = await startMockController({

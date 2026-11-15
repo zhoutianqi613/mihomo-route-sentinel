@@ -244,6 +244,31 @@ test('legacy candidate snapshots restore uncertainty-aware ranking fields', () =
   assert.equal(Number.isFinite(restored.stable[0].latencyUpperMs), true);
 });
 
+for (const field of ['candidates', 'sampled']) {
+  test(`名称策略收紧后拒绝复用含俄罗斯节点的${field}快照`, () => {
+    const { service, config, clock } = createHarness();
+    const snapshot = { at: clock.nowIso(), selection: 'current', leaf: 'current', candidates: [], sampled: [],
+      [field]: [{ node: '🇷🇺 俄罗斯 01 [D]', profile: 'strict', attempts: 4, successes: 4, successRate: 1, averageMs: 100 }] };
+    config.probes.excludeRegex = '俄罗斯|Russia|🇷🇺';
+    assert.equal(service.searchFromCandidateSnapshot(snapshot, 'current', 'current'), null);
+    config.probes.excludeRegex = '';
+    config.probes.includeRegex = '日本';
+    assert.equal(service.searchFromCandidateSnapshot(snapshot, 'current', 'current'), null);
+  });
+}
+
+test('俄罗斯显式排除独立于地区白名单，并在审计中优先解释', async () => {
+  const { service, config } = createHarness({ candidates: ['🇷🇺 俄罗斯 01 [D]', '日本 01'],
+    responses: [withProbeStats([], { method: 'per-node' }), withProbeStats([], { method: 'per-node' })] });
+  config.probes.includeRegex = '日本';
+  config.probes.excludeRegex = '(俄罗斯|俄国|Russia|🇷🇺|(?:^|[^A-Za-z])RU(?:[^A-Za-z]|$))';
+  const result = await service.findCandidates('current');
+  assert.deepEqual(result.audit.find(row => /俄罗斯/.test(row.node)).reasons, ['exclude-regex']);
+  config.probes.includeRegex = '';
+  assert.deepEqual(service.filterCandidates(['俄罗斯01', 'Russia 01', 'Russian 02', 'RU01', '🇷🇺 节点', '日本 01', 'Brunei 01', 'Peru 01'], 'current'),
+    ['日本 01', 'Brunei 01', 'Peru 01']);
+});
+
 test('searchFromCandidateSnapshot inflates missing metrics and preserves probe stats', () => {
   const clock = createFakeClock();
   const { service } = createHarness({ clock });

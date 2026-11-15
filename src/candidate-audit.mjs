@@ -32,9 +32,9 @@ export function buildCandidateScanAudit({ source, currentLeaf, excludedNodes, co
     let status;
     let reasons;
     if (node === currentLeaf) reasons = ['current-node'];
+    else if (exclude?.test(node)) reasons = ['exclude-regex'];
     else if (excludedNodes.has(node)) reasons = ['excluded-node'];
     else if (include && !include.test(node)) reasons = ['include-regex'];
-    else if (exclude?.test(node)) reasons = ['exclude-regex'];
     if (reasons) status = 'filtered';
     else if (!discovery) { status = 'not-measured'; reasons = ['not-measured']; }
     else if (discovery.successes <= 0) {

@@ -129,6 +129,10 @@ export function createCandidateService({
       const ageMs = clock.now() - Date.parse(snapshot.at ?? '');
       if (!Number.isFinite(ageMs)
           || ageMs > config.policy.candidateSnapshotMaxAgeSeconds * 1000) return null;
+      // 名称策略收紧后，旧快照不能把已排除节点重新带入应急候选池。
+      const cachedNodes = new Set([...(snapshot.candidates ?? []), ...(snapshot.sampled ?? [])]
+        .map((entry) => entry.node));
+      if (service.filterCandidates([...cachedNodes], leaf).length !== cachedNodes.size) return null;
       const inflate = (entry) => ({
         ...entry,
         successLowerBound: Number.isFinite(entry.successLowerBound)
