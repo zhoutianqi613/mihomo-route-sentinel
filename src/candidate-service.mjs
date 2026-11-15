@@ -9,6 +9,7 @@ import {
 } from './health-policy.mjs';
 import { latencyUpperBound, wilsonLowerBound } from './estimator.mjs';
 import { waitUntil } from './probe-scheduler.mjs';
+import { buildCandidateScanAudit } from './candidate-audit.mjs';
 
 const REAL_CLOCK = Object.freeze({
   now: () => Date.now(),
@@ -86,6 +87,8 @@ export function createCandidateService({
     createCandidateSnapshot(search, selection, leaf) {
       const compact = (result) => ({
         node: result.node,
+        startedAt: result.startedAt ?? null,
+        completedAt: result.completedAt ?? null,
         attempts: result.attempts,
         successes: result.successes,
         successRate: result.successRate,
@@ -109,6 +112,7 @@ export function createCandidateService({
         deadlineMs: search.deadlineMs,
         deadlineReached: search.deadlineReached,
         scanId: search.scanId ?? null,
+        audit: search.audit ?? [],
         probeStats: search.probeStats ?? null,
         candidates: (search.validated ?? []).map((entry) => ({
           ...compact(entry),
@@ -150,7 +154,8 @@ export function createCandidateService({
         validated,
         sampled: (snapshot.sampled ?? []).map(inflate),
         rejected: validated.filter((entry) => entry.profile === 'rejected')
-          .map((entry) => ({ node: entry.node, reasons: ['cached-rejected'] })),
+          .map((entry) => ({ node: entry.node, reasons: snapshot.audit?.find(row => row.node === entry.node)?.reasons ?? ['cached-rejected'] })),
+        audit: snapshot.audit ?? [],
         durationMs: snapshot.durationMs,
         deadlineMs: snapshot.deadlineMs,
         deadlineReached: snapshot.deadlineReached,
@@ -299,6 +304,9 @@ export function createCandidateService({
       const rejected = validated
         .filter((result) => !stable.includes(result) && !provisional.includes(result))
         .map((result) => ({ node: result.node, ...explainRoundStability(result, candidateThresholds()) }));
+      const audit = buildCandidateScanAudit({ source: source.all, currentLeaf, excludedNodes, config,
+        sampled: quickResults, ranked, validated, stable, provisional, thresholds: candidateThresholds() });
+      await logger('info', 'candidate-scan-audited', { scanId, at: clock.nowIso(), nodes: audit });
       await logger('info', 'candidate-validation-completed', {
         validatedCount: validated.length,
         stable: stable.map((result) => ({
@@ -328,6 +336,7 @@ export function createCandidateService({
         stable,
         provisional,
         sampled: quickResults,
+        audit,
         validated,
         rejected,
         probeStats: {

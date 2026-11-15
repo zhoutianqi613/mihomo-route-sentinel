@@ -70,6 +70,8 @@ test('候选扫描仅探测候选，逐节点串行采集全部轮次与业务 U
   assert.equal(result.probeStats.discovery.controllerRequests, 6);
   assert.equal(result.probeStats.validation.controllerRequests, 8);
   for (const candidate of result.stable) {
+    assert.ok(Number.isFinite(Date.parse(candidate.startedAt)));
+    assert.ok(Date.parse(candidate.completedAt) >= Date.parse(candidate.startedAt));
     assert.equal(candidate.samples.length, 4);
     assert.deepEqual(candidate.samples.map(({ round }) => round), [1, 1, 2, 2]);
     assert.deepEqual(calls.get(candidate.node), [

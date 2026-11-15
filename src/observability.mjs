@@ -1,6 +1,7 @@
 import { appendFile, mkdir, open, readFile, rename, stat, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { synchronizeDecisionState } from './decision-state.mjs';
+import { candidateReasonLabels } from './candidate-audit.mjs';
 
 export const DEFAULT_LOGGING = Object.freeze({
   maxBytes: 30 * 1024 * 1024,
@@ -458,9 +459,27 @@ export async function buildStatusSnapshot({
           ? state.candidateSnapshot.candidates.length : 0,
         selection: state.candidateSnapshot.selection ?? null,
         leaf: state.candidateSnapshot.leaf ?? null,
+        matchesCurrent: state.candidateSnapshot.selection === current.selected
+          && state.candidateSnapshot.leaf === current.leaf,
+        audit: (state.candidateSnapshot.audit ?? []).map(row => ({ ...row,
+          actionReason: ['strict', 'current-health'].includes(row.status)
+            && state.candidateSnapshot.selection === current.selected && state.candidateSnapshot.leaf === current.leaf
+            && Number.isFinite(candidateSnapshotAgeMs)
+            && candidateSnapshotAgeMs <= (policy?.candidateSnapshotMaxAgeSeconds ?? 0) * 1000
+            && Date.parse(state.lastDecision?.at ?? '') >= Date.parse(state.candidateSnapshot.at ?? '')
+            ? state.lastDecision.reason : null,
+        })),
         probeStats: state.candidateSnapshot.probeStats ?? null,
       }
     : null;
+  const comparisonAgeMs = Date.now() - Date.parse(state.lastCandidateComparison?.at ?? '');
+  const lastCandidateComparison = state.lastCandidateComparison ? {
+    ...state.lastCandidateComparison,
+    ageMs: Number.isFinite(comparisonAgeMs) ? Math.max(0, comparisonAgeMs) : null,
+    fresh: Number.isFinite(comparisonAgeMs) && comparisonAgeMs <= (policy?.candidateSnapshotMaxAgeSeconds ?? 0) * 1000,
+    matchesCurrent: state.lastCandidateComparison.selection === current.selected
+      && state.lastCandidateComparison.leaf === current.leaf,
+  } : null;
   const quarantinedNodes = activeQuarantines(state.quarantinedNodes);
   const externalSelectionAdmission = state.externalSelectionPendingAdmission
     ? {
@@ -565,6 +584,7 @@ export async function buildStatusSnapshot({
     candidateScan: state.candidateScan ?? null,
     candidateSnapshot,
     lastCandidateScan: state.lastCandidateScan ?? null,
+    lastCandidateComparison,
     provisionalFallback: state.provisionalFallback ?? null,
     lastSwitch: state.lastSwitch ? { at: state.lastSwitchAt ?? null, ...state.lastSwitch } : null,
     lastSelectionNormalization: state.lastSelectionNormalization ?? null,
@@ -577,6 +597,36 @@ export async function buildStatusSnapshot({
 
 function display(value, suffix = '') {
   return value === null || value === undefined ? '-' : `${value}${suffix}`;
+}
+
+function candidateEvidenceText(evidence) {
+  if (!evidence) return '未测';
+  const rate = evidence.successRate == null ? '-' : `${Math.round(evidence.successRate * 100)}%`;
+  return `采样 ${localTimeText(evidence.startedAt)}～${localTimeText(evidence.completedAt)}，${rate}，均 ${display(evidence.averageMs, ' ms')}，最大 ${display(evidence.maxMs, ' ms')}`;
+}
+
+function candidateAuditLines(snapshot) {
+  const scan = snapshot.candidateSnapshot;
+  const labels = { filtered: '未参选', strict: '严格合格', 'current-health': '仅满足健康线',
+    rejected: '严格复测不合格' };
+  const reasonText = reasons => (reasons ?? []).map(reason => candidateReasonLabels[reason] ?? reason).join('、');
+  const lines = [];
+  if (scan?.audit?.length) {
+    lines.push(`逐节点扫描审计 : ${localTimeText(scan.at)}，${scan.fresh ? '时效内' : '已过期'}，${scan.matchesCurrent ? '当前出口记录' : '旧出口记录'}；合格不等于已选中，本轮行动见最近决策`);
+    for (const row of scan.audit) {
+      lines.push(`  ${row.node} : ${labels[row.status] ?? candidateReasonLabels[row.status] ?? row.status}${row.reasons?.length ? `（${reasonText(row.reasons)}）` : ''}${row.actionReason ? `；本轮行动 ${candidateReasonLabels[row.actionReason] ?? row.actionReason}` : ''}；初筛 ${candidateEvidenceText(row.discovery)}；复测 ${candidateEvidenceText(row.validation)}`);
+    }
+  }
+  const comparison = snapshot.lastCandidateComparison;
+  if (comparison) {
+    lines.push(`最近切前比较   : ${localTimeText(comparison.at)}，${display(comparison.stage)}，${comparison.fresh ? '时效内' : '已过期'}，${comparison.matchesCurrent ? '当前出口记录' : '旧出口记录'}；首选 ${display(comparison.preferredNode)}（首选不等于已执行）`);
+    lines.push(`  比较时当前节点 ${comparison.current?.node} : ${candidateEvidenceText(comparison.current)}`);
+    for (const row of comparison.candidates ?? []) {
+      const outcome = row.rank === 1 ? '本次首选' : row.rank ? `本次排名靠后（第${row.rank}）` : '本次拒绝';
+      lines.push(`  ${row.node} : ${outcome}${row.reasons?.length ? `（${reasonText(row.reasons)}）` : ''}；${candidateEvidenceText(row.evidence)}`);
+    }
+  }
+  return lines;
 }
 
 export function formatStatus(snapshot) {
@@ -679,6 +729,7 @@ export function formatStatus(snapshot) {
     `等待原因       : ${waitReasonText(snapshot.lastDecision)}`,
     `后台候选扫描   : ${activeScanText}`,
     `候选快照       : ${candidateSnapshotText}`,
+    ...candidateAuditLines(snapshot),
     `最近候选扫描   : ${scanText}`,
     `淘汰原因聚合   : ${rejectedReasonsText || '无'}`,
     `候选探测负载   : ${probeLoadText}`,

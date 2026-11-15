@@ -147,6 +147,8 @@ export function createProbeScheduler({ controller, config, logger, clock, onObse
       }
     }
     const result = summarizeSamples(node, samples);
+    result.startedAt = startedAt === null ? null : new Date(startedAt).toISOString();
+    result.completedAt = new Date(now()).toISOString();
     onObservation(result, { at: startedAt === null ? NaN : (startedAt + now()) / 2,
       timeoutMs, fullTimeout: true });
     return result;
@@ -206,7 +208,7 @@ export function createProbeScheduler({ controller, config, logger, clock, onObse
           }
         }
       }
-      timings.set(node, { at: startedAt === null ? NaN : (startedAt + now()) / 2,
+      timings.set(node, { startedAt, completedAt: now(), at: startedAt === null ? NaN : (startedAt + now()) / 2,
         timeoutMs, fullTimeout });
       return nodeSamples;
     });
@@ -215,7 +217,12 @@ export function createProbeScheduler({ controller, config, logger, clock, onObse
       node,
       samples.filter((sample) => sample.node === node),
     ));
-    for (const result of results) onObservation(result, timings.get(result.node));
+    for (const result of results) {
+      const timing = timings.get(result.node);
+      result.startedAt = timing.startedAt === null ? null : new Date(timing.startedAt).toISOString();
+      result.completedAt = new Date(timing.completedAt).toISOString();
+      onObservation(result, timing);
+    }
     Object.defineProperty(results, 'probeStats', {
       enumerable: false,
       value: {

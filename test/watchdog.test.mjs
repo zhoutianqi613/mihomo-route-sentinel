@@ -1601,6 +1601,29 @@ test('background mode rejects a stale fast candidate before changing routes', as
   assert.equal(events.some((entry) => entry.event === 'candidate-pre-switch-rejected'), true);
 });
 
+test('普通切前比较保存合格者排名与拒绝者证据，仍按既有规则选点', async (t) => {
+  const mock = await startMockController({ initialSelected: 'degraded-node',
+    candidates: ['degraded-node', 'fast', 'slower', 'noisy'],
+    delayResolver: ({ name, probeCount }) => name === 'degraded-node' ? 1500
+      : name === 'fast' ? 100 : name === 'slower' ? 200 : probeCount <= 3 ? 50 : 900,
+  });
+  t.after(() => mock.server.close());
+  const config = await makeConfig(mock.url);
+  const watchdog = new Watchdog({ controller: new MihomoController(config.controller, {}), config, logger: async () => {} });
+  const first = await watchdog.runOnce({ dryRun: false, backgroundScan: true });
+  await first.backgroundWake;
+  await watchdog.runOnce({ dryRun: false, backgroundScan: true });
+  const state = JSON.parse(await readFile(config.files.state, 'utf8'));
+  const comparison = state.lastCandidateComparison;
+  assert.equal(comparison.stage, 'strict');
+  assert.equal(comparison.preferredNode, 'fast');
+  assert.equal(comparison.candidates.find(row => row.node === 'slower').rank, 2);
+  assert.deepEqual(comparison.candidates.find(row => row.node === 'noisy').reasons, ['average-latency']);
+  assert.equal(comparison.candidates.length, 3);
+  assert.deepEqual(mock.switches, ['fast']);
+  assert.equal(state.switchHistory.filter(row => row.budgetClass === 'optimization').length, 1);
+});
+
 test('后台切前门禁拒绝不占用实际切换次数', async (t) => {
   const mock = await startMockController({
     candidates: ['bad-node', 'stale-a', 'stale-b', 'good-node'],
@@ -1755,6 +1778,15 @@ test('硬故障没有 100% 候选时在一秒内切到成功率最高节点', as
   const state = JSON.parse(await readFile(config.files.state, 'utf8'));
   assert.equal(state.provisionalFallback.profile, 'emergency-best-effort');
   assert.equal(state.lastSwitch.verified, false);
+  const comparisons = events.filter(entry => entry.event === 'candidate-live-compared');
+  assert.deepEqual(comparisons.map(entry => entry.details.stage), ['emergency-fast', 'emergency-recovery']);
+  const comparison = state.lastCandidateComparison;
+  assert.equal(comparison.preferredNode, 'partial-best');
+  assert.equal(comparison.current.node, 'bad-node');
+  assert.equal(comparison.candidates.find(row => row.node === 'partial-worse').outcome, 'ranked-behind');
+  assert.equal(comparison.candidates.find(row => row.node === 'partial-best').rank, 1);
+  assert.ok(comparison.candidates.every(row => row.evidence.startedAt && row.evidence.completedAt));
+  assert.doesNotMatch(JSON.stringify(comparison), /https:|service-a|service-b/);
 });
 
 test('紧急降级在所有候选成功率为零时不制造无收益切换', async (t) => {

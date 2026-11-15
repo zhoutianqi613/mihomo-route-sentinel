@@ -24,6 +24,7 @@ import { evaluateApplicationHealth } from './application-health.mjs';
 import { createProbeScheduler, mapLimit } from './probe-scheduler.mjs';
 import { createSwitchExecutor } from './switch-executor.mjs';
 import { createCandidateService } from './candidate-service.mjs';
+import { buildLiveCandidateComparison } from './candidate-audit.mjs';
 import { createHistoryObservation, mergeOptimizationHistory, evaluateHistoricalCandidate }
   from './optimization-history.mjs';
 
@@ -1062,6 +1063,7 @@ export class Watchdog {
       deadlineMs: search.deadlineMs,
       deadlineReached: search.deadlineReached,
       probeStats: search.probeStats ?? null,
+      audit: search.audit ?? [],
     };
     // 扫描与串行切前门禁是两个阶段；立即落盘可避免状态把后续门禁误报为扫描超时。
     await persistState();
@@ -1227,6 +1229,15 @@ export class Watchdog {
         validationDeadlineAt,
       );
       const resultByNode = new Map(preSwitchResults.map((entry) => [entry.node, entry]));
+      const recordComparison = async (stage, results, ranked, reasons = new Map()) => {
+        state.lastCandidateComparison = buildLiveCandidateComparison({
+          at: this.clock.nowIso(), stage, decisionId, scanId: search.scanId ?? null,
+          snapshotAt: search.completedAt ?? null, selection: previousSelection, leaf: currentLeaf,
+          current, results, ranked, reasons, thresholds: this.candidateThresholds(),
+        });
+        await this.log('info', 'candidate-live-compared', state.lastCandidateComparison);
+        await persistState();
+      };
       let emergencyGuardBudget = emergencyRecovery ? {
         timeoutMs: this.switchExecutor.guardTimeoutFor(decisionStartedAt + decisionDeadlineMs),
         source: 'emergency-decision-budget',
@@ -1241,6 +1252,9 @@ export class Watchdog {
         let ranked = preSwitchResults
           .filter(isRecoveryImprovement)
           .sort(compareAvailability);
+        const recoveryReasons = (results) => new Map(results.filter(entry => !isRecoveryImprovement(entry))
+          .map(entry => [entry.node, [entry.successes <= 0 ? 'no-successful-sample' : 'no-relative-improvement']]));
+        await recordComparison('emergency-fast', preSwitchResults, ranked, recoveryReasons(preSwitchResults));
         let verificationSource = 'live-fast-validation';
         if (ranked.length === 0 || ranked[0].successRate < 1) {
           // 快速窗口是恢复目标，不能成为拒绝较慢但可用出口的永久门槛。
@@ -1268,6 +1282,7 @@ export class Watchdog {
           ranked = preSwitchResults
             .filter(isRecoveryImprovement)
             .sort(compareAvailability);
+          await recordComparison('emergency-recovery', preSwitchResults, ranked, recoveryReasons(preSwitchResults));
           verificationSource = 'live-recovery-validation';
           // 扩展复核已使用独立的完整探测窗口，不能再让后续守卫只继承早已过期的一秒决策窗口。
           emergencyGuardBudget = {
@@ -1387,6 +1402,7 @@ export class Watchdog {
             });
             await persistState();
             await this.log('warn', 'emergency-fallback-switched', {
+              decisionId, scanId: search.scanId ?? null,
               from: previousSelection,
               to: emergencyCandidate.node,
               successRate: emergencyCandidate.successRate,
@@ -1413,9 +1429,11 @@ export class Watchdog {
         }
       } else {
         const admitted = [];
+        const comparisonReasons = new Map();
         for (const nextCandidate of candidates) {
           const verification = resultByNode.get(nextCandidate.node);
           if (!verification || !hasCompleteProbeRounds(verification, this.config.probes.urls, preSwitchRounds)) {
+            comparisonReasons.set(nextCandidate.node, ['incomplete-evidence']);
             preSwitchValidationIncomplete = true;
             await this.log('warn', 'candidate-pre-switch-deferred', {
               node: nextCandidate.node, reason: 'incomplete-evidence',
@@ -1434,6 +1452,7 @@ export class Watchdog {
               && isStableAcrossRounds(verification, admissionThresholds)
             : hasStrictAdmissionEvidence(verification, this.config.probes, admissionThresholds));
           if (!admittedEvidence) {
+            comparisonReasons.set(nextCandidate.node, explainRoundStability(verification, admissionThresholds).reasons);
             // 质量不达标只说明“本次没到严格线”，不是网络失败：用短冷却而非 900s 隔离，
             // 否则一次复核就会把候选池整体清空。
             quarantineNodeAt(this.clock, 
@@ -1489,6 +1508,12 @@ export class Watchdog {
         });
         if (historicalOptimization) {
           candidates = await rankByHistory(candidates, 'pre-switch');
+          for (const row of state.lastOptimizationComparison.candidates) {
+            if (!row.eligible) comparisonReasons.set(row.node, [row.reason]);
+          }
+        }
+        await recordComparison('strict', preSwitchResults, candidates, comparisonReasons);
+        if (historicalOptimization) {
           if (!candidates.length && admitted.length > 0) {
             setDecision('hold', 'optimization-history-pending');
             await persistState();

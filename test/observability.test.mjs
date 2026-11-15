@@ -11,6 +11,57 @@ import {
   readRecentNdjson,
 } from '../src/observability.mjs';
 
+test('状态逐节点展示测评时间与未选原因，并标注旧出口比较不能代表当前出口', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'sentinel-candidate-audit-'));
+  const stateFile = path.join(root, 'state.json');
+  const at = new Date().toISOString();
+  const evidence = { startedAt: at, completedAt: at, successRate: 1, averageMs: 300, maxMs: 400 };
+  await writeFile(stateFile, JSON.stringify({ currentSelection: 'new', currentLeaf: 'new',
+    lastDecision: { at, action: 'blocked', reason: 'switch-budget-exhausted' },
+    candidateSnapshot: { at, selection: 'old', leaf: 'old', candidates: [], audit: [
+      { node: '泰国', status: 'filtered', reasons: ['include-regex'], discovery: null, validation: null },
+      { node: '日本', status: 'strict', reasons: [], discovery: evidence, validation: evidence },
+    ] },
+    lastCandidateComparison: { at, selection: 'old', leaf: 'old', stage: 'strict', preferredNode: '日本',
+      current: { node: 'old', ...evidence }, candidates: [
+        { node: '日本', rank: 1, outcome: 'preferred', reasons: [], evidence },
+        { node: '越南', rank: 2, outcome: 'ranked-behind', reasons: ['ranked-behind'], evidence },
+      ] },
+  }));
+  const snapshot = await buildStatusSnapshot({ stateFile, logFile: path.join(root, 'missing.ndjson'),
+    policy: { candidateSnapshotMaxAgeSeconds: 120 } });
+  assert.equal(snapshot.candidateSnapshot.matchesCurrent, false);
+  assert.equal(snapshot.lastCandidateComparison.matchesCurrent, false);
+  const text = formatStatus(snapshot);
+  assert.match(text, /泰国.*未匹配包含规则/);
+  assert.match(text, /日本.*严格合格/);
+  assert.match(text, /复测.*100%.*300.*400/);
+  assert.match(text, /越南.*排名靠后/);
+  assert.match(text, /旧出口记录/);
+  assert.match(text, /采样/);
+  assert.match(text, /首选不等于已执行/);
+});
+
+test('合格节点显示本轮预算阻断，过期扫描不冒充当前拒选依据', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'sentinel-audit-budget-'));
+  const stateFile = path.join(root, 'state.json');
+  const at = new Date().toISOString();
+  const state = { currentSelection: 'current', currentLeaf: 'current',
+    lastDecision: { at, action: 'blocked', reason: 'switch-budget-exhausted' },
+    candidateSnapshot: { at, selection: 'current', leaf: 'current', candidates: [],
+      audit: [{ node: 'faster', status: 'strict', reasons: [], discovery: null, validation: null }] },
+  };
+  const options = { stateFile, logFile: path.join(root, 'missing.ndjson'), policy: { candidateSnapshotMaxAgeSeconds: 120 } };
+  await writeFile(stateFile, JSON.stringify(state));
+  assert.match(formatStatus(await buildStatusSnapshot(options)), /faster.*严格合格.*本轮行动 切换预算耗尽/);
+  state.candidateSnapshot.at = new Date(Date.now() - 180_000).toISOString();
+  await writeFile(stateFile, JSON.stringify(state));
+  const snapshot = await buildStatusSnapshot(options);
+  assert.equal(snapshot.candidateSnapshot.fresh, false);
+  assert.equal(snapshot.candidateSnapshot.audit[0].actionReason, null);
+  assert.match(formatStatus(snapshot), /逐节点扫描审计.*已过期/);
+});
+
 test('rotating logger retains valid NDJSON and redacts credentials', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'watchdog-log-'));
   const logFile = path.join(root, 'watchdog.ndjson');

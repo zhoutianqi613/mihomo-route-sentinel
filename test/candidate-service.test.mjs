@@ -123,6 +123,62 @@ test('filterCandidates excludes current/quarantined nodes and honors include/exc
   );
 });
 
+test('逐节点审计区分过滤、初筛无响应、短名单截断与严格合格，并保留原采样时间', async () => {
+  const start = '2026-11-15T14:00:00.000Z';
+  const end = '2026-11-15T14:00:01.000Z';
+  const timed = (node, delay) => ({ ...makeResult(node, { delay, score: delay }), startedAt: start, completedAt: end });
+  const silent = { ...summarizeSamples('silent', [{ round: 1, url: baseConfig.probes.urls[0], ok: false, error: '凭据不得进入审计' }]), startedAt: start, completedAt: end };
+  const { service, config, probes, events } = createHarness({
+    candidates: ['current', 'cooling', 'blocked', '泰国', 'strict', 'slow', 'silent', 'strict'],
+    responses: [[timed('strict', 100), timed('slow', 200), silent], [timed('strict', 100)]]
+      .map(rows => withProbeStats(rows, { method: 'per-node' })),
+  });
+  config.probes.includeRegex = 'current|cooling|blocked|strict|slow|silent';
+  config.probes.excludeRegex = 'blocked';
+  config.probes.maxValidationCandidates = 1;
+  const result = await service.findCandidates('current', new Set(['cooling']), { background: true });
+  const rows = new Map(result.audit.map(row => [row.node, row]));
+  assert.equal(rows.size, 7);
+  for (const [node, reason] of [['current', 'current-node'], ['cooling', 'excluded-node'], ['blocked', 'exclude-regex'], ['泰国', 'include-regex']]) {
+    assert.deepEqual(rows.get(node).reasons, [reason]);
+    assert.equal(rows.get(node).discovery, null);
+  }
+  assert.equal(rows.get('strict').status, 'strict');
+  assert.equal(rows.get('strict').validation.startedAt, start);
+  assert.equal(rows.get('silent').status, 'discovery-no-success');
+  assert.equal(rows.get('slow').status, 'not-shortlisted');
+  assert.equal(rows.get('slow').discovery.completedAt, end);
+  assert.deepEqual(probes.calls[0].nodes, ['strict', 'slow', 'silent']);
+  assert.doesNotMatch(JSON.stringify(result.audit), /service-a|https:|凭据/);
+  assert.deepEqual(events.find(x => x.event === 'candidate-scan-audited').details.nodes, result.audit);
+  const snapshot = service.createCandidateSnapshot(result, 'selection', 'current');
+  assert.deepEqual(service.searchFromCandidateSnapshot(snapshot, 'selection', 'current').audit, result.audit);
+});
+
+test('空地区筛选允许所有地区参与，缓存保留逐轮不合格原因而非仅显示缓存拒绝', async () => {
+  const good = makeResult('泰国', { delay: 100 });
+  const poor = makeResult('越南', { delay: 900 });
+  const { service } = createHarness({ candidates: ['泰国', '越南'],
+    responses: [[good, poor], [good, poor]].map(rows => withProbeStats(rows, { method: 'per-node' })) });
+  const result = await service.findCandidates('current', new Set(), { background: true });
+  assert.deepEqual(result.sampled.map(row => row.node), ['泰国', '越南']);
+  assert.deepEqual(result.audit.find(row => row.node === '越南').reasons, ['average-latency']);
+  const snapshot = service.createCandidateSnapshot(result, 'current', 'current');
+  const restored = service.searchFromCandidateSnapshot(snapshot, 'current', 'current');
+  assert.deepEqual(restored.rejected[0].reasons, ['average-latency']);
+  assert.equal(restored.audit.find(row => row.node === '越南').validation.rounds.length, 2);
+});
+
+test('初筛被截止取消时标记证据未齐，不冒充已证实不可达', async () => {
+  const incomplete = summarizeSamples('pending', [{ round: 1, url: baseConfig.probes.urls[0], ok: false, error: 'SCAN_DEADLINE' }]);
+  const { service } = createHarness({ candidates: ['pending'], responses: [
+    withProbeStats([incomplete], { method: 'per-node' }), withProbeStats([], { method: 'per-node' }),
+  ] });
+  const result = await service.findCandidates('current');
+  assert.equal(result.audit[0].status, 'discovery-incomplete');
+  assert.equal(result.audit[0].validation, null);
+});
+
 test('candidate snapshot keeps identity and expires after the configured age', () => {
   const clock = createFakeClock();
   const { service } = createHarness({ clock });
